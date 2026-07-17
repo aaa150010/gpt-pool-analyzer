@@ -1,0 +1,29 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build universal app
+        shell: bash
+        run: ./build.sh
+
+      - name: Verify bundle
+        shell: bash
+        run: |
+          lipo -archs "build/GPT分析器.app/Contents/MacOS/GPT分析器" | grep -q arm64
+          lipo -archs "build/GPT分析器.app/Contents/MacOS/GPT分析器" | grep -q x86_64
+          codesign --verify --deep --strict "build/GPT分析器.app"
