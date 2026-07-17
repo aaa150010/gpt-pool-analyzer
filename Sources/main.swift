@@ -696,7 +696,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var poolSummaryLabels: [String: (total: NSTextField, schedulable: NSTextField, status: NSTextField, change: NSTextField, time: NSTextField)] = [:]
     private var poolHistoryTables: [NSTableView: String] = [:]
     private var settlementTextObservers: [NSObjectProtocol] = []
-    private var settlementLabels: (partnerTransfer: NSTextField, ownerReceives: NSTextField, formula: NSTextField)?
+    private var settlementLabels: (partnerTransfer: NSTextField, ownerReceives: NSTextField, balanceChange: NSTextField, netOutcome: NSTextField, settlementLine: NSTextField)?
 
     private var initial: Snapshot?
     private var history: [Snapshot] = []
@@ -1548,18 +1548,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panel.translatesAutoresizingMaskIntoConstraints = false
 
         let title = NSTextField(labelWithString: "合伙结算")
-        title.font = .systemFont(ofSize: 15, weight: .bold)
+        title.font = .systemFont(ofSize: 20, weight: .bold)
         title.textColor = .systemIndigo
         title.alignment = .left
         title.translatesAutoresizingMaskIntoConstraints = false
 
         let hint = NSTextField(labelWithString: "按当前余额合计与基准余额合计的差额结算；盈利先返还双方实际出资，再按比例分利润；亏损双方各承担一半。")
-        hint.font = .systemFont(ofSize: 12, weight: .medium)
+        hint.font = .systemFont(ofSize: 14, weight: .semibold)
         hint.textColor = .secondaryLabelColor
         hint.lineBreakMode = .byWordWrapping
         hint.maximumNumberOfLines = 2
         hint.alignment = .left
         hint.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleRow = NSStackView()
+        titleRow.orientation = .horizontal
+        titleRow.spacing = 44
+        titleRow.alignment = .firstBaseline
+        titleRow.translatesAutoresizingMaskIntoConstraints = false
+        titleRow.addArrangedSubview(title)
+        titleRow.addArrangedSubview(hint)
+        title.widthAnchor.constraint(equalToConstant: 172).isActive = true
 
         configureSettlementField(partnerShareField, placeholder: "40", width: 58)
         partnerShareField.stringValue = money(settlement.partnerSharePercent)
@@ -1569,17 +1578,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         settingsRow.spacing = 8
         settingsRow.alignment = .centerY
         settingsRow.translatesAutoresizingMaskIntoConstraints = false
-        let partnerInfo = NSButton(title: "?", target: nil, action: nil)
-        partnerInfo.isBordered = true
-        partnerInfo.bezelStyle = .circular
-        partnerInfo.controlSize = .small
-        partnerInfo.font = .systemFont(ofSize: 11, weight: .bold)
-        partnerInfo.toolTip = "合作人出资金额在顶部“合作人出资”输入框里改；没出资就填 0。盈利先返还双方出资，亏损双方各承担一半。"
-        partnerInfo.translatesAutoresizingMaskIntoConstraints = false
-        partnerInfo.widthAnchor.constraint(equalToConstant: 22).isActive = true
-        partnerInfo.heightAnchor.constraint(equalToConstant: 22).isActive = true
-        settingsRow.addArrangedSubview(label("合作人出资见顶部输入框"))
-        settingsRow.addArrangedSubview(partnerInfo)
         settingsRow.addArrangedSubview(label("对方分成"))
         settingsRow.addArrangedSubview(partnerShareField)
         settingsRow.addArrangedSubview(label("%"))
@@ -1591,38 +1589,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         let partnerTransferValue = settlementMetricValue()
         let ownerReceivesValue = settlementMetricValue()
-        partnerTransferValue.font = .systemFont(ofSize: 21, weight: .bold)
-        ownerReceivesValue.font = .systemFont(ofSize: 21, weight: .bold)
+        partnerTransferValue.font = .systemFont(ofSize: 24, weight: .bold)
+        ownerReceivesValue.font = .systemFont(ofSize: 24, weight: .bold)
 
         let resultRow = NSStackView()
         resultRow.orientation = .horizontal
-        resultRow.spacing = 12
+        resultRow.spacing = 16
         resultRow.alignment = .centerY
         resultRow.distribution = .fill
         resultRow.translatesAutoresizingMaskIntoConstraints = false
-        resultRow.addArrangedSubview(settlementResultBlock(title: "合作人应收", value: partnerTransferValue, color: .systemOrange))
+        resultRow.addArrangedSubview(settlementResultBlock(title: "合伙人应收", value: partnerTransferValue, color: .systemOrange))
         resultRow.addArrangedSubview(settlementResultBlock(title: "我方应留", value: ownerReceivesValue, color: .systemIndigo))
 
-        let formula = NSTextField(wrappingLabelWithString: "")
-        formula.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
-        formula.textColor = .secondaryLabelColor
-        formula.maximumNumberOfLines = 3
-        formula.lineBreakMode = .byWordWrapping
-        formula.alignment = .left
-        formula.translatesAutoresizingMaskIntoConstraints = false
+        let balanceChangeFormula = settlementFormulaValue()
+        let netOutcomeFormula = settlementFormulaValue()
+        let settlementLineFormula = settlementFormulaValue(isResult: true)
+        let formulaStack = NSStackView()
+        formulaStack.orientation = .vertical
+        formulaStack.spacing = 12
+        formulaStack.alignment = .width
+        formulaStack.translatesAutoresizingMaskIntoConstraints = false
+        formulaStack.addArrangedSubview(settlementFormulaRow(title: "余额变化", value: balanceChangeFormula))
+        formulaStack.addArrangedSubview(settlementFormulaRow(title: "净利润", value: netOutcomeFormula))
+        formulaStack.addArrangedSubview(settlementDivider())
+        formulaStack.addArrangedSubview(settlementFormulaRow(title: "结算结果", value: settlementLineFormula))
 
         let leftColumn = NSStackView()
         leftColumn.orientation = .vertical
-        leftColumn.spacing = 8
+        leftColumn.spacing = 28
         leftColumn.alignment = .width
         leftColumn.translatesAutoresizingMaskIntoConstraints = false
-        leftColumn.addArrangedSubview(hint)
         leftColumn.addArrangedSubview(settingsRow)
-        leftColumn.addArrangedSubview(formula)
+        leftColumn.addArrangedSubview(formulaStack)
 
         let contentRow = NSStackView()
         contentRow.orientation = .horizontal
-        contentRow.spacing = 18
+        contentRow.spacing = 34
         contentRow.alignment = .centerY
         contentRow.translatesAutoresizingMaskIntoConstraints = false
         contentRow.addArrangedSubview(leftColumn)
@@ -1632,22 +1634,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         resultRow.setContentHuggingPriority(.required, for: .horizontal)
         resultRow.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        panel.addSubview(title)
+        panel.addSubview(titleRow)
         panel.addSubview(contentRow)
         NSLayoutConstraint.activate([
-            title.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 16),
-            title.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -16),
-            title.topAnchor.constraint(equalTo: panel.topAnchor, constant: 12),
-            contentRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 16),
-            contentRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -16),
-            contentRow.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
-            contentRow.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -12),
-            resultRow.widthAnchor.constraint(equalToConstant: 412)
+            titleRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 48),
+            titleRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -48),
+            titleRow.topAnchor.constraint(equalTo: panel.topAnchor, constant: 28),
+            contentRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 48),
+            contentRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -48),
+            contentRow.topAnchor.constraint(equalTo: titleRow.bottomAnchor, constant: 14),
+            contentRow.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -28),
+            resultRow.widthAnchor.constraint(equalToConstant: 456)
         ])
 
-        settlementLabels = (partnerTransferValue, ownerReceivesValue, formula)
+        settlementLabels = (partnerTransferValue, ownerReceivesValue, balanceChangeFormula, netOutcomeFormula, settlementLineFormula)
         updateSettlementOutput()
         return panel
+    }
+
+    private func settlementFormulaValue(isResult: Bool = false) -> NSTextField {
+        let value = NSTextField(wrappingLabelWithString: "")
+        value.font = isResult ? .systemFont(ofSize: 13, weight: .bold) : .monospacedSystemFont(ofSize: 13, weight: .medium)
+        value.textColor = isResult ? .labelColor : .secondaryLabelColor
+        value.maximumNumberOfLines = 2
+        value.lineBreakMode = .byWordWrapping
+        value.alignment = .left
+        value.translatesAutoresizingMaskIntoConstraints = false
+        value.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        value.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return value
+    }
+
+    private func settlementFormulaRow(title: String, value: NSTextField) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: 13, weight: .bold)
+        titleLabel.textColor = .systemBlue
+        titleLabel.alignment = .left
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        row.addSubview(titleLabel)
+        row.addSubview(value)
+        NSLayoutConstraint.activate([
+            titleLabel.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            titleLabel.topAnchor.constraint(equalTo: row.topAnchor),
+            titleLabel.widthAnchor.constraint(equalToConstant: 120),
+            value.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 150),
+            value.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            value.firstBaselineAnchor.constraint(equalTo: titleLabel.firstBaselineAnchor),
+            value.bottomAnchor.constraint(lessThanOrEqualTo: row.bottomAnchor),
+            titleLabel.bottomAnchor.constraint(equalTo: row.bottomAnchor)
+        ])
+        return row
+    }
+
+    private func settlementDivider() -> NSView {
+        let divider = NSBox()
+        divider.boxType = .separator
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        divider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        return divider
     }
 
     private func configureSettlementField(_ field: NSTextField, placeholder: String, width: CGFloat) {
@@ -1717,36 +1765,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func settlementResultBlock(title: String, value: NSTextField, color: NSColor) -> NSView {
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.spacing = 4
-        stack.alignment = .centerX
-        stack.edgeInsets = NSEdgeInsets(top: 9, left: 12, bottom: 9, right: 12)
-        stack.wantsLayer = true
-        stack.layer?.cornerRadius = 8
-        stack.layer?.backgroundColor = color.withAlphaComponent(0.08).cgColor
-        stack.layer?.borderColor = color.withAlphaComponent(0.22).cgColor
-        stack.layer?.borderWidth = 1
-        stack.translatesAutoresizingMaskIntoConstraints = false
+        let card = NSView()
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 8
+        card.layer?.backgroundColor = color.withAlphaComponent(0.08).cgColor
+        card.layer?.borderColor = color.withAlphaComponent(0.22).cgColor
+        card.layer?.borderWidth = 1
+        card.translatesAutoresizingMaskIntoConstraints = false
+
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.spacing = 4
+        content.alignment = .width
+        content.translatesAutoresizingMaskIntoConstraints = false
 
         let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = .systemFont(ofSize: 12, weight: .bold)
+        titleLabel.font = .systemFont(ofSize: 13, weight: .bold)
         titleLabel.textColor = color
         titleLabel.alignment = .center
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         value.alignment = .center
 
-        stack.addArrangedSubview(titleLabel)
-        stack.addArrangedSubview(value)
+        content.addArrangedSubview(titleLabel)
+        content.addArrangedSubview(value)
+        card.addSubview(content)
         NSLayoutConstraint.activate([
-            titleLabel.leadingAnchor.constraint(equalTo: stack.leadingAnchor, constant: 10),
-            titleLabel.trailingAnchor.constraint(equalTo: stack.trailingAnchor, constant: -10),
-            value.leadingAnchor.constraint(equalTo: stack.leadingAnchor, constant: 10),
-            value.trailingAnchor.constraint(equalTo: stack.trailingAnchor, constant: -10),
-            stack.widthAnchor.constraint(equalToConstant: 200),
-            stack.heightAnchor.constraint(equalToConstant: 78)
+            card.widthAnchor.constraint(equalToConstant: 220),
+            card.heightAnchor.constraint(equalToConstant: 86),
+            content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
+            content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
+            content.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+            titleLabel.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            titleLabel.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            value.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            value.trailingAnchor.constraint(equalTo: content.trailingAnchor)
         ])
-        return stack
+        return card
     }
 
     private struct SettlementAccount {
@@ -1825,26 +1879,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard let labels = settlementLabels else { return }
         let calculation = settlementCalculation()
 
-        if calculation.partnerSettlement >= 0 {
-            labels.partnerTransfer.stringValue = money(calculation.partnerSettlement)
-            labels.partnerTransfer.textColor = .systemOrange
-        } else {
-            labels.partnerTransfer.stringValue = "-\(money(abs(calculation.partnerSettlement)))"
-            labels.partnerTransfer.textColor = .systemRed
-        }
-        labels.ownerReceives.stringValue = money(calculation.ownerSettlement)
+        animateMetricNumber(
+            "settlement.partnerTransfer",
+            field: labels.partnerTransfer,
+            value: calculation.partnerSettlement,
+            formatter: { value in value >= 0 ? String(format: "%.2f", value) : "-\(String(format: "%.2f", abs(value)))" }
+        )
+        labels.partnerTransfer.textColor = calculation.partnerSettlement >= 0 ? .systemOrange : .systemRed
+        animateMetricNumber(
+            "settlement.ownerReceives",
+            field: labels.ownerReceives,
+            value: calculation.ownerSettlement,
+            formatter: { String(format: "%.2f", $0) }
+        )
         labels.ownerReceives.textColor = calculation.ownerSettlement >= 0 ? .systemIndigo : .systemRed
 
-        let outcomeLine: String
+        labels.balanceChange.stringValue = "当前余额 \(money(calculation.currentTotal)) - 基准余额 \(money(calculation.baseTotal)) = \(signedMoney(calculation.balanceChange))"
+
+        let netOutcomeLabel: String
+        let settlementLine: String
         if calculation.netOutcome >= 0 {
-            outcomeLine = "净利润 \(money(calculation.netOutcome)) = 余额变化 \(money(calculation.balanceChange)) - 总出资 \(money(calculation.totalCost))；\(settlement.partnerName) 应收 = 出资 \(money(partnerCost)) + 净利润 × \(money(calculation.partnerSharePercent))% = \(money(calculation.partnerSettlement))。"
+            netOutcomeLabel = "余额变化 \(money(calculation.balanceChange)) - 总出资 \(money(calculation.totalCost)) = \(money(calculation.netOutcome))"
+            settlementLine = "\(settlement.partnerName) 应收 = 出资 \(money(partnerCost)) + 净利润 \(money(calculation.netOutcome)) × \(money(calculation.partnerSharePercent))% = \(money(calculation.partnerSettlement))；我方应留 = \(money(calculation.ownerSettlement))"
         } else {
-            outcomeLine = "亏损 \(money(abs(calculation.netOutcome))) = 总出资 \(money(calculation.totalCost)) - 余额变化 \(money(calculation.balanceChange))；双方各承担 \(money(abs(calculation.netOutcome) / 2))。"
+            netOutcomeLabel = "余额变化 \(money(calculation.balanceChange)) - 总出资 \(money(calculation.totalCost)) = \(signedMoney(calculation.netOutcome))，双方各承担 \(money(abs(calculation.netOutcome) / 2))"
+            settlementLine = calculation.partnerSettlement >= 0
+                ? "\(settlement.partnerName) 应收 = 出资 \(money(partnerCost)) - 应承担亏损 \(money(abs(calculation.netOutcome) / 2)) = \(money(calculation.partnerSettlement))；我方应留 = \(money(calculation.ownerSettlement))"
+                : "\(settlement.partnerName) 本次应补给我方 \(money(abs(calculation.partnerSettlement)))；我方无需向对方转款"
         }
-        let direction = calculation.partnerSettlement >= 0
-            ? "若余额回款都到我方，本次应转给 \(settlement.partnerName) \(money(calculation.partnerSettlement)) 元；我方应留 \(money(calculation.ownerSettlement)) 元。"
-            : "\(settlement.partnerName) 本次应补给我方 \(money(abs(calculation.partnerSettlement))) 元；我方无需向对方转款。"
-        labels.formula.stringValue = "余额变化 = 当前余额 \(money(calculation.currentTotal)) - 基准余额 \(money(calculation.baseTotal)) = \(signedMoney(calculation.balanceChange))；净利润 = 余额变化 \(money(calculation.balanceChange)) - 总出资 \(money(calculation.totalCost)) = \(signedMoney(calculation.netOutcome))。\(outcomeLine) \(direction)"
+        labels.netOutcome.stringValue = netOutcomeLabel
+        labels.settlementLine.stringValue = settlementLine
     }
 
     private func buildHistoryPanel() -> NSView {
@@ -3830,7 +3894,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         setMetric("result", field: resultValue, value: currentProfit, suffix: " 元")
         resultValue.textColor = currentProfit >= 0 ? .systemGreen : .systemRed
         setMetric("progress", field: progressValue, value: progress, suffix: "%", decimals: 1)
-        setMetricText("remaining", field: remainingValue, text: "\(signedMoney(paybackDelta)) 元")
+        animateMetricNumber("remaining", field: remainingValue, value: paybackDelta) { "\(String(format: "%+.2f", $0)) 元" }
         remainingValue.textColor = paybackDelta >= 0 ? .systemGreen : .systemRed
     }
 
@@ -3851,17 +3915,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
 
+        animateMetricNumber(key, field: field, value: value) { self.formatMetric($0, suffix: suffix, decimals: decimals) }
+    }
+
+    private func animateMetricNumber(_ key: String, field: NSTextField, value: Double, formatter: @escaping (Double) -> String) {
+        metricAnimations[key]?.invalidate()
+
         let startValue = displayedMetricValues[key] ?? value
         displayedMetricValues[key] = value
 
         guard startValue != value else {
-            field.stringValue = formatMetric(value, suffix: suffix, decimals: decimals)
+            field.stringValue = formatter(value)
             resizeMetricField(field)
             return
         }
 
-        let steps = 22
-        let interval = 0.018
+        let duration = 1.5
+        let interval = 1.0 / 60.0
+        let steps = max(1, Int(duration / interval))
         var step = 0
         metricAnimations[key] = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self, weak field] timer in
             guard let self, let field else {
@@ -3872,11 +3943,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             let rawProgress = min(Double(step) / Double(steps), 1)
             let eased = 1 - pow(1 - rawProgress, 3)
             let current = startValue + (value - startValue) * eased
-            field.stringValue = self.formatMetric(current, suffix: suffix, decimals: decimals)
+            field.stringValue = formatter(current)
             self.resizeMetricField(field)
             if step >= steps {
-                field.stringValue = self.formatMetric(value, suffix: suffix, decimals: decimals)
+                field.stringValue = formatter(value)
                 self.resizeMetricField(field)
+                self.metricAnimations.removeValue(forKey: key)
                 timer.invalidate()
             }
         }
