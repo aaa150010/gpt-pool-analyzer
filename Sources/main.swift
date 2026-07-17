@@ -58,6 +58,7 @@ struct OCRLine {
 struct StoredState: Codable {
     var cost: Double
     var partnerCost: Double?
+    var manualBaseTotal: Double?
     var initial: Snapshot?
     var history: [Snapshot]
     var settlement: SettlementState?
@@ -654,6 +655,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var window: NSWindow!
     private let costField = NSTextField(string: "200")
     private let partnerCostField = NSTextField(string: "0")
+    private let manualBaseField = NSTextField(string: "")
     private let addCostField = NSTextField(string: "")
     private let statusLabel = NSTextField(labelWithString: "")
     private var metricAnimations: [String: Timer] = [:]
@@ -699,6 +701,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var settlementLabels: (partnerTransfer: NSTextField, ownerReceives: NSTextField, balanceChange: NSTextField, netOutcome: NSTextField, settlementLine: NSTextField)?
 
     private var initial: Snapshot?
+    private var manualBaseTotal: Double?
     private var history: [Snapshot] = []
     private var poolHistory: [PoolSnapshot] = []
     private var selectedPoolGroups: [String] = ["PLUS共享号池", "K12共享号池"]
@@ -750,6 +753,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         configureField(costField, placeholder: "200")
         configureField(partnerCostField, placeholder: "0")
+        configureField(manualBaseField, placeholder: "可手填")
         configureField(addCostField, placeholder: "0")
         addCostField.target = self
         addCostField.action = #selector(addCost)
@@ -834,6 +838,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         NotificationCenter.default.addObserver(self, selector: #selector(inputsChanged), name: NSControl.textDidChangeNotification, object: costField)
         NotificationCenter.default.addObserver(self, selector: #selector(inputsChanged), name: NSControl.textDidChangeNotification, object: partnerCostField)
+        NotificationCenter.default.addObserver(self, selector: #selector(inputsChanged), name: NSControl.textDidChangeNotification, object: manualBaseField)
 
     }
 
@@ -942,6 +947,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         inputRow.addArrangedSubview(costField)
         inputRow.addArrangedSubview(label("合作人出资"))
         inputRow.addArrangedSubview(partnerCostField)
+        inputRow.addArrangedSubview(label("基准余额合计"))
+        inputRow.addArrangedSubview(manualBaseField)
         inputRow.addArrangedSubview(label("追加成本"))
         inputRow.addArrangedSubview(addCostField)
         inputRow.addArrangedSubview(addCostButton)
@@ -1604,15 +1611,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let balanceChangeFormula = settlementFormulaValue()
         let netOutcomeFormula = settlementFormulaValue()
         let settlementLineFormula = settlementFormulaValue(isResult: true)
-        let formulaStack = NSStackView()
-        formulaStack.orientation = .vertical
-        formulaStack.spacing = 12
-        formulaStack.alignment = .width
-        formulaStack.translatesAutoresizingMaskIntoConstraints = false
-        formulaStack.addArrangedSubview(settlementFormulaRow(title: "余额变化", value: balanceChangeFormula))
-        formulaStack.addArrangedSubview(settlementFormulaRow(title: "净利润", value: netOutcomeFormula))
-        formulaStack.addArrangedSubview(settlementDivider())
-        formulaStack.addArrangedSubview(settlementFormulaRow(title: "结算结果", value: settlementLineFormula))
+        let formulaGrid = settlementFormulaGrid(
+            balanceChange: balanceChangeFormula,
+            netOutcome: netOutcomeFormula,
+            settlementLine: settlementLineFormula
+        )
 
         let leftColumn = NSStackView()
         leftColumn.orientation = .vertical
@@ -1620,7 +1623,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         leftColumn.alignment = .width
         leftColumn.translatesAutoresizingMaskIntoConstraints = false
         leftColumn.addArrangedSubview(settingsRow)
-        leftColumn.addArrangedSubview(formulaStack)
+        leftColumn.addArrangedSubview(formulaGrid)
 
         let contentRow = NSStackView()
         contentRow.orientation = .horizontal
@@ -1665,32 +1668,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         return value
     }
 
-    private func settlementFormulaRow(title: String, value: NSTextField) -> NSView {
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
+    private func settlementFormulaGrid(balanceChange: NSTextField, netOutcome: NSTextField, settlementLine: NSTextField) -> NSView {
+        let grid = NSView()
+        grid.translatesAutoresizingMaskIntoConstraints = false
 
-        let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.font = .systemFont(ofSize: 13, weight: .bold)
-        titleLabel.textColor = .systemBlue
-        titleLabel.alignment = .left
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        let balanceTitle = settlementFormulaTitle("余额变化")
+        let netTitle = settlementFormulaTitle("净利润")
+        let settlementTitle = settlementFormulaTitle("结算结果")
+        let divider = settlementDivider()
 
-        row.addSubview(titleLabel)
-        row.addSubview(value)
+        for view in [balanceTitle, netTitle, divider, settlementTitle, balanceChange, netOutcome, settlementLine] {
+            grid.addSubview(view)
+        }
+
+        let formulaLeading: CGFloat = 150
         NSLayoutConstraint.activate([
-            titleLabel.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-            titleLabel.topAnchor.constraint(equalTo: row.topAnchor),
-            titleLabel.widthAnchor.constraint(equalToConstant: 120),
-            value.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 150),
-            value.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-            value.firstBaselineAnchor.constraint(equalTo: titleLabel.firstBaselineAnchor),
-            value.bottomAnchor.constraint(lessThanOrEqualTo: row.bottomAnchor),
-            titleLabel.bottomAnchor.constraint(equalTo: row.bottomAnchor)
+            balanceTitle.leadingAnchor.constraint(equalTo: grid.leadingAnchor),
+            balanceTitle.topAnchor.constraint(equalTo: grid.topAnchor),
+            balanceTitle.widthAnchor.constraint(equalToConstant: 120),
+            balanceChange.leadingAnchor.constraint(equalTo: grid.leadingAnchor, constant: formulaLeading),
+            balanceChange.trailingAnchor.constraint(equalTo: grid.trailingAnchor),
+            balanceChange.firstBaselineAnchor.constraint(equalTo: balanceTitle.firstBaselineAnchor),
+
+            netTitle.leadingAnchor.constraint(equalTo: grid.leadingAnchor),
+            netTitle.topAnchor.constraint(equalTo: balanceTitle.bottomAnchor, constant: 14),
+            netTitle.widthAnchor.constraint(equalToConstant: 120),
+            netOutcome.leadingAnchor.constraint(equalTo: grid.leadingAnchor, constant: formulaLeading),
+            netOutcome.trailingAnchor.constraint(equalTo: grid.trailingAnchor),
+            netOutcome.firstBaselineAnchor.constraint(equalTo: netTitle.firstBaselineAnchor),
+
+            divider.leadingAnchor.constraint(equalTo: grid.leadingAnchor),
+            divider.trailingAnchor.constraint(equalTo: grid.trailingAnchor),
+            divider.topAnchor.constraint(equalTo: netTitle.bottomAnchor, constant: 14),
+
+            settlementTitle.leadingAnchor.constraint(equalTo: grid.leadingAnchor),
+            settlementTitle.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 14),
+            settlementTitle.widthAnchor.constraint(equalToConstant: 120),
+            settlementLine.leadingAnchor.constraint(equalTo: grid.leadingAnchor, constant: formulaLeading),
+            settlementLine.trailingAnchor.constraint(equalTo: grid.trailingAnchor),
+            settlementLine.firstBaselineAnchor.constraint(equalTo: settlementTitle.firstBaselineAnchor),
+            settlementTitle.bottomAnchor.constraint(equalTo: grid.bottomAnchor)
         ])
-        return row
+        return grid
     }
 
-    private func settlementDivider() -> NSView {
+    private func settlementFormulaTitle(_ title: String) -> NSTextField {
+        let label = NSTextField(labelWithString: title)
+        label.font = .systemFont(ofSize: 13, weight: .bold)
+        label.textColor = .systemBlue
+        label.alignment = .left
+        label.translatesAutoresizingMaskIntoConstraints = false
+        return label
+    }
+
+    private func settlementDivider() -> NSBox {
         let divider = NSBox()
         divider.boxType = .separator
         divider.translatesAutoresizingMaskIntoConstraints = false
@@ -1843,7 +1874,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func settlementCalculation() -> SettlementCalculation {
         let partnerSharePercent = min(max(settlementNumber(from: partnerShareField, fallback: settlement.partnerSharePercent), 0), 100)
-        let baseTotal = initial?.total ?? 0
+        let baseTotal = effectiveBaseTotal ?? 0
         let currentTotal = history.last?.total ?? baseTotal
         let balanceChange = currentTotal - baseTotal
         let totalCost = cost + partnerCost
@@ -2051,6 +2082,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func inputsChanged() {
+        manualBaseTotal = manualBaseInputValue()
         saveState()
         updateSettlementOutput()
         refreshOutput()
@@ -2085,6 +2117,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc private func resetAll() {
         initial = nil
         history = []
+        manualBaseTotal = nil
+        manualBaseField.stringValue = ""
         partnerCostField.stringValue = "0"
         settlement = .default
         UserDefaults.standard.removeObject(forKey: "StoredState")
@@ -2239,6 +2273,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let snapshot = Snapshot(date: Date(), total: amounts.reduce(0, +), amounts: amounts, accounts: accounts)
         if asInitial || initial == nil {
             initial = snapshot
+            manualBaseTotal = snapshot.total
+            manualBaseField.stringValue = money(snapshot.total)
             history = [snapshot]
             settlement.withdrawals = [:]
             showFeedback("已查询为基准余额：\(money(snapshot.total))。", color: .systemGreen)
@@ -3476,6 +3512,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         max(Double(partnerCostField.stringValue.replacingOccurrences(of: ",", with: "")) ?? 0, 0)
     }
 
+    private func manualBaseInputValue() -> Double? {
+        let raw = manualBaseField.stringValue
+            .replacingOccurrences(of: ",", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, let value = Double(raw), value >= 0 else { return nil }
+        return value
+    }
+
+    private var effectiveBaseTotal: Double? {
+        manualBaseInputValue() ?? manualBaseTotal ?? initial?.total
+    }
+
     private var cost: Double {
         ownerCost + partnerCost
     }
@@ -3862,7 +3910,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func updateMetrics() {
         setMetric("cost", field: costValue, value: cost, suffix: " 元")
-        guard let initial else {
+        guard let baseTotal = effectiveBaseTotal else {
             setMetric("base", field: baseValue, value: nil, suffix: " 元")
             setMetric("current", field: currentValue, value: nil, suffix: " 元")
             setMetric("net", field: netValue, value: nil, suffix: " 元")
@@ -3872,7 +3920,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
 
-        setMetric("base", field: baseValue, value: initial.total, suffix: " 元")
+        setMetric("base", field: baseValue, value: baseTotal, suffix: " 元")
         guard let latest = history.last else {
             setMetric("current", field: currentValue, value: nil, suffix: " 元")
             setMetric("net", field: netValue, value: nil, suffix: " 元")
@@ -3882,7 +3930,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
 
-        let gross = latest.total - initial.total
+        let gross = latest.total - baseTotal
         let totalCost = cost + partnerCost
         let currentProfit = gross - totalCost
         let progress = totalCost > 0 ? gross / totalCost * 100 : 0
@@ -4080,9 +4128,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
 
         if tableView == historyTable {
-            guard let initial else { return container }
+            guard let baseTotal = effectiveBaseTotal else { return container }
             let item = history[row]
-            let gross = item.total - initial.total
+            let gross = item.total - baseTotal
             let afterCost = gross - cost - partnerCost
             switch identifier {
             case "index":
@@ -4127,14 +4175,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         lines.append("总出资：我方 \(money(cost)) 元 + 合作人 \(money(partnerCost)) 元 = \(money(cost + partnerCost)) 元")
         lines.append("")
 
-        guard let initial else {
+        guard let initial, let baseTotal = effectiveBaseTotal else {
             lines.append("请先复制基准截图并按 Command+V。")
             return lines.joined(separator: "\n")
         }
 
         lines.append("基准截图")
         lines.append("  时间：\(formatDate(initial.date))")
-        lines.append("  基准余额合计：\(amountList(initial.amounts)) = \(money(initial.total)) 元")
+        lines.append("  基准余额合计：\(money(baseTotal)) 元")
         lines.append("")
 
         guard let latest = history.last else {
@@ -4142,7 +4190,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return lines.joined(separator: "\n")
         }
 
-        let gross = latest.total - initial.total
+        let gross = latest.total - baseTotal
         let currentProfitAfterCost = gross - cost - partnerCost
         let remaining = currentProfitAfterCost
         let progress = (cost + partnerCost) > 0 ? gross / (cost + partnerCost) * 100 : 0
@@ -4164,7 +4212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func buildHistoryReport() -> String {
-        guard let initial else {
+        guard let baseTotal = effectiveBaseTotal else {
             return "请先复制基准截图并按 Command+V。"
         }
         guard !history.isEmpty else {
@@ -4178,7 +4226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         ]
 
         for (index, item) in history.enumerated() {
-            let gross = item.total - initial.total
+            let gross = item.total - baseTotal
             let afterCost = gross - cost - partnerCost
             rows.append(String(format: "│ %4d │ %-8@ │ %12.2f │ %+12.2f │ %+12.2f │",
                                index + 1,
@@ -4272,6 +4320,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let state = StoredState(
             cost: ownerCost,
             partnerCost: partnerCost,
+            manualBaseTotal: manualBaseInputValue() ?? manualBaseTotal,
             initial: initial,
             history: history,
             settlement: settlement
@@ -4303,6 +4352,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         costField.stringValue = money(state.cost)
         partnerCostField.stringValue = money(state.partnerCost ?? 0)
+        manualBaseTotal = state.manualBaseTotal
+        manualBaseField.stringValue = state.manualBaseTotal.map { money($0) } ?? ""
         initial = state.initial
         history = state.history
         settlement = state.settlement ?? .default
