@@ -1547,23 +1547,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panel.layer?.cornerRadius = 8
         panel.translatesAutoresizingMaskIntoConstraints = false
 
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.spacing = 8
-        stack.alignment = .width
-        stack.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
         let title = NSTextField(labelWithString: "合伙结算")
         title.font = .systemFont(ofSize: 15, weight: .bold)
         title.textColor = .systemIndigo
         title.alignment = .left
+        title.translatesAutoresizingMaskIntoConstraints = false
 
         let hint = NSTextField(labelWithString: "按当前余额合计与基准余额合计的差额结算；盈利先返还双方实际出资，再按比例分利润；亏损双方各承担一半。")
         hint.font = .systemFont(ofSize: 12, weight: .medium)
         hint.textColor = .secondaryLabelColor
         hint.lineBreakMode = .byWordWrapping
         hint.maximumNumberOfLines = 2
+        hint.alignment = .left
+        hint.translatesAutoresizingMaskIntoConstraints = false
 
         configureSettlementField(partnerShareField, placeholder: "40", width: 58)
         partnerShareField.stringValue = money(settlement.partnerSharePercent)
@@ -1572,6 +1568,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         settingsRow.orientation = .horizontal
         settingsRow.spacing = 8
         settingsRow.alignment = .centerY
+        settingsRow.translatesAutoresizingMaskIntoConstraints = false
         let partnerInfo = NSButton(title: "?", target: nil, action: nil)
         partnerInfo.isBordered = true
         partnerInfo.bezelStyle = .circular
@@ -1589,69 +1586,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let ownerShare = NSTextField(labelWithString: "我方分成 = 100% - 对方分成")
         ownerShare.font = .systemFont(ofSize: 12, weight: .semibold)
         ownerShare.textColor = .secondaryLabelColor
+        ownerShare.alignment = .left
         settingsRow.addArrangedSubview(ownerShare)
 
         let partnerTransferValue = settlementMetricValue()
         let ownerReceivesValue = settlementMetricValue()
-        partnerTransferValue.font = .systemFont(ofSize: 22, weight: .bold)
-        ownerReceivesValue.font = .systemFont(ofSize: 22, weight: .bold)
+        partnerTransferValue.font = .systemFont(ofSize: 21, weight: .bold)
+        ownerReceivesValue.font = .systemFont(ofSize: 21, weight: .bold)
 
         let resultRow = NSStackView()
         resultRow.orientation = .horizontal
-        resultRow.spacing = 18
+        resultRow.spacing = 12
         resultRow.alignment = .centerY
-        resultRow.distribution = .fillEqually
+        resultRow.distribution = .fill
+        resultRow.translatesAutoresizingMaskIntoConstraints = false
         resultRow.addArrangedSubview(settlementResultBlock(title: "合作人应收", value: partnerTransferValue, color: .systemOrange))
         resultRow.addArrangedSubview(settlementResultBlock(title: "我方应留", value: ownerReceivesValue, color: .systemIndigo))
 
         let formula = NSTextField(wrappingLabelWithString: "")
         formula.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
         formula.textColor = .secondaryLabelColor
-        formula.maximumNumberOfLines = 2
+        formula.maximumNumberOfLines = 3
         formula.lineBreakMode = .byWordWrapping
+        formula.alignment = .left
+        formula.translatesAutoresizingMaskIntoConstraints = false
 
         let leftColumn = NSStackView()
         leftColumn.orientation = .vertical
-        leftColumn.spacing = 10
+        leftColumn.spacing = 8
         leftColumn.alignment = .width
         leftColumn.translatesAutoresizingMaskIntoConstraints = false
         leftColumn.addArrangedSubview(hint)
         leftColumn.addArrangedSubview(settingsRow)
-
-        let rightColumn = NSStackView()
-        rightColumn.orientation = .vertical
-        rightColumn.spacing = 8
-        rightColumn.alignment = .width
-        rightColumn.translatesAutoresizingMaskIntoConstraints = false
-        rightColumn.addArrangedSubview(resultRow)
+        leftColumn.addArrangedSubview(formula)
 
         let contentRow = NSStackView()
         contentRow.orientation = .horizontal
-        contentRow.spacing = 28
+        contentRow.spacing = 18
         contentRow.alignment = .centerY
         contentRow.translatesAutoresizingMaskIntoConstraints = false
         contentRow.addArrangedSubview(leftColumn)
-        contentRow.addArrangedSubview(rightColumn)
+        contentRow.addArrangedSubview(resultRow)
         leftColumn.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        rightColumn.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        leftColumn.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        resultRow.setContentHuggingPriority(.required, for: .horizontal)
+        resultRow.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        stack.addArrangedSubview(title)
-        stack.addArrangedSubview(contentRow)
-        stack.addArrangedSubview(formula)
-        panel.addSubview(stack)
+        panel.addSubview(title)
+        panel.addSubview(contentRow)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: panel.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: panel.bottomAnchor),
-            title.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
-            title.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
-            contentRow.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
-            contentRow.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
-            formula.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
-            formula.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
-            leftColumn.widthAnchor.constraint(greaterThanOrEqualTo: stack.widthAnchor, multiplier: 0.48),
-            rightColumn.widthAnchor.constraint(greaterThanOrEqualTo: stack.widthAnchor, multiplier: 0.32)
+            title.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 16),
+            title.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -16),
+            title.topAnchor.constraint(equalTo: panel.topAnchor, constant: 12),
+            contentRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 16),
+            contentRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -16),
+            contentRow.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
+            contentRow.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -12),
+            resultRow.widthAnchor.constraint(equalToConstant: 412)
         ])
 
         settlementLabels = (partnerTransferValue, ownerReceivesValue, formula)
@@ -1693,13 +1684,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let value = NSTextField(labelWithString: "--")
         value.font = .systemFont(ofSize: 14, weight: .bold)
         value.alignment = .center
-        value.lineBreakMode = .byTruncatingTail
+        value.lineBreakMode = .byClipping
         value.maximumNumberOfLines = 1
         value.cell?.wraps = false
         value.cell?.isScrollable = false
         value.translatesAutoresizingMaskIntoConstraints = false
-        value.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        value.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        value.setContentHuggingPriority(.required, for: .horizontal)
+        value.setContentCompressionResistancePriority(.required, for: .horizontal)
         return value
     }
 
@@ -1728,19 +1719,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func settlementResultBlock(title: String, value: NSTextField, color: NSColor) -> NSView {
         let stack = NSStackView()
         stack.orientation = .vertical
-        stack.spacing = 6
+        stack.spacing = 4
         stack.alignment = .centerX
-        stack.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
+        stack.edgeInsets = NSEdgeInsets(top: 9, left: 12, bottom: 9, right: 12)
         stack.wantsLayer = true
         stack.layer?.cornerRadius = 8
         stack.layer?.backgroundColor = color.withAlphaComponent(0.08).cgColor
         stack.layer?.borderColor = color.withAlphaComponent(0.22).cgColor
         stack.layer?.borderWidth = 1
+        stack.translatesAutoresizingMaskIntoConstraints = false
 
         let titleLabel = NSTextField(labelWithString: title)
         titleLabel.font = .systemFont(ofSize: 12, weight: .bold)
         titleLabel.textColor = color
         titleLabel.alignment = .center
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
         value.alignment = .center
 
         stack.addArrangedSubview(titleLabel)
@@ -1750,6 +1743,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             titleLabel.trailingAnchor.constraint(equalTo: stack.trailingAnchor, constant: -10),
             value.leadingAnchor.constraint(equalTo: stack.leadingAnchor, constant: 10),
             value.trailingAnchor.constraint(equalTo: stack.trailingAnchor, constant: -10),
+            stack.widthAnchor.constraint(equalToConstant: 200),
             stack.heightAnchor.constraint(equalToConstant: 78)
         ])
         return stack
