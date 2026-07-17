@@ -73,6 +73,7 @@ for arch in arm64 x86_64; do
         -sdk "$SDK_PATH" \
         -target "$arch-apple-macosx$MIN_MACOS_VERSION" \
         -framework Cocoa \
+        -framework Security \
         -framework Vision \
         -F "$SPARKLE_DIR" \
         -framework Sparkle \

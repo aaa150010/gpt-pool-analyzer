@@ -1,6 +1,40 @@
 import Cocoa
+import Security
 import Sparkle
 import Vision
+
+private let maxBalanceHistoryCount = 1000
+private let maxPoolHistoryPerGroup = 1000
+private let defaultPollingMinutes: Double = 5
+private let defaultBalanceBaseURL = "https://api.ai-pixel.online"
+
+private func drawTimeAxis(in rect: NSRect, minDate: Date, maxDate: Date, tickCount: Int = 5) {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "zh_CN")
+    formatter.dateFormat = Calendar.current.isDate(minDate, inSameDayAs: maxDate) ? "HH:mm" : "MM-dd HH:mm"
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.alignment = .center
+    let attrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+        .foregroundColor: NSColor.secondaryLabelColor,
+        .paragraphStyle: paragraph
+    ]
+    let count = max(tickCount, 2)
+    let span = max(maxDate.timeIntervalSince(minDate), 1)
+    NSColor.separatorColor.withAlphaComponent(0.35).setStroke()
+    for index in 0..<count {
+        let ratio = CGFloat(index) / CGFloat(count - 1)
+        let x = rect.minX + ratio * rect.width
+        let tick = NSBezierPath()
+        tick.lineWidth = 0.8
+        tick.move(to: NSPoint(x: x, y: rect.maxY))
+        tick.line(to: NSPoint(x: x, y: rect.maxY + 5))
+        tick.stroke()
+        let date = minDate.addingTimeInterval(TimeInterval(ratio) * span)
+        let label = formatter.string(from: date)
+        label.draw(in: NSRect(x: x - 45, y: rect.maxY + 8, width: 90, height: 16), withAttributes: attrs)
+    }
+}
 
 struct Snapshot: Codable {
     var date: Date
@@ -23,8 +57,24 @@ struct OCRLine {
 
 struct StoredState: Codable {
     var cost: Double
+    var partnerCost: Double?
     var initial: Snapshot?
     var history: [Snapshot]
+    var settlement: SettlementState?
+}
+
+struct SettlementState: Codable {
+    var partnerName: String
+    var partnerSharePercent: Double
+    var payoutRatePercent: Double
+    var withdrawals: [String: Double]
+
+    static let `default` = SettlementState(
+        partnerName: "合作人",
+        partnerSharePercent: 40,
+        payoutRatePercent: 85,
+        withdrawals: [:]
+    )
 }
 
 struct PoolSnapshot: Codable {
@@ -36,6 +86,8 @@ struct PoolSnapshot: Codable {
     var schedulable: Int
     var remaining5h: Int?
     var remaining7d: Int?
+    var utilization5h: Double?
+    var utilization7d: Double?
     var concurrentAvailable: Int
     var concurrentTotal: Int
     var limited: Int
@@ -46,6 +98,551 @@ struct PoolSnapshot: Codable {
 
 struct PoolAnalyzerState: Codable {
     var history: [PoolSnapshot]
+    var selectedGroups: [String]?
+    var availableGroups: [String]?
+    var pollingMinutes: Double?
+    var warningEmail: String?
+    var accessToken: String?
+    var refreshToken: String?
+}
+
+struct APIQuotaDashboardResponse: Decodable {
+    var data: APIQuotaDashboardData
+}
+
+struct APIQuotaDashboardData: Decodable {
+    var platform: APIQuotaPlatform
+}
+
+struct APIQuotaPlatform: Decodable {
+    var groupSummaries: [APIGroupSummary]
+
+    enum CodingKeys: String, CodingKey {
+        case groupSummaries = "group_summaries"
+    }
+}
+
+struct APIGroupSummary: Decodable {
+    var groupName: String
+    var groupStatus: String
+    var accountCount: Int
+    var activeAccountCount: Int
+    var schedulableAccountCount: Int
+    var rateLimitedAccountCount: Int
+    var codexQuotaProtectedAccountCount: Int
+    var errorAccountCount: Int
+    var disabledAccountCount: Int
+    var usageWindows: [APIUsageWindow]
+
+    enum CodingKeys: String, CodingKey {
+        case groupName = "group_name"
+        case groupStatus = "group_status"
+        case accountCount = "account_count"
+        case activeAccountCount = "active_account_count"
+        case schedulableAccountCount = "schedulable_account_count"
+        case rateLimitedAccountCount = "rate_limited_account_count"
+        case codexQuotaProtectedAccountCount = "codex_quota_protected_account_count"
+        case errorAccountCount = "error_account_count"
+        case disabledAccountCount = "disabled_account_count"
+        case usageWindows = "usage_windows"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        groupName = try container.decodeIfPresent(String.self, forKey: .groupName) ?? ""
+        groupStatus = try container.decodeIfPresent(String.self, forKey: .groupStatus) ?? ""
+        accountCount = try container.decodeFlexibleInt(forKey: .accountCount)
+        activeAccountCount = try container.decodeFlexibleInt(forKey: .activeAccountCount)
+        schedulableAccountCount = try container.decodeFlexibleInt(forKey: .schedulableAccountCount)
+        rateLimitedAccountCount = try container.decodeFlexibleInt(forKey: .rateLimitedAccountCount)
+        codexQuotaProtectedAccountCount = try container.decodeFlexibleInt(forKey: .codexQuotaProtectedAccountCount)
+        errorAccountCount = try container.decodeFlexibleInt(forKey: .errorAccountCount)
+        disabledAccountCount = try container.decodeFlexibleInt(forKey: .disabledAccountCount)
+        usageWindows = try container.decodeIfPresent([APIUsageWindow].self, forKey: .usageWindows) ?? []
+    }
+}
+
+struct APIUsageWindow: Decodable {
+    var window: String
+    var accountCount: Int?
+    var remainingCapacityPercent: Double?
+    var averageUtilization: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case window
+        case accountCount = "account_count"
+        case remainingCapacityPercent = "remaining_capacity_percent"
+        case averageUtilization = "average_utilization"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        window = try container.decodeIfPresent(String.self, forKey: .window) ?? ""
+        accountCount = try container.decodeFlexibleOptionalInt(forKey: .accountCount)
+        remainingCapacityPercent = try container.decodeFlexibleOptionalDouble(forKey: .remainingCapacityPercent)
+        averageUtilization = try container.decodeFlexibleOptionalDouble(forKey: .averageUtilization)
+    }
+}
+
+struct APILoginResponse: Decodable {
+    var data: APILoginData
+}
+
+struct APIErrorResponse: Decodable {
+    var message: String?
+    var code: Int?
+}
+
+struct APILoginData: Decodable {
+    var accessToken: String
+    var refreshToken: String?
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
+        case refreshToken = "refresh_token"
+    }
+}
+
+struct PoolCredentials: Codable {
+    var email: String
+    var password: String
+}
+
+struct SMTPSettings: Codable {
+    var host: String
+    var port: Int
+    var username: String
+    var password: String
+    var recipient: String
+
+    static let `default` = SMTPSettings(
+        host: "smtp.qq.com",
+        port: 465,
+        username: "",
+        password: "",
+        recipient: "706137702@qq.com"
+    )
+}
+
+struct BalanceAccount: Codable {
+    var name: String
+    var baseURL: String
+    var apiKey: String
+}
+
+struct BalanceQueryItem {
+    var account: BalanceAccount
+    var balance: Double
+    var unit: String
+}
+
+enum PoolTrendMetric: Int, CaseIterable {
+    case remaining5h
+    case remaining7d
+    case total
+    case limited
+    case quotaProtected
+    case error
+    case concurrent
+
+    var title: String {
+        switch self {
+        case .remaining5h: return "5h剩余"
+        case .remaining7d: return "7d剩余"
+        case .total: return "总账号"
+        case .limited: return "限流"
+        case .quotaProtected: return "额度保护"
+        case .error: return "错误"
+        case .concurrent: return "并发可用"
+        }
+    }
+
+    func value(in snapshot: PoolSnapshot) -> Double? {
+        switch self {
+        case .remaining5h: return snapshot.remaining5h.map(Double.init)
+        case .remaining7d: return snapshot.remaining7d.map(Double.init)
+        case .total: return Double(snapshot.total)
+        case .limited: return Double(snapshot.limited)
+        case .quotaProtected: return Double(snapshot.quotaProtected)
+        case .error: return Double(snapshot.error)
+        case .concurrent: return Double(snapshot.concurrentAvailable)
+        }
+    }
+}
+
+final class PoolTrendChartView: NSView {
+    var history: [PoolSnapshot] = [] {
+        didSet { needsDisplay = true }
+    }
+    var groups: [String] = [] {
+        didSet { needsDisplay = true }
+    }
+    var metric: PoolTrendMetric = .remaining5h {
+        didSet { needsDisplay = true }
+    }
+
+    private let palette: [NSColor] = [.systemTeal, .systemOrange, .systemBlue, .systemPurple, .systemPink, .systemGreen, .systemRed, .systemIndigo]
+    private var trackingArea: NSTrackingArea?
+    private var hoverLocation: NSPoint?
+
+    override var isFlipped: Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        hoverLocation = convert(event.locationInWindow, from: nil)
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hoverLocation = nil
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        NSColor.white.setFill()
+        bounds.fill()
+
+        let plotRect = bounds.insetBy(dx: 58, dy: 42)
+        guard plotRect.width > 80, plotRect.height > 80 else { return }
+
+        let series = makeSeries()
+        guard !series.isEmpty else {
+            drawEmpty(in: bounds)
+            return
+        }
+
+        let allPoints = series.flatMap(\.points)
+        guard let minDate = allPoints.map(\.date).min(),
+              let maxDate = allPoints.map(\.date).max() else {
+            drawEmpty(in: bounds)
+            return
+        }
+        let values = allPoints.map(\.value)
+        let rawMin = values.min() ?? 0
+        let rawMax = values.max() ?? 1
+        let padding = max((rawMax - rawMin) * 0.12, rawMax == rawMin ? max(rawMax * 0.08, 1) : 0)
+        let minValue = max(0, rawMin - padding)
+        let maxValue = rawMax + padding
+        let timeSpan = max(maxDate.timeIntervalSince(minDate), 1)
+        let valueSpan = max(maxValue - minValue, 1)
+
+        drawGrid(in: plotRect, minValue: minValue, maxValue: maxValue)
+        drawAxes(in: plotRect)
+
+        for (index, item) in series.enumerated() {
+            let color = palette[index % palette.count]
+            let path = NSBezierPath()
+            path.lineWidth = 2.4
+            path.lineJoinStyle = .round
+            for (pointIndex, point) in item.points.enumerated() {
+                let x = plotRect.minX + CGFloat(point.date.timeIntervalSince(minDate) / timeSpan) * plotRect.width
+                let y = plotRect.maxY - CGFloat((point.value - minValue) / valueSpan) * plotRect.height
+                if pointIndex == 0 {
+                    path.move(to: NSPoint(x: x, y: y))
+                } else {
+                    path.line(to: NSPoint(x: x, y: y))
+                }
+            }
+            color.setStroke()
+            path.stroke()
+            if let last = item.points.last {
+                let x = plotRect.minX + CGFloat(last.date.timeIntervalSince(minDate) / timeSpan) * plotRect.width
+                let y = plotRect.maxY - CGFloat((last.value - minValue) / valueSpan) * plotRect.height
+                color.setFill()
+                NSBezierPath(ovalIn: NSRect(x: x - 3.5, y: y - 3.5, width: 7, height: 7)).fill()
+            }
+        }
+
+        drawTimeAxis(in: plotRect, minDate: minDate, maxDate: maxDate)
+        drawLegend(series: series, in: NSRect(x: plotRect.minX, y: bounds.minY + 8, width: plotRect.width, height: 24))
+        drawTooltipIfNeeded(in: plotRect, minDate: minDate, timeSpan: timeSpan, minValue: minValue, valueSpan: valueSpan)
+    }
+
+    private func makeSeries() -> [(group: String, points: [(date: Date, value: Double)])] {
+        let orderedGroups = groups.isEmpty
+            ? Array(Set(history.map(\.groupName))).sorted()
+            : groups
+        return orderedGroups.compactMap { group in
+            let points = history
+                .filter { $0.groupName == group }
+                .sorted { $0.date < $1.date }
+                .compactMap { snapshot -> (date: Date, value: Double)? in
+                    guard let value = metric.value(in: snapshot) else { return nil }
+                    return (snapshot.date, value)
+                }
+            return points.isEmpty ? nil : (group, points)
+        }
+    }
+
+    private func drawGrid(in rect: NSRect, minValue: Double, maxValue: Double) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .right
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: paragraph
+        ]
+        NSColor.separatorColor.withAlphaComponent(0.6).setStroke()
+        for index in 0...4 {
+            let ratio = CGFloat(index) / 4
+            let y = rect.maxY - ratio * rect.height
+            let path = NSBezierPath()
+            path.lineWidth = 0.8
+            path.move(to: NSPoint(x: rect.minX, y: y))
+            path.line(to: NSPoint(x: rect.maxX, y: y))
+            path.stroke()
+            let value = minValue + Double(ratio) * (maxValue - minValue)
+            let label = value >= 100 ? "\(Int(value.rounded()))" : String(format: "%.1f", value)
+            label.draw(in: NSRect(x: 4, y: y - 8, width: rect.minX - 10, height: 16), withAttributes: attrs)
+        }
+    }
+
+    private func drawAxes(in rect: NSRect) {
+        NSColor.separatorColor.setStroke()
+        let path = NSBezierPath()
+        path.lineWidth = 1
+        path.move(to: NSPoint(x: rect.minX, y: rect.minY))
+        path.line(to: NSPoint(x: rect.minX, y: rect.maxY))
+        path.line(to: NSPoint(x: rect.maxX, y: rect.maxY))
+        path.stroke()
+    }
+
+    private func drawLegend(series: [(group: String, points: [(date: Date, value: Double)])], in rect: NSRect) {
+        var x = rect.minX
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: NSColor.labelColor
+        ]
+        for (index, item) in series.enumerated() {
+            let color = palette[index % palette.count]
+            color.setFill()
+            NSBezierPath(roundedRect: NSRect(x: x, y: rect.minY + 6, width: 18, height: 5), xRadius: 2, yRadius: 2).fill()
+            let latest = item.points.last?.value ?? 0
+            let label = "\(item.group) \(latest >= 100 ? "\(Int(latest.rounded()))" : String(format: "%.1f", latest))"
+            let size = (label as NSString).size(withAttributes: attrs)
+            label.draw(in: NSRect(x: x + 24, y: rect.minY, width: size.width + 8, height: 18), withAttributes: attrs)
+            x += 34 + size.width + 22
+            if x > rect.maxX - 120 { break }
+        }
+    }
+
+    private func drawTooltipIfNeeded(in plotRect: NSRect, minDate: Date, timeSpan: TimeInterval, minValue: Double, valueSpan: Double) {
+        guard let hoverLocation, plotRect.contains(hoverLocation) else { return }
+        let ratio = max(0, min((hoverLocation.x - plotRect.minX) / plotRect.width, 1))
+        let targetDate = minDate.addingTimeInterval(TimeInterval(ratio) * timeSpan)
+        let rows = tooltipRows(near: targetDate)
+        guard !rows.isEmpty else { return }
+
+        let nearestDate = rows.map(\.snapshot.date).min { abs($0.timeIntervalSince(targetDate)) < abs($1.timeIntervalSince(targetDate)) } ?? targetDate
+        let x = plotRect.minX + CGFloat(nearestDate.timeIntervalSince(minDate) / timeSpan) * plotRect.width
+        NSColor.secondaryLabelColor.withAlphaComponent(0.5).setStroke()
+        let guide = NSBezierPath()
+        guide.lineWidth = 1
+        guide.move(to: NSPoint(x: x, y: plotRect.minY))
+        guide.line(to: NSPoint(x: x, y: plotRect.maxY))
+        guide.stroke()
+
+        for row in rows {
+            if let value = metric.value(in: row.snapshot) {
+                let y = plotRect.maxY - CGFloat((value - minValue) / valueSpan) * plotRect.height
+                row.color.setFill()
+                NSBezierPath(ovalIn: NSRect(x: x - 4, y: y - 4, width: 8, height: 8)).fill()
+            }
+        }
+        drawTooltipBox(rows: rows, anchor: NSPoint(x: x, y: hoverLocation.y), in: plotRect)
+    }
+
+    private func tooltipRows(near targetDate: Date) -> [(group: String, snapshot: PoolSnapshot, color: NSColor)] {
+        let orderedGroups = groups.isEmpty
+            ? Array(Set(history.map(\.groupName))).sorted()
+            : groups
+        return orderedGroups.enumerated().compactMap { index, group in
+            let rows = history.filter { $0.groupName == group }
+            guard let nearest = rows.min(by: {
+                abs($0.date.timeIntervalSince(targetDate)) < abs($1.date.timeIntervalSince(targetDate))
+            }) else { return nil }
+            return (group, nearest, palette[index % palette.count])
+        }
+    }
+
+    private func drawTooltipBox(rows: [(group: String, snapshot: PoolSnapshot, color: NSColor)], anchor: NSPoint, in plotRect: NSRect) {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "MM-dd HH:mm:ss"
+        let title = formatter.string(from: rows.first?.snapshot.date ?? Date())
+        let lines = rows.map { row -> String in
+            let five = row.snapshot.remaining5h.map(String.init) ?? "--"
+            let seven = row.snapshot.remaining7d.map(String.init) ?? "--"
+            let fivePercent = row.snapshot.utilization5h.map { String(format: "%.1f%%", $0) } ?? "--"
+            let sevenPercent = row.snapshot.utilization7d.map { String(format: "%.1f%%", $0) } ?? "--"
+            return "\(row.group)  5h \(five) (\(fivePercent))   7d \(seven) (\(sevenPercent))"
+        }
+        let titleAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .bold),
+            .foregroundColor: NSColor.labelColor
+        ]
+        let rowAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.labelColor
+        ]
+        let width = max((title as NSString).size(withAttributes: titleAttrs).width, lines.map { ($0 as NSString).size(withAttributes: rowAttrs).width }.max() ?? 0) + 28
+        let height = CGFloat(28 + lines.count * 20)
+        var x = anchor.x + 12
+        if x + width > plotRect.maxX { x = anchor.x - width - 12 }
+        let y = min(max(anchor.y - height / 2, plotRect.minY + 4), plotRect.maxY - height - 4)
+        let rect = NSRect(x: x, y: y, width: width, height: height)
+
+        NSColor.windowBackgroundColor.withAlphaComponent(0.96).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).fill()
+        NSColor.separatorColor.setStroke()
+        NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).stroke()
+
+        title.draw(in: NSRect(x: rect.minX + 12, y: rect.minY + 8, width: rect.width - 24, height: 16), withAttributes: titleAttrs)
+        for (index, line) in lines.enumerated() {
+            let rowY = rect.minY + 30 + CGFloat(index * 20)
+            rows[index].color.setFill()
+            NSBezierPath(ovalIn: NSRect(x: rect.minX + 12, y: rowY + 5, width: 7, height: 7)).fill()
+            line.draw(in: NSRect(x: rect.minX + 24, y: rowY, width: rect.width - 34, height: 16), withAttributes: rowAttrs)
+        }
+    }
+
+    private func drawEmpty(in rect: NSRect) {
+        let text = "暂无轮询历史"
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 16, weight: .semibold),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        let size = (text as NSString).size(withAttributes: attrs)
+        text.draw(in: NSRect(x: rect.midX - size.width / 2, y: rect.midY - 10, width: size.width, height: 24), withAttributes: attrs)
+    }
+}
+
+final class BalanceTrendChartView: NSView {
+    var history: [Snapshot] = [] {
+        didSet { needsDisplay = true }
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        NSColor.white.setFill()
+        bounds.fill()
+        let rect = bounds.insetBy(dx: 54, dy: 34)
+        let points = history.sorted { $0.date < $1.date }.map { ($0.date, $0.total) }
+        guard points.count >= 2, let minDate = points.map(\.0).min(), let maxDate = points.map(\.0).max() else {
+            drawEmpty()
+            return
+        }
+        let minValue = max((points.map(\.1).min() ?? 0) * 0.96, 0)
+        let maxValue = max((points.map(\.1).max() ?? 1) * 1.04, minValue + 1)
+        let timeSpan = max(maxDate.timeIntervalSince(minDate), 1)
+        let valueSpan = max(maxValue - minValue, 1)
+        drawGrid(in: rect, minValue: minValue, maxValue: maxValue)
+        let path = NSBezierPath()
+        path.lineWidth = 2.6
+        path.lineJoinStyle = .round
+        for (index, point) in points.enumerated() {
+            let x = rect.minX + CGFloat(point.0.timeIntervalSince(minDate) / timeSpan) * rect.width
+            let y = rect.maxY - CGFloat((point.1 - minValue) / valueSpan) * rect.height
+            index == 0 ? path.move(to: NSPoint(x: x, y: y)) : path.line(to: NSPoint(x: x, y: y))
+        }
+        NSColor.systemGreen.setStroke()
+        path.stroke()
+        if let latest = points.last {
+            let x = rect.minX + CGFloat(latest.0.timeIntervalSince(minDate) / timeSpan) * rect.width
+            let y = rect.maxY - CGFloat((latest.1 - minValue) / valueSpan) * rect.height
+            NSColor.systemGreen.setFill()
+            NSBezierPath(ovalIn: NSRect(x: x - 4, y: y - 4, width: 8, height: 8)).fill()
+        }
+        drawTimeAxis(in: rect, minDate: minDate, maxDate: maxDate)
+        drawLatest(points.last?.1 ?? 0, in: rect)
+    }
+
+    private func drawGrid(in rect: NSRect, minValue: Double, maxValue: Double) {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .right
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: paragraph
+        ]
+        NSColor.separatorColor.withAlphaComponent(0.6).setStroke()
+        for index in 0...3 {
+            let ratio = CGFloat(index) / 3
+            let y = rect.maxY - ratio * rect.height
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: rect.minX, y: y))
+            path.line(to: NSPoint(x: rect.maxX, y: y))
+            path.stroke()
+            let value = minValue + Double(ratio) * (maxValue - minValue)
+            String(format: "%.0f", value).draw(in: NSRect(x: 0, y: y - 8, width: rect.minX - 8, height: 16), withAttributes: attrs)
+        }
+    }
+
+    private func drawLatest(_ value: Double, in rect: NSRect) {
+        let text = "最新余额合计 \(String(format: "%.2f", value))"
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .bold),
+            .foregroundColor: NSColor.systemGreen
+        ]
+        text.draw(in: NSRect(x: rect.minX, y: 8, width: 240, height: 20), withAttributes: attrs)
+    }
+
+    private func drawEmpty() {
+        let text = "查询为基准后开始显示余额走势"
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        let size = (text as NSString).size(withAttributes: attrs)
+        text.draw(in: NSRect(x: bounds.midX - size.width / 2, y: bounds.midY - 10, width: size.width, height: 24), withAttributes: attrs)
+    }
+}
+
+final class UsageBarView: NSView {
+    var value: Double = 0 {
+        didSet { needsDisplay = true }
+    }
+
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let clamped = max(0, min(value, 1))
+        let track = bounds.insetBy(dx: 0, dy: max((bounds.height - 8) / 2, 0))
+        let path = NSBezierPath(roundedRect: track, xRadius: 4, yRadius: 4)
+        NSColor(calibratedWhite: 0.86, alpha: 1).setFill()
+        path.fill()
+
+        guard clamped > 0 else { return }
+        let fillRect = NSRect(x: track.minX, y: track.minY, width: track.width * CGFloat(clamped), height: track.height)
+        let fillPath = NSBezierPath(roundedRect: fillRect, xRadius: 4, yRadius: 4)
+        usageColor(for: clamped).setFill()
+        fillPath.fill()
+    }
+
+    private func usageColor(for value: Double) -> NSColor {
+        let percent = value * 100
+        if percent >= 100 { return .systemRed }
+        if percent >= 80 { return .systemOrange }
+        return .systemGreen
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
@@ -56,10 +653,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     )
     private var window: NSWindow!
     private let costField = NSTextField(string: "200")
+    private let partnerCostField = NSTextField(string: "0")
     private let addCostField = NSTextField(string: "")
     private let statusLabel = NSTextField(labelWithString: "")
-    private let fixedFeePercent = 15.0
-    private var pasteMonitor: Any?
     private var metricAnimations: [String: Timer] = [:]
     private var displayedMetricValues: [String: Double] = [:]
     private var poolAnimations: [String: Timer] = [:]
@@ -77,27 +673,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let resultValue = NSTextField(labelWithString: "--")
     private let progressValue = NSTextField(labelWithString: "--")
     private let remainingValue = NSTextField(labelWithString: "--")
+    private let partnerNameField = NSTextField(string: "合作人")
+    private let partnerShareField = NSTextField(string: "40")
     private let comparisonTable = NSTableView()
     private let historyTable = NSTableView()
     private let plusPoolHistoryTable = NSTableView()
     private let k12PoolHistoryTable = NSTableView()
-    private let tabControl = NSSegmentedControl(labels: ["账号池分析", "成本计算", "成本历史"], trackingMode: .selectOne, target: nil, action: nil)
+    private let poolGroupsLabel = NSTextField(labelWithString: "PLUS共享号池、K12共享号池")
+    private let poolGroupsButton = NSButton(title: "选择号池", target: nil, action: nil)
+    private let poolPollingField = NSTextField(string: "5")
+    private let poolRefreshButton = NSButton(title: "刷新", target: nil, action: nil)
+    private let poolCredentialsButton = NSButton(title: "接口账号", target: nil, action: nil)
+    private let poolWarningButton = NSButton(title: "预警设置", target: nil, action: nil)
+    private let tabControl = NSSegmentedControl(labels: ["趋势分析", "账号池分析", "成本计算", "成本历史"], trackingMode: .selectOne, target: nil, action: nil)
+    private let trendMetricControl = NSSegmentedControl(labels: PoolTrendMetric.allCases.map(\.title), trackingMode: .selectOne, target: nil, action: nil)
+    private let trendChartView = PoolTrendChartView()
+    private let balanceTrendChartView = BalanceTrendChartView()
     private let contentHost = NSView()
     private var topPanel: NSView?
     private var metricWrap: NSView?
     private var activeContentView: NSView?
     private var poolSummaryLabels: [String: (total: NSTextField, schedulable: NSTextField, status: NSTextField, change: NSTextField, time: NSTextField)] = [:]
+    private var poolHistoryTables: [NSTableView: String] = [:]
+    private var settlementTextObservers: [NSObjectProtocol] = []
+    private var settlementLabels: (partnerTransfer: NSTextField, ownerReceives: NSTextField, formula: NSTextField)?
 
     private var initial: Snapshot?
     private var history: [Snapshot] = []
     private var poolHistory: [PoolSnapshot] = []
+    private var selectedPoolGroups: [String] = ["PLUS共享号池", "K12共享号池"]
+    private var availablePoolGroups: [String] = ["PLUS共享号池", "K12共享号池"]
+    private var poolAccessToken: String?
+    private var poolRefreshToken: String?
+    private var poolRefreshInProgress = false
+    private var poolPollingMinutes: Double = defaultPollingMinutes
+    private var poolPollingTimer: Timer?
+    private var selectedTrendMetric: PoolTrendMetric = .remaining5h
+    private var smtpSettings = SMTPSettings.default
+    private var poolWarningDedup: Set<String> = []
+    private var balanceAccounts: [BalanceAccount] = []
+    private var balancePollingTimer: Timer?
+    private var balanceQueryInProgress = false
+    private var settlement = SettlementState.default
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenu()
         buildWindow()
         loadState()
         loadPoolState()
+        balanceAccounts = loadBalanceAccounts()
         refreshOutput()
+        restartPoolPollingTimer()
+        restartBalancePollingTimer()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -105,10 +732,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if let pasteMonitor {
-            NSEvent.removeMonitor(pasteMonitor)
-        }
+        clearSettlementTextObservers()
         feedbackHideTimer?.invalidate()
+        poolPollingTimer?.invalidate()
+        balancePollingTimer?.invalidate()
     }
 
     private func buildWindow() {
@@ -122,15 +749,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         window.center()
 
         configureField(costField, placeholder: "200")
+        configureField(partnerCostField, placeholder: "0")
         configureField(addCostField, placeholder: "0")
         addCostField.target = self
         addCostField.action = #selector(addCost)
 
-        let initialButton = button("粘贴为基准截图", action: #selector(importInitial))
-        let latestButton = button("粘贴为最新截图", action: #selector(importLatest))
+        let initialButton = button("账号配置", action: #selector(editBalanceAccounts))
+        let latestButton = button("查询为基准", action: #selector(queryBalanceAsInitial))
+        let queryLatestButton = button("查询最新余额", action: #selector(queryBalanceAsLatest))
         let resetButton = button("一键重置", action: #selector(resetAll))
         let addCostButton = button("累加成本", action: #selector(addCost))
-        let buttonRow = NSStackView(views: [initialButton, latestButton, resetButton])
+        let buttonRow = NSStackView(views: [initialButton, latestButton, queryLatestButton, resetButton])
         buttonRow.orientation = .horizontal
         buttonRow.spacing = 10
         buttonRow.alignment = .centerY
@@ -204,15 +833,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         window.makeKeyAndOrderFront(nil)
 
         NotificationCenter.default.addObserver(self, selector: #selector(inputsChanged), name: NSControl.textDidChangeNotification, object: costField)
+        NotificationCenter.default.addObserver(self, selector: #selector(inputsChanged), name: NSControl.textDidChangeNotification, object: partnerCostField)
 
-        pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command),
-               event.charactersIgnoringModifiers?.lowercased() == "v" {
-                self?.pasteSmart()
-                return nil
-            }
-            return event
+    }
+
+    private func isEditingTextInput() -> Bool {
+        guard let responder = window?.firstResponder else { return false }
+        if responder is NSTextView {
+            return true
         }
+        if let view = responder as? NSView {
+            var current: NSView? = view
+            while let item = current {
+                if item is NSTextField {
+                    return true
+                }
+                current = item.superview
+            }
+        }
+        return false
     }
 
     private func buildMenu() {
@@ -239,6 +878,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         )
         quitItem.keyEquivalentModifierMask = [.command]
         appMenu.addItem(quitItem)
+
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let editMenu = NSMenu(title: "编辑")
+        editItem.submenu = editMenu
+        editMenu.addItem(NSMenuItem(title: "撤销", action: Selector(("undo:")), keyEquivalent: "z"))
+        let redoItem = NSMenuItem(title: "重做", action: Selector(("redo:")), keyEquivalent: "Z")
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(redoItem)
+        editMenu.addItem(.separator())
+        editMenu.addItem(NSMenuItem(title: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        editMenu.addItem(NSMenuItem(title: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        editMenu.addItem(NSMenuItem(title: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        editMenu.addItem(NSMenuItem(title: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
 
         NSApplication.shared.mainMenu = mainMenu
     }
@@ -277,15 +930,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         stack.orientation = .vertical
         stack.spacing = 6
         stack.alignment = .leading
-        stack.edgeInsets = NSEdgeInsets(top: 12, left: 20, bottom: 8, right: 20)
+        stack.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 8, right: 12)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         let inputRow = NSStackView()
         inputRow.orientation = .horizontal
         inputRow.spacing = 8
         inputRow.alignment = .centerY
-        inputRow.addArrangedSubview(label("成本"))
+        inputRow.translatesAutoresizingMaskIntoConstraints = false
+        inputRow.addArrangedSubview(label("我方出资"))
         inputRow.addArrangedSubview(costField)
+        inputRow.addArrangedSubview(label("合作人出资"))
+        inputRow.addArrangedSubview(partnerCostField)
         inputRow.addArrangedSubview(label("追加成本"))
         inputRow.addArrangedSubview(addCostField)
         inputRow.addArrangedSubview(addCostButton)
@@ -294,15 +950,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             inputRow.addArrangedSubview(button)
         }
 
-        stack.addArrangedSubview(inputRow)
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = inputRow
+        scroll.hasHorizontalScroller = true
+        scroll.hasVerticalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.borderType = .noBorder
+        stack.addArrangedSubview(scroll)
 
         panel.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: panel.trailingAnchor),
+            stack.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
             stack.topAnchor.constraint(equalTo: panel.topAnchor),
             stack.bottomAnchor.constraint(equalTo: panel.bottomAnchor),
-            panel.heightAnchor.constraint(equalToConstant: 54)
+            scroll.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+            scroll.heightAnchor.constraint(equalToConstant: 34),
+            inputRow.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            inputRow.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            inputRow.bottomAnchor.constraint(equalTo: scroll.contentView.bottomAnchor),
+            panel.heightAnchor.constraint(equalToConstant: 52)
         ])
         return panel
     }
@@ -318,9 +987,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         tabControl.selectedSegment = 0
         tabControl.segmentStyle = .rounded
         tabControl.controlSize = .large
-        tabControl.setWidth(112, forSegment: 0)
-        tabControl.setWidth(92, forSegment: 1)
+        tabControl.setWidth(100, forSegment: 0)
+        tabControl.setWidth(112, forSegment: 1)
         tabControl.setWidth(92, forSegment: 2)
+        tabControl.setWidth(92, forSegment: 3)
         tabControl.translatesAutoresizingMaskIntoConstraints = false
 
         bar.addSubview(tabControl)
@@ -346,13 +1016,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         statusLabel.font = .systemFont(ofSize: 13, weight: .semibold)
         statusLabel.alignment = .center
-        statusLabel.maximumNumberOfLines = 1
-        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.maximumNumberOfLines = 2
+        statusLabel.lineBreakMode = .byWordWrapping
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
         bar.addSubview(statusLabel)
         NSLayoutConstraint.activate([
-            bar.heightAnchor.constraint(equalToConstant: 36),
+            bar.heightAnchor.constraint(greaterThanOrEqualToConstant: 36),
             statusLabel.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 18),
             statusLabel.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -18),
             statusLabel.centerYAnchor.constraint(equalTo: bar.centerYAnchor)
@@ -362,9 +1032,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func showFeedback(_ message: String, color: NSColor = .white, autoHide: Bool = true) {
         feedbackHideTimer?.invalidate()
-        statusLabel.stringValue = message
+        let summary = message.count > 120 ? String(message.prefix(120)) + "..." : message
+        statusLabel.stringValue = summary
         statusLabel.textColor = color
         feedbackBar?.isHidden = false
+        if message.count > 180 || message.contains("\n") {
+            showDetailDialog(title: "提示详情", message: message, style: color == .systemRed ? .warning : .informational)
+        }
         guard autoHide else { return }
         feedbackHideTimer = Timer.scheduledTimer(withTimeInterval: 3.2, repeats: false) { [weak self] _ in
             self?.feedbackBar?.isHidden = true
@@ -398,17 +1072,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     @objc private func switchTab(_ sender: Any?) {
         activeContentView?.removeFromSuperview()
-        let isPoolTab = tabControl.selectedSegment == 0
-        topPanel?.isHidden = isPoolTab
-        metricWrap?.isHidden = isPoolTab
+        let isAccountTab = tabControl.selectedSegment == 0 || tabControl.selectedSegment == 1
+        topPanel?.isHidden = isAccountTab
+        metricWrap?.isHidden = isAccountTab
         let nextView: NSView
         switch tabControl.selectedSegment {
         case 1:
-            nextView = buildCalcPanel()
+            nextView = buildPoolPanel()
         case 2:
+            nextView = buildCalcPanel()
+        case 3:
             nextView = buildHistoryPanel()
         default:
-            nextView = buildPoolPanel()
+            nextView = buildTrendPanel()
         }
         activeContentView = nextView
         nextView.translatesAutoresizingMaskIntoConstraints = false
@@ -419,46 +1095,143 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             nextView.topAnchor.constraint(equalTo: contentHost.topAnchor),
             nextView.bottomAnchor.constraint(equalTo: contentHost.bottomAnchor)
         ])
+        if tabControl.selectedSegment == 1 {
+            scrollToLatestRows()
+        }
     }
 
     private func buildPoolPanel() -> NSView {
         let panel = NSView()
         panel.wantsLayer = true
         panel.layer?.backgroundColor = NSColor.white.cgColor
+        poolHistoryTables = [:]
 
         let stack = NSStackView()
         stack.orientation = .vertical
-        stack.spacing = 14
+        stack.spacing = 10
         stack.alignment = .width
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        let summaryRow = NSStackView(views: [
-            poolSummaryCard(groupName: "PLUS共享号池", accent: .systemTeal),
-            poolSummaryCard(groupName: "K12共享号池", accent: .systemOrange)
-        ])
-        summaryRow.orientation = .horizontal
-        summaryRow.spacing = 12
-        summaryRow.distribution = .fillEqually
-        summaryRow.translatesAutoresizingMaskIntoConstraints = false
+        let toolbar = buildPoolToolbar()
+        toolbar.heightAnchor.constraint(equalToConstant: 34).isActive = true
 
-        let plusSection = poolHistorySection(title: "PLUS共享号池历史", groupName: "PLUS共享号池", table: plusPoolHistoryTable)
-        let k12Section = poolHistorySection(title: "K12共享号池历史", groupName: "K12共享号池", table: k12PoolHistoryTable)
-        plusSection.setContentHuggingPriority(.defaultLow, for: .vertical)
-        k12Section.setContentHuggingPriority(.defaultLow, for: .vertical)
-        plusSection.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        k12Section.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        let sectionStack = NSStackView()
+        sectionStack.orientation = .vertical
+        sectionStack.spacing = 10
+        sectionStack.alignment = .width
+        sectionStack.translatesAutoresizingMaskIntoConstraints = false
 
-        stack.addArrangedSubview(summaryRow)
-        stack.addArrangedSubview(plusSection)
-        stack.addArrangedSubview(k12Section)
+        let groups = selectedPoolGroups.isEmpty ? ["PLUS共享号池", "K12共享号池"] : selectedPoolGroups
+        var firstSection: NSView?
+        for group in groups {
+            let table = NSTableView()
+            poolHistoryTables[table] = group
+            let section = poolHistorySection(title: "\(group)历史", groupName: group, table: table)
+            section.setContentHuggingPriority(.defaultLow, for: .vertical)
+            section.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+            sectionStack.addArrangedSubview(section)
+            section.leadingAnchor.constraint(equalTo: sectionStack.leadingAnchor).isActive = true
+            section.trailingAnchor.constraint(equalTo: sectionStack.trailingAnchor).isActive = true
+            if let firstSection {
+                section.heightAnchor.constraint(equalTo: firstSection.heightAnchor).isActive = true
+            } else {
+                firstSection = section
+            }
+        }
+
+        let sectionScroll = NSScrollView()
+        sectionScroll.translatesAutoresizingMaskIntoConstraints = false
+        sectionScroll.documentView = sectionStack
+        sectionScroll.hasVerticalScroller = true
+        sectionScroll.hasHorizontalScroller = false
+        sectionScroll.autohidesScrollers = true
+        sectionScroll.borderType = .noBorder
+        sectionScroll.setContentHuggingPriority(.defaultLow, for: .vertical)
+        sectionScroll.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+
+        stack.addArrangedSubview(toolbar)
+        stack.addArrangedSubview(sectionScroll)
         NSLayoutConstraint.activate([
-            summaryRow.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
-            summaryRow.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
-            plusSection.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
-            plusSection.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
-            k12Section.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
-            k12Section.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
-            plusSection.heightAnchor.constraint(equalTo: k12Section.heightAnchor)
+            toolbar.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            toolbar.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+            sectionScroll.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            sectionScroll.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+            sectionStack.leadingAnchor.constraint(equalTo: sectionScroll.contentView.leadingAnchor),
+            sectionStack.trailingAnchor.constraint(equalTo: sectionScroll.contentView.trailingAnchor),
+            sectionStack.topAnchor.constraint(equalTo: sectionScroll.contentView.topAnchor),
+            sectionStack.widthAnchor.constraint(equalTo: sectionScroll.contentView.widthAnchor)
+        ])
+        if groups.count <= 2 {
+            firstSection?.heightAnchor.constraint(greaterThanOrEqualTo: sectionScroll.heightAnchor, multiplier: groups.count == 1 ? 1 : 0.49).isActive = true
+        } else {
+            firstSection?.heightAnchor.constraint(equalToConstant: 260).isActive = true
+        }
+
+        panel.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 20),
+            stack.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -20),
+            stack.topAnchor.constraint(equalTo: panel.topAnchor, constant: 10),
+            stack.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -12)
+        ])
+        return panel
+    }
+
+    private func buildTrendPanel() -> NSView {
+        let panel = NSView()
+        panel.wantsLayer = true
+        panel.layer?.backgroundColor = NSColor.white.cgColor
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.spacing = 12
+        stack.alignment = .width
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let toolbar = NSStackView()
+        toolbar.orientation = .horizontal
+        toolbar.spacing = 10
+        toolbar.alignment = .centerY
+
+        let title = NSTextField(labelWithString: "账号池趋势")
+        title.font = .systemFont(ofSize: 16, weight: .bold)
+        title.textColor = .labelColor
+
+        trendMetricControl.target = self
+        trendMetricControl.action = #selector(trendMetricChanged)
+        trendMetricControl.selectedSegment = selectedTrendMetric.rawValue
+        trendMetricControl.segmentStyle = .rounded
+        trendMetricControl.controlSize = .regular
+        for index in 0..<PoolTrendMetric.allCases.count {
+            trendMetricControl.setWidth(index < 2 ? 86 : 74, forSegment: index)
+        }
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        toolbar.addArrangedSubview(title)
+        toolbar.addArrangedSubview(spacer)
+        toolbar.addArrangedSubview(trendMetricControl)
+
+        let hint = NSTextField(labelWithString: "每次手动刷新或自动轮询都会追加历史；10 分钟内某分组总账号减少超过 100 会触发预警。")
+        hint.font = .systemFont(ofSize: 12, weight: .medium)
+        hint.textColor = .secondaryLabelColor
+        hint.maximumNumberOfLines = 1
+        hint.lineBreakMode = .byTruncatingTail
+
+        trendChartView.history = poolHistory
+        trendChartView.groups = selectedPoolGroups
+        trendChartView.metric = selectedTrendMetric
+        trendChartView.translatesAutoresizingMaskIntoConstraints = false
+        trendChartView.wantsLayer = true
+        trendChartView.layer?.borderColor = NSColor.separatorColor.cgColor
+        trendChartView.layer?.borderWidth = 1
+        trendChartView.layer?.cornerRadius = 8
+
+        stack.addArrangedSubview(toolbar)
+        stack.addArrangedSubview(hint)
+        stack.addArrangedSubview(trendChartView)
+        NSLayoutConstraint.activate([
+            trendChartView.heightAnchor.constraint(greaterThanOrEqualToConstant: 520)
         ])
 
         panel.addSubview(stack)
@@ -468,8 +1241,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             stack.topAnchor.constraint(equalTo: panel.topAnchor, constant: 14),
             stack.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -16)
         ])
-        updatePoolSummaryLabels()
         return panel
+    }
+
+    @objc private func trendMetricChanged() {
+        selectedTrendMetric = PoolTrendMetric(rawValue: trendMetricControl.selectedSegment) ?? .remaining5h
+        trendChartView.metric = selectedTrendMetric
+    }
+
+    private func buildPoolToolbar() -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 8
+        row.alignment = .centerY
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        updatePoolGroupsLabel()
+        poolGroupsLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        poolGroupsLabel.textColor = .labelColor
+        poolGroupsLabel.lineBreakMode = .byTruncatingTail
+        poolGroupsLabel.maximumNumberOfLines = 1
+        poolGroupsLabel.translatesAutoresizingMaskIntoConstraints = false
+        poolGroupsLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 260).isActive = true
+
+        poolGroupsButton.target = self
+        poolGroupsButton.action = #selector(selectPoolGroups)
+        poolGroupsButton.bezelStyle = .rounded
+        poolGroupsButton.controlSize = .large
+        poolGroupsButton.font = .systemFont(ofSize: 13, weight: .semibold)
+        poolGroupsButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 96).isActive = true
+
+        poolPollingField.stringValue = money(poolPollingMinutes)
+        poolPollingField.placeholderString = "2"
+        poolPollingField.alignment = .center
+        poolPollingField.font = .systemFont(ofSize: 13, weight: .semibold)
+        poolPollingField.cell?.usesSingleLineMode = true
+        poolPollingField.translatesAutoresizingMaskIntoConstraints = false
+        poolPollingField.widthAnchor.constraint(equalToConstant: 54).isActive = true
+        poolPollingField.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        poolPollingField.target = self
+        poolPollingField.action = #selector(poolPollingChanged)
+        NotificationCenter.default.removeObserver(self, name: NSControl.textDidChangeNotification, object: poolPollingField)
+        NotificationCenter.default.addObserver(self, selector: #selector(poolPollingChanged), name: NSControl.textDidChangeNotification, object: poolPollingField)
+
+        poolRefreshButton.target = self
+        poolRefreshButton.action = #selector(refreshPoolsFromAPIButton)
+        poolRefreshButton.bezelStyle = .rounded
+        poolRefreshButton.controlSize = .large
+        poolRefreshButton.font = .systemFont(ofSize: 13, weight: .semibold)
+        poolRefreshButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 86).isActive = true
+
+        poolCredentialsButton.target = self
+        poolCredentialsButton.action = #selector(editPoolCredentials)
+        poolCredentialsButton.bezelStyle = .rounded
+        poolCredentialsButton.controlSize = .large
+        poolCredentialsButton.font = .systemFont(ofSize: 13, weight: .semibold)
+        poolCredentialsButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 96).isActive = true
+
+        poolWarningButton.target = self
+        poolWarningButton.action = #selector(editWarningSettings)
+        poolWarningButton.bezelStyle = .rounded
+        poolWarningButton.controlSize = .large
+        poolWarningButton.font = .systemFont(ofSize: 13, weight: .semibold)
+        poolWarningButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 96).isActive = true
+
+        let info = NSTextField(labelWithString: "平台共享容量池")
+        info.font = .systemFont(ofSize: 13, weight: .semibold)
+        info.textColor = .secondaryLabelColor
+
+        let left = NSStackView()
+        left.orientation = .horizontal
+        left.spacing = 8
+        left.alignment = .centerY
+        left.addArrangedSubview(info)
+        left.addArrangedSubview(poolGroupsLabel)
+        left.addArrangedSubview(poolGroupsButton)
+
+        let right = NSStackView()
+        right.orientation = .horizontal
+        right.spacing = 8
+        right.alignment = .centerY
+        right.addArrangedSubview(label("轮询"))
+        right.addArrangedSubview(poolPollingField)
+        right.addArrangedSubview(label("分钟"))
+        right.addArrangedSubview(poolRefreshButton)
+        right.addArrangedSubview(poolCredentialsButton)
+        right.addArrangedSubview(poolWarningButton)
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(left)
+        row.addArrangedSubview(spacer)
+        row.addArrangedSubview(right)
+        return row
     }
 
     private func poolHistorySection(title: String, groupName: String, table: NSTableView) -> NSView {
@@ -503,15 +1367,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             table: table,
             columns: [
                 ("时间", "time", 118),
-                ("总账号", "total", 92),
-                ("5h可调度剩余", "remaining5h", 122),
-                ("7d可调度剩余", "remaining7d", 122),
-                ("并发可用", "concurrent", 150),
-                ("限流", "limited", 98),
-                ("额度保护", "quotaProtected", 112),
-                ("错误", "error", 96),
-                ("禁用", "disabled", 78),
-                ("较上次变化", "delta", 82)
+                ("总账号", "total", 88),
+                ("5h窗口", "remaining5h", 178),
+                ("7d窗口", "remaining7d", 178),
+                ("并发可用", "concurrent", 138),
+                ("错误", "error", 82),
+                ("较上次变化", "delta", 84)
             ]
         )
         scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 170).isActive = true
@@ -642,10 +1503,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             ]
         )
         comparisonScroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        comparisonScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 360).isActive = true
+        comparisonScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 250).isActive = true
 
+        balanceTrendChartView.history = history
+        balanceTrendChartView.translatesAutoresizingMaskIntoConstraints = false
+        balanceTrendChartView.wantsLayer = true
+        balanceTrendChartView.layer?.borderColor = NSColor.separatorColor.cgColor
+        balanceTrendChartView.layer?.borderWidth = 1
+        balanceTrendChartView.layer?.cornerRadius = 8
+        balanceTrendChartView.heightAnchor.constraint(equalToConstant: 180).isActive = true
+
+        let settlementPanel = buildSettlementPanel()
+        stack.addArrangedSubview(balanceTrendChartView)
+        stack.addArrangedSubview(settlementPanel)
         stack.addArrangedSubview(comparisonScroll)
         NSLayoutConstraint.activate([
+            balanceTrendChartView.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            balanceTrendChartView.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+            settlementPanel.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            settlementPanel.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
             comparisonScroll.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
             comparisonScroll.trailingAnchor.constraint(equalTo: stack.trailingAnchor)
         ])
@@ -658,6 +1534,323 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             stack.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -16)
         ])
         return panel
+    }
+
+    private func buildSettlementPanel() -> NSView {
+        clearSettlementTextObservers()
+
+        let panel = NSView()
+        panel.wantsLayer = true
+        panel.layer?.backgroundColor = NSColor.systemIndigo.withAlphaComponent(0.06).cgColor
+        panel.layer?.borderColor = NSColor.systemIndigo.withAlphaComponent(0.26).cgColor
+        panel.layer?.borderWidth = 1
+        panel.layer?.cornerRadius = 8
+        panel.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.spacing = 8
+        stack.alignment = .width
+        stack.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let title = NSTextField(labelWithString: "合伙结算")
+        title.font = .systemFont(ofSize: 15, weight: .bold)
+        title.textColor = .systemIndigo
+        title.alignment = .left
+
+        let hint = NSTextField(labelWithString: "按当前余额合计与基准余额合计的差额结算；盈利先返还双方实际出资，再按比例分利润；亏损双方各承担一半。")
+        hint.font = .systemFont(ofSize: 12, weight: .medium)
+        hint.textColor = .secondaryLabelColor
+        hint.lineBreakMode = .byWordWrapping
+        hint.maximumNumberOfLines = 2
+
+        configureSettlementField(partnerShareField, placeholder: "40", width: 58)
+        partnerShareField.stringValue = money(settlement.partnerSharePercent)
+
+        let settingsRow = NSStackView()
+        settingsRow.orientation = .horizontal
+        settingsRow.spacing = 8
+        settingsRow.alignment = .centerY
+        let partnerInfo = NSButton(title: "?", target: nil, action: nil)
+        partnerInfo.isBordered = true
+        partnerInfo.bezelStyle = .circular
+        partnerInfo.controlSize = .small
+        partnerInfo.font = .systemFont(ofSize: 11, weight: .bold)
+        partnerInfo.toolTip = "合作人出资金额在顶部“合作人出资”输入框里改；没出资就填 0。盈利先返还双方出资，亏损双方各承担一半。"
+        partnerInfo.translatesAutoresizingMaskIntoConstraints = false
+        partnerInfo.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        partnerInfo.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        settingsRow.addArrangedSubview(label("合作人出资见顶部输入框"))
+        settingsRow.addArrangedSubview(partnerInfo)
+        settingsRow.addArrangedSubview(label("对方分成"))
+        settingsRow.addArrangedSubview(partnerShareField)
+        settingsRow.addArrangedSubview(label("%"))
+        let ownerShare = NSTextField(labelWithString: "我方分成 = 100% - 对方分成")
+        ownerShare.font = .systemFont(ofSize: 12, weight: .semibold)
+        ownerShare.textColor = .secondaryLabelColor
+        settingsRow.addArrangedSubview(ownerShare)
+
+        let partnerTransferValue = settlementMetricValue()
+        let ownerReceivesValue = settlementMetricValue()
+        partnerTransferValue.font = .systemFont(ofSize: 22, weight: .bold)
+        ownerReceivesValue.font = .systemFont(ofSize: 22, weight: .bold)
+
+        let resultRow = NSStackView()
+        resultRow.orientation = .horizontal
+        resultRow.spacing = 18
+        resultRow.alignment = .centerY
+        resultRow.distribution = .fillEqually
+        resultRow.addArrangedSubview(settlementResultBlock(title: "合作人应收", value: partnerTransferValue, color: .systemOrange))
+        resultRow.addArrangedSubview(settlementResultBlock(title: "我方应留", value: ownerReceivesValue, color: .systemIndigo))
+
+        let formula = NSTextField(wrappingLabelWithString: "")
+        formula.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+        formula.textColor = .secondaryLabelColor
+        formula.maximumNumberOfLines = 2
+        formula.lineBreakMode = .byWordWrapping
+
+        let leftColumn = NSStackView()
+        leftColumn.orientation = .vertical
+        leftColumn.spacing = 10
+        leftColumn.alignment = .width
+        leftColumn.translatesAutoresizingMaskIntoConstraints = false
+        leftColumn.addArrangedSubview(hint)
+        leftColumn.addArrangedSubview(settingsRow)
+
+        let rightColumn = NSStackView()
+        rightColumn.orientation = .vertical
+        rightColumn.spacing = 8
+        rightColumn.alignment = .width
+        rightColumn.translatesAutoresizingMaskIntoConstraints = false
+        rightColumn.addArrangedSubview(resultRow)
+
+        let contentRow = NSStackView()
+        contentRow.orientation = .horizontal
+        contentRow.spacing = 28
+        contentRow.alignment = .centerY
+        contentRow.translatesAutoresizingMaskIntoConstraints = false
+        contentRow.addArrangedSubview(leftColumn)
+        contentRow.addArrangedSubview(rightColumn)
+        leftColumn.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        rightColumn.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+
+        stack.addArrangedSubview(title)
+        stack.addArrangedSubview(contentRow)
+        stack.addArrangedSubview(formula)
+        panel.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: panel.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: panel.bottomAnchor),
+            title.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            title.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+            contentRow.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            contentRow.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+            formula.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            formula.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+            leftColumn.widthAnchor.constraint(greaterThanOrEqualTo: stack.widthAnchor, multiplier: 0.48),
+            rightColumn.widthAnchor.constraint(greaterThanOrEqualTo: stack.widthAnchor, multiplier: 0.32)
+        ])
+
+        settlementLabels = (partnerTransferValue, ownerReceivesValue, formula)
+        updateSettlementOutput()
+        return panel
+    }
+
+    private func configureSettlementField(_ field: NSTextField, placeholder: String, width: CGFloat) {
+        field.placeholderString = placeholder
+        field.alignment = .right
+        field.font = .systemFont(ofSize: 13, weight: .semibold)
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.widthAnchor.constraint(equalToConstant: width).isActive = true
+        field.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        field.target = self
+        field.action = #selector(settlementInputsChanged)
+        observeSettlementField(field)
+    }
+
+    private func observeSettlementField(_ field: NSTextField) {
+        let observer = NotificationCenter.default.addObserver(
+            forName: NSControl.textDidChangeNotification,
+            object: field,
+            queue: .main
+        ) { [weak self] _ in
+            self?.settlementInputsChanged()
+        }
+        settlementTextObservers.append(observer)
+    }
+
+    private func clearSettlementTextObservers() {
+        for observer in settlementTextObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        settlementTextObservers = []
+    }
+
+    private func settlementMetricValue() -> NSTextField {
+        let value = NSTextField(labelWithString: "--")
+        value.font = .systemFont(ofSize: 14, weight: .bold)
+        value.alignment = .center
+        value.lineBreakMode = .byTruncatingTail
+        value.maximumNumberOfLines = 1
+        value.cell?.wraps = false
+        value.cell?.isScrollable = false
+        value.translatesAutoresizingMaskIntoConstraints = false
+        value.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        value.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return value
+    }
+
+    private func settlementMetric(title: String, value: NSTextField, color: NSColor) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.spacing = 2
+        stack.alignment = .centerX
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: 11, weight: .bold)
+        titleLabel.textColor = color
+        titleLabel.alignment = .center
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.maximumNumberOfLines = 1
+        stack.addArrangedSubview(titleLabel)
+        stack.addArrangedSubview(value)
+        NSLayoutConstraint.activate([
+            titleLabel.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            titleLabel.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+            value.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            value.trailingAnchor.constraint(equalTo: stack.trailingAnchor)
+        ])
+        return stack
+    }
+
+    private func settlementResultBlock(title: String, value: NSTextField, color: NSColor) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.spacing = 6
+        stack.alignment = .centerX
+        stack.edgeInsets = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 10)
+        stack.wantsLayer = true
+        stack.layer?.cornerRadius = 8
+        stack.layer?.backgroundColor = color.withAlphaComponent(0.08).cgColor
+        stack.layer?.borderColor = color.withAlphaComponent(0.22).cgColor
+        stack.layer?.borderWidth = 1
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: 12, weight: .bold)
+        titleLabel.textColor = color
+        titleLabel.alignment = .center
+        value.alignment = .center
+
+        stack.addArrangedSubview(titleLabel)
+        stack.addArrangedSubview(value)
+        NSLayoutConstraint.activate([
+            titleLabel.leadingAnchor.constraint(equalTo: stack.leadingAnchor, constant: 10),
+            titleLabel.trailingAnchor.constraint(equalTo: stack.trailingAnchor, constant: -10),
+            value.leadingAnchor.constraint(equalTo: stack.leadingAnchor, constant: 10),
+            value.trailingAnchor.constraint(equalTo: stack.trailingAnchor, constant: -10),
+            stack.heightAnchor.constraint(equalToConstant: 78)
+        ])
+        return stack
+    }
+
+    private struct SettlementAccount {
+        let key: String
+        let name: String
+        let base: Double
+        let current: Double
+    }
+
+    private struct SettlementCalculation {
+        let baseTotal: Double
+        let currentTotal: Double
+        let balanceChange: Double
+        let totalCost: Double
+        let netOutcome: Double
+        let partnerSettlement: Double
+        let ownerSettlement: Double
+        let partnerSharePercent: Double
+    }
+
+    private func settlementAccounts() -> [SettlementAccount] {
+        guard let initial, let latest = history.last else { return [] }
+        let count = max(initial.amounts.count, latest.amounts.count)
+        let names = latest.accounts ?? initial.accounts ?? []
+        return (0..<count).map { index in
+            let name = index < names.count ? names[index] : "账号 \(index + 1)"
+            return SettlementAccount(
+                key: "\(index):\(name)",
+                name: name,
+                base: amount(at: index, in: initial),
+                current: amount(at: index, in: latest)
+            )
+        }
+    }
+
+    private func settlementNumber(from field: NSTextField, fallback: Double) -> Double {
+        let value = Double(field.stringValue.replacingOccurrences(of: ",", with: ""))
+        return value ?? fallback
+    }
+
+    private func settlementCalculation() -> SettlementCalculation {
+        let partnerSharePercent = min(max(settlementNumber(from: partnerShareField, fallback: settlement.partnerSharePercent), 0), 100)
+        let baseTotal = initial?.total ?? 0
+        let currentTotal = history.last?.total ?? baseTotal
+        let balanceChange = currentTotal - baseTotal
+        let totalCost = cost + partnerCost
+        let netOutcome = balanceChange - totalCost
+        let partnerSettlement: Double
+        if netOutcome >= 0 {
+            partnerSettlement = partnerCost + netOutcome * partnerSharePercent / 100
+        } else {
+            partnerSettlement = partnerCost + netOutcome / 2
+        }
+
+        return SettlementCalculation(
+            baseTotal: baseTotal,
+            currentTotal: currentTotal,
+            balanceChange: balanceChange,
+            totalCost: totalCost,
+            netOutcome: netOutcome,
+            partnerSettlement: partnerSettlement,
+            ownerSettlement: balanceChange - partnerSettlement,
+            partnerSharePercent: partnerSharePercent
+        )
+    }
+
+    @objc private func settlementInputsChanged() {
+        settlement.partnerName = "合作人"
+        settlement.partnerSharePercent = min(max(settlementNumber(from: partnerShareField, fallback: settlement.partnerSharePercent), 0), 100)
+
+        saveState()
+        updateSettlementOutput()
+    }
+
+    private func updateSettlementOutput() {
+        guard let labels = settlementLabels else { return }
+        let calculation = settlementCalculation()
+
+        if calculation.partnerSettlement >= 0 {
+            labels.partnerTransfer.stringValue = money(calculation.partnerSettlement)
+            labels.partnerTransfer.textColor = .systemOrange
+        } else {
+            labels.partnerTransfer.stringValue = "-\(money(abs(calculation.partnerSettlement)))"
+            labels.partnerTransfer.textColor = .systemRed
+        }
+        labels.ownerReceives.stringValue = money(calculation.ownerSettlement)
+        labels.ownerReceives.textColor = calculation.ownerSettlement >= 0 ? .systemIndigo : .systemRed
+
+        let outcomeLine: String
+        if calculation.netOutcome >= 0 {
+            outcomeLine = "净利润 \(money(calculation.netOutcome)) = 余额变化 \(money(calculation.balanceChange)) - 总出资 \(money(calculation.totalCost))；\(settlement.partnerName) 应收 = 出资 \(money(partnerCost)) + 净利润 × \(money(calculation.partnerSharePercent))% = \(money(calculation.partnerSettlement))。"
+        } else {
+            outcomeLine = "亏损 \(money(abs(calculation.netOutcome))) = 总出资 \(money(calculation.totalCost)) - 余额变化 \(money(calculation.balanceChange))；双方各承担 \(money(abs(calculation.netOutcome) / 2))。"
+        }
+        let direction = calculation.partnerSettlement >= 0
+            ? "若余额回款都到我方，本次应转给 \(settlement.partnerName) \(money(calculation.partnerSettlement)) 元；我方应留 \(money(calculation.ownerSettlement)) 元。"
+            : "\(settlement.partnerName) 本次应补给我方 \(money(abs(calculation.partnerSettlement))) 元；我方无需向对方转款。"
+        labels.formula.stringValue = "余额变化 = 当前余额 \(money(calculation.currentTotal)) - 基准余额 \(money(calculation.baseTotal)) = \(signedMoney(calculation.balanceChange))；净利润 = 余额变化 \(money(calculation.balanceChange)) - 总出资 \(money(calculation.totalCost)) = \(signedMoney(calculation.netOutcome))。\(outcomeLine) \(direction)"
     }
 
     private func buildHistoryPanel() -> NSView {
@@ -678,7 +1871,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 ("时间", "time", 170),
                 ("余额合计", "total", 190),
                 ("较基准", "gross", 190),
-                ("扣成本后收益", "afterCost", 210)
+                ("净利润", "afterCost", 210)
             ]
         )
         scroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -704,7 +1897,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             metricCard(title: "成本合计", value: costValue, color: .systemBlue),
             metricCard(title: "基准余额合计", value: baseValue, color: .systemPurple),
             metricCard(title: "现在余额合计", value: currentValue, color: .systemTeal),
-            metricCard(title: "扣成本后结果", value: resultValue, color: .systemOrange),
+            metricCard(title: "净利润", value: resultValue, color: .systemOrange),
             metricCard(title: "回本进度", value: progressValue, color: .systemPink),
             metricCard(title: "回本状态", value: remainingValue, color: .systemRed),
             metricCard(title: "当前收益", value: netValue, color: .systemGreen)
@@ -744,26 +1937,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         value.lineBreakMode = .byTruncatingTail
         value.maximumNumberOfLines = 1
         value.cell?.wraps = false
-        value.cell?.isScrollable = true
-
-        let valueScroll = NSScrollView()
-        valueScroll.drawsBackground = false
-        valueScroll.borderType = .noBorder
-        valueScroll.hasHorizontalScroller = true
-        valueScroll.hasVerticalScroller = false
-        valueScroll.autohidesScrollers = true
-        valueScroll.documentView = value
-        valueScroll.heightAnchor.constraint(equalToConstant: 25).isActive = true
-        valueScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 92).isActive = true
+        value.cell?.isScrollable = false
+        value.translatesAutoresizingMaskIntoConstraints = false
+        value.heightAnchor.constraint(equalToConstant: 25).isActive = true
+        value.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        value.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         stack.addArrangedSubview(titleLabel)
-        stack.addArrangedSubview(valueScroll)
+        stack.addArrangedSubview(value)
         card.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: card.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: card.trailingAnchor),
             stack.topAnchor.constraint(equalTo: card.topAnchor),
             stack.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+            value.leadingAnchor.constraint(equalTo: stack.leadingAnchor, constant: 4),
+            value.trailingAnchor.constraint(equalTo: stack.trailingAnchor, constant: -4),
             card.heightAnchor.constraint(equalToConstant: 72)
         ])
         return card
@@ -805,6 +1994,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     @objc private func inputsChanged() {
         saveState()
+        updateSettlementOutput()
         refreshOutput()
     }
 
@@ -814,10 +2004,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             showFeedback("请输入要累加的成本金额。", color: .systemOrange)
             return
         }
-        let newCost = cost + increment
+        let newCost = ownerCost + increment
         costField.stringValue = money(newCost)
         addCostField.stringValue = ""
-        showFeedback("已累加成本：\(signedMoney(increment)) 元，当前成本 \(money(newCost)) 元。", color: .systemGreen)
+        showFeedback("已累加我方出资：\(signedMoney(increment)) 元，我方当前出资 \(money(newCost)) 元。", color: .systemGreen)
         saveState()
         refreshOutput()
     }
@@ -837,9 +2027,296 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc private func resetAll() {
         initial = nil
         history = []
+        partnerCostField.stringValue = "0"
+        settlement = .default
         UserDefaults.standard.removeObject(forKey: "StoredState")
         showFeedback("成本计算数据已重置。", color: .systemGreen)
         refreshOutput()
+    }
+
+    @objc private func editBalanceAccounts() {
+        let alert = NSAlert()
+        alert.messageText = "余额账号配置"
+        alert.informativeText = "每行一个账号：名称---api_key。接口地址统一使用 \(defaultBalanceBaseURL)，密钥保存在本机钥匙串。"
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "导入")
+        alert.addButton(withTitle: "导出脱敏")
+        alert.addButton(withTitle: "完整备份")
+        alert.addButton(withTitle: "取消")
+
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 720, height: 220))
+        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.string = formatBalanceAccountsForEditing(balanceAccounts)
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.allowsUndo = true
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 740, height: 240))
+        scroll.documentView = textView
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .lineBorder
+        alert.accessoryView = scroll
+
+        let response = alert.runModal()
+        if response == .alertSecondButtonReturn {
+            importBalanceAccountsFromPasteboard(into: textView)
+            return
+        }
+        if response == .alertThirdButtonReturn {
+            exportBalanceAccounts(masked: true)
+            return
+        }
+        if response.rawValue == NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + 3 {
+            confirmAndExportFullBalanceAccounts()
+            return
+        }
+        guard response == .alertFirstButtonReturn else { return }
+        let accounts = parseBalanceAccounts(textView.string)
+        guard !accounts.isEmpty else {
+            showError("至少配置一个余额账号。")
+            return
+        }
+        balanceAccounts = accounts
+        if saveBalanceAccounts(accounts) {
+            showFeedback("余额账号已保存。", color: .systemGreen)
+        } else {
+            showFeedback("余额账号保存失败。", color: .systemRed)
+        }
+    }
+
+    private func importBalanceAccountsFromPasteboard(into textView: NSTextView) {
+        guard let text = NSPasteboard.general.string(forType: .string), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            showError("剪贴板里没有可导入的文本。")
+            return
+        }
+        let accounts = parseBalanceAccounts(text)
+        guard !accounts.isEmpty else {
+            showError("没有解析到账号。支持：名称---api_key。")
+            return
+        }
+        balanceAccounts = accounts
+        if saveBalanceAccounts(accounts) {
+            showFeedback("已从剪贴板导入 \(accounts.count) 个余额账号。", color: .systemGreen)
+        }
+        textView.string = formatBalanceAccountsForEditing(accounts)
+    }
+
+    private func exportBalanceAccounts(masked: Bool) {
+        let payload = balanceAccounts.map {
+            [
+                "name": $0.name,
+                "base_url": $0.baseURL,
+                "api_key": masked ? maskedKey($0.apiKey) : $0.apiKey
+            ]
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]),
+              let text = String(data: data, encoding: .utf8) else {
+            showError("导出失败。")
+            return
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        showFeedback(masked ? "已复制脱敏账号配置。" : "已复制完整账号备份，请妥善保管。", color: masked ? .systemGreen : .systemOrange)
+    }
+
+    private func confirmAndExportFullBalanceAccounts() {
+        let alert = NSAlert()
+        alert.messageText = "导出完整备份？"
+        alert.informativeText = "完整备份会包含 API Key。只建议用于你自己的离线备份，不要发到群里或提交到 GitHub。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "复制完整备份")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        exportBalanceAccounts(masked: false)
+    }
+
+    private func maskedKey(_ key: String) -> String {
+        guard key.count > 10 else { return "******" }
+        return "\(key.prefix(6))...\(key.suffix(4))"
+    }
+
+    @objc private func queryBalanceAsInitial() {
+        queryBalances(asInitial: true, manual: true)
+    }
+
+    @objc private func queryBalanceAsLatest() {
+        queryBalances(asInitial: false, manual: true)
+    }
+
+    private func queryBalances(asInitial: Bool, manual: Bool) {
+        guard !balanceAccounts.isEmpty else {
+            if manual { editBalanceAccounts() }
+            return
+        }
+        guard !balanceQueryInProgress else {
+            if manual { showFeedback("正在查询余额，请稍等。", color: .systemOrange) }
+            return
+        }
+        balanceQueryInProgress = true
+        showFeedback(asInitial ? "正在查询基准余额..." : "正在查询最新余额...", color: .white, autoHide: false)
+        fetchAllBalances { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.balanceQueryInProgress = false
+                switch result {
+                case .success(let items):
+                    self.applyBalanceItems(items, asInitial: asInitial)
+                case .failure(let error):
+                    if manual {
+                        self.showError(error.localizedDescription)
+                    } else {
+                        self.showFeedback("自动余额查询失败：\(error.localizedDescription)", color: .systemOrange)
+                    }
+                }
+            }
+        }
+    }
+
+    private func applyBalanceItems(_ items: [BalanceQueryItem], asInitial: Bool) {
+        let amounts = items.map(\.balance)
+        let accounts = items.map { $0.account.name }
+        let snapshot = Snapshot(date: Date(), total: amounts.reduce(0, +), amounts: amounts, accounts: accounts)
+        if asInitial || initial == nil {
+            initial = snapshot
+            history = [snapshot]
+            settlement.withdrawals = [:]
+            showFeedback("已查询为基准余额：\(money(snapshot.total))。", color: .systemGreen)
+        } else {
+            history.append(snapshot)
+            trimBalanceHistory()
+            showFeedback("已查询最新余额：\(money(snapshot.total))。", color: .systemGreen)
+        }
+        saveState()
+        refreshOutput()
+    }
+
+    private func fetchAllBalances(completion: @escaping (Result<[BalanceQueryItem], Error>) -> Void) {
+        let accounts = balanceAccounts
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var items: [BalanceQueryItem] = []
+        var failures: [String] = []
+
+        for account in accounts {
+            group.enter()
+            fetchBalance(account: account) { result in
+                lock.lock()
+                switch result {
+                case .success(let item):
+                    items.append(item)
+                case .failure(let error):
+                    failures.append("\(account.name)：\(error.localizedDescription)")
+                }
+                lock.unlock()
+                group.leave()
+            }
+        }
+
+        group.notify(queue: .main) {
+            if !failures.isEmpty {
+                completion(.failure(AppError(failures.joined(separator: "\n"))))
+                return
+            }
+            let ordered = accounts.compactMap { account in
+                items.first { $0.account.name == account.name && $0.account.baseURL == account.baseURL }
+            }
+            completion(.success(ordered))
+        }
+    }
+
+    private func fetchBalance(account: BalanceAccount, completion: @escaping (Result<BalanceQueryItem, Error>) -> Void) {
+        guard let url = balanceURL(baseURL: account.baseURL) else {
+            completion(.failure(AppError("Base URL 无效")))
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 20
+        request.setValue("Bearer \(account.apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("cc-switch/1.0", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200..<300).contains(statusCode), let data else {
+                completion(.failure(AppError("余额接口 HTTP \(statusCode)")))
+                return
+            }
+            do {
+                let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                guard let json else {
+                    completion(.failure(AppError("余额接口返回不是 JSON")))
+                    return
+                }
+                let source = (json["data"] as? [String: Any]) ?? json
+                let balance = Self.extractBalance(from: source)
+                guard let balance else {
+                    completion(.failure(AppError("余额字段缺失：\(Self.responsePreview(data))")))
+                    return
+                }
+                let unit = (source["unit"] as? String) ?? "USD"
+                completion(.success(BalanceQueryItem(account: account, balance: balance, unit: unit)))
+            } catch {
+                completion(.failure(AppError("余额接口返回格式不正确：\(Self.responsePreview(data))")))
+            }
+        }.resume()
+    }
+
+    private func balanceURL(baseURL: String) -> URL? {
+        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !trimmed.isEmpty else { return nil }
+        return URL(string: "\(trimmed)/v1/usage")
+    }
+
+    private static func doubleValue(_ value: Any?) -> Double? {
+        if let value = value as? Double { return value }
+        if let value = value as? Int { return Double(value) }
+        if let value = value as? String { return Double(value) }
+        return nil
+    }
+
+    private static func extractBalance(from source: [String: Any]) -> Double? {
+        if let value = doubleValue(source["balance"])
+            ?? doubleValue(source["remaining"])
+            ?? doubleValue(source["totalBalance"])
+            ?? doubleValue(source["total_balance"])
+            ?? doubleValue(source["available_balance"])
+            ?? doubleValue(source["amount"]) {
+            return value
+        }
+        if let infos = source["balance_infos"] as? [[String: Any]],
+           let first = infos.first {
+            return doubleValue(first["total_balance"])
+                ?? doubleValue(first["balance"])
+                ?? doubleValue(first["remaining"])
+                ?? doubleValue(first["topped_up_balance"])
+        }
+        return nil
+    }
+
+    private static func responsePreview(_ data: Data) -> String {
+        let text = String(data: data, encoding: .utf8) ?? "<非 UTF-8 数据 \(data.count) bytes>"
+        let compact = text
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if compact.count <= 200 { return compact }
+        return String(compact.prefix(200)) + "..."
+    }
+
+    private func restartBalancePollingTimer() {
+        balancePollingTimer?.invalidate()
+        balancePollingTimer = Timer.scheduledTimer(withTimeInterval: defaultPollingMinutes * 60, repeats: true) { [weak self] _ in
+            guard let self, self.initial != nil else { return }
+            self.queryBalances(asInitial: false, manual: false)
+        }
     }
 
     @objc private func confirmClearPoolHistory(_ sender: NSButton) {
@@ -884,6 +2361,418 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         savePoolState()
         showFeedback("\(groupName) 已全部清除，移除 \(beforeCount) 条。", color: .systemGreen)
         refreshOutput()
+    }
+
+    @objc private func editWarningSettings() {
+        let existing = loadSMTPSettings() ?? smtpSettings
+        let alert = NSAlert()
+        alert.messageText = "掉号预警设置"
+        alert.informativeText = "QQ 邮箱 SMTP：进入 QQ 邮箱网页版 -> 设置 -> 账号 -> POP3/IMAP/SMTP 服务，开启后生成授权码。服务器 smtp.qq.com，端口 465，密码填授权码。"
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+
+        let recipientField = NSTextField(string: existing.recipient)
+        recipientField.placeholderString = "预警收件邮箱"
+        let hostField = NSTextField(string: existing.host)
+        hostField.placeholderString = "SMTP 服务器"
+        let portField = NSTextField(string: "\(existing.port)")
+        portField.placeholderString = "端口"
+        let usernameField = NSTextField(string: existing.username)
+        usernameField.placeholderString = "发件邮箱账号"
+        let passwordField = NSSecureTextField(string: existing.password)
+        passwordField.placeholderString = "SMTP 授权码"
+        for field in [recipientField, hostField, portField, usernameField, passwordField] {
+            field.translatesAutoresizingMaskIntoConstraints = false
+            field.widthAnchor.constraint(equalToConstant: 360).isActive = true
+            field.heightAnchor.constraint(equalToConstant: 26).isActive = true
+        }
+        let stack = NSStackView(views: [recipientField, hostField, portField, usernameField, passwordField])
+        stack.orientation = .vertical
+        stack.spacing = 7
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 160))
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 8)
+        ])
+        alert.accessoryView = container
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        smtpSettings = SMTPSettings(
+            host: hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
+            port: Int(portField.stringValue) ?? 465,
+            username: usernameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
+            password: passwordField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
+            recipient: normalizedEmail(recipientField.stringValue)
+        )
+        _ = saveSMTPSettings(smtpSettings)
+        savePoolState()
+        showFeedback("掉号预警设置已保存。", color: .systemGreen)
+    }
+
+    @objc private func selectPoolGroups() {
+        poolGroupsButton.isEnabled = false
+        showFeedback("正在读取平台共享容量池分组...", color: .white, autoHide: false)
+        fetchQuotaDashboard(retryAfterLogin: true) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.poolGroupsButton.isEnabled = true
+                switch result {
+                case .success(let summaries):
+                    let groups = summaries.map(\.groupName).filter { !$0.isEmpty }
+                    self.availablePoolGroups = groups.isEmpty ? self.availablePoolGroups : groups
+                    self.presentPoolGroupPicker()
+                case .failure(let error):
+                    self.showError(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    @objc private func editPoolCredentials() {
+        _ = promptForPoolCredentials(force: true)
+    }
+
+    @objc private func poolPollingChanged() {
+        let value = Double(poolPollingField.stringValue.replacingOccurrences(of: ",", with: "")) ?? defaultPollingMinutes
+        poolPollingMinutes = normalizedPollingMinutes(value)
+        poolPollingField.stringValue = money(poolPollingMinutes)
+        savePoolState()
+        restartPoolPollingTimer()
+    }
+
+    @objc private func refreshPoolsFromAPIButton() {
+        refreshPoolsFromAPI(isAutomatic: false)
+    }
+
+    private func refreshPoolsFromAPI(isAutomatic: Bool) {
+        let groups = selectedPoolGroups
+        guard !groups.isEmpty else {
+            showError("请至少填写一个要同步的分组名称。")
+            return
+        }
+        savePoolState()
+        guard !poolRefreshInProgress else {
+            if !isAutomatic {
+                showFeedback("正在刷新账号池，请稍等。", color: .systemOrange)
+            }
+            return
+        }
+        poolRefreshInProgress = true
+        poolRefreshButton.isEnabled = false
+        showFeedback(isAutomatic ? "正在自动同步平台共享容量池..." : "正在同步平台共享容量池...", color: .white, autoHide: false)
+
+        fetchQuotaDashboard(retryAfterLogin: true) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.poolRefreshInProgress = false
+                self.poolRefreshButton.isEnabled = true
+                switch result {
+                case .success(let summaries):
+                    self.applyDashboardSummaries(summaries, selectedGroups: groups)
+                case .failure(let error):
+                    self.showError(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func restartPoolPollingTimer() {
+        poolPollingTimer?.invalidate()
+        let interval = normalizedPollingMinutes(poolPollingMinutes) * 60
+        poolPollingTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.refreshPoolsFromAPI(isAutomatic: true)
+        }
+    }
+
+    private func normalizedPollingMinutes(_ value: Double) -> Double {
+        let clamped = min(max(value, defaultPollingMinutes), 1440)
+        return max(defaultPollingMinutes, (clamped / defaultPollingMinutes).rounded() * defaultPollingMinutes)
+    }
+
+    private func presentPoolGroupPicker() {
+        let alert = NSAlert()
+        alert.messageText = "选择平台共享容量池"
+        alert.informativeText = "刷新时只会同步勾选的分组。"
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.spacing = 6
+        stack.alignment = .leading
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let orderedGroups = availablePoolGroups.sorted { lhs, rhs in
+            let priority = ["PLUS共享号池": 0, "K12共享号池": 1]
+            return (priority[lhs] ?? 99, lhs) < (priority[rhs] ?? 99, rhs)
+        }
+        var checks: [(String, NSButton)] = []
+        for group in orderedGroups {
+            let check = NSButton(checkboxWithTitle: group, target: nil, action: nil)
+            check.state = selectedPoolGroups.contains(group) ? .on : .off
+            check.font = .systemFont(ofSize: 13, weight: .medium)
+            checks.append((group, check))
+            stack.addArrangedSubview(check)
+        }
+
+        let containerHeight = min(CGFloat(max(orderedGroups.count, 1)) * 28 + 16, 300)
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: containerHeight))
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -8)
+        ])
+        alert.accessoryView = container
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let selected = checks.filter { $0.1.state == .on }.map(\.0)
+        guard !selected.isEmpty else {
+            showError("至少选择一个号池分组。")
+            return
+        }
+        selectedPoolGroups = selected
+        savePoolState()
+        updatePoolGroupsLabel()
+        showFeedback("已选择：\(selected.joined(separator: "、"))", color: .systemGreen)
+    }
+
+    private func updatePoolGroupsLabel() {
+        poolGroupsLabel.stringValue = selectedPoolGroups.joined(separator: "、")
+        poolGroupsLabel.toolTip = poolGroupsLabel.stringValue
+    }
+
+    private func applyDashboardSummaries(_ summaries: [APIGroupSummary], selectedGroups: [String]) {
+        let now = Date()
+        let selected = Set(selectedGroups)
+        let snapshots = summaries
+            .filter { selected.contains($0.groupName) }
+            .map { Self.poolSnapshot(from: $0, date: now) }
+
+        guard !snapshots.isEmpty else {
+            let available = summaries.map(\.groupName).joined(separator: "、")
+            showFeedback("没找到选中分组。接口返回：\(available)", color: .systemOrange, autoHide: false)
+            return
+        }
+
+        poolHistory.append(contentsOf: snapshots)
+        trimPoolHistory()
+        checkPoolDropWarnings(for: snapshots)
+        savePoolState()
+        refreshOutput()
+        let names = snapshots.map(\.groupName).joined(separator: "、")
+        showFeedback("已同步 \(names)，新增 \(snapshots.count) 条历史。", color: .systemGreen)
+    }
+
+    private func checkPoolDropWarnings(for snapshots: [PoolSnapshot]) {
+        for snapshot in snapshots {
+            let windowStart = snapshot.date.addingTimeInterval(-10 * 60)
+            guard let baseline = poolHistory
+                .filter({ $0.groupName == snapshot.groupName && $0.date >= windowStart && $0.date < snapshot.date })
+                .min(by: { $0.date < $1.date }) else {
+                continue
+            }
+            let drop = baseline.total - snapshot.total
+            guard drop > 100 else { continue }
+            let minuteKey = Int(snapshot.date.timeIntervalSince1970 / 60)
+            let dedupKey = "\(snapshot.groupName):\(minuteKey)"
+            guard !poolWarningDedup.contains(dedupKey) else { continue }
+            poolWarningDedup.insert(dedupKey)
+            let message = "\(snapshot.groupName) 10 分钟内减少 \(drop) 个账号（\(baseline.total) -> \(snapshot.total)）。"
+            showFeedback("掉号预警：\(message)", color: .systemRed, autoHide: false)
+            sendPoolWarningEmailIfConfigured(subject: "GPT分析器掉号预警", body: message)
+        }
+    }
+
+    private func sendPoolWarningEmailIfConfigured(subject: String, body: String) {
+        guard !smtpSettings.recipient.isEmpty else { return }
+        guard !smtpSettings.host.isEmpty, !smtpSettings.username.isEmpty, !smtpSettings.password.isEmpty else {
+            showFeedback("掉号预警已触发；SMTP 未配置完整，未发送邮件。", color: .systemOrange, autoHide: false)
+            return
+        }
+        showFeedback("掉号预警已触发；邮件发送通道已配置，待接入 SMTP 发送。", color: .systemOrange, autoHide: false)
+    }
+
+    private func fetchQuotaDashboard(retryAfterLogin: Bool, completion: @escaping (Result<[APIGroupSummary], Error>) -> Void) {
+        guard let url = URL(string: "https://cf.ai-pixel.online/api/v1/accounts/quota-dashboard?timezone=Asia%2FShanghai") else {
+            completion(.failure(AppError("账号池接口地址无效。")))
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        if let poolAccessToken, !poolAccessToken.isEmpty {
+            request.setValue("Bearer \(poolAccessToken)", forHTTPHeaderField: "Authorization")
+        }
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if statusCode == 401 || self?.poolAccessToken == nil {
+                guard retryAfterLogin else {
+                    completion(.failure(AppError("登录已失效，请重新设置接口账号。")))
+                    return
+                }
+                self?.loginForPoolAPI { loginResult in
+                    switch loginResult {
+                    case .success:
+                        self?.fetchQuotaDashboard(retryAfterLogin: false, completion: completion)
+                    case .failure(let error):
+                        completion(.failure(error))
+                    }
+                }
+                return
+            }
+            guard (200..<300).contains(statusCode), let data else {
+                completion(.failure(AppError("账号池接口返回异常：HTTP \(statusCode)。")))
+                return
+            }
+            do {
+                let decoded = try JSONDecoder().decode(APIQuotaDashboardResponse.self, from: data)
+                completion(.success(decoded.data.platform.groupSummaries))
+            } catch {
+                let message = Self.apiErrorMessage(from: data) ?? error.localizedDescription
+                completion(.failure(AppError("账号池接口解析失败：\(message)")))
+            }
+        }.resume()
+    }
+
+    private func loginForPoolAPI(completion: @escaping (Result<Void, Error>) -> Void) {
+        if let credentials = loadPoolCredentials() {
+            performPoolLogin(credentials: credentials, completion: completion)
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let credentials = self.promptForPoolCredentials(force: false) else {
+                completion(.failure(AppError("请先设置接口账号。")))
+                return
+            }
+            self.performPoolLogin(credentials: credentials, completion: completion)
+        }
+    }
+
+    private func performPoolLogin(credentials: PoolCredentials, completion: @escaping (Result<Void, Error>) -> Void) {
+        guard let url = URL(string: "https://cf.ai-pixel.online/api/v1/auth/login") else {
+            completion(.failure(AppError("登录接口地址无效。")))
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let body: [String: String] = [
+            "email": credentials.email,
+            "password": credentials.password,
+            "login_agreement_revision": "a90464c54fba46d4"
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200..<300).contains(statusCode), let data else {
+                let message = Self.apiErrorMessage(from: data) ?? "HTTP \(statusCode)"
+                completion(.failure(AppError("登录失败：\(message)。请点“接口账号”重新保存一次账号密码。")))
+                return
+            }
+            do {
+                let decoded = try JSONDecoder().decode(APILoginResponse.self, from: data)
+                DispatchQueue.main.async {
+                    self?.poolAccessToken = decoded.data.accessToken
+                    self?.poolRefreshToken = decoded.data.refreshToken
+                    self?.savePoolState()
+                    completion(.success(()))
+                }
+            } catch {
+                let message = Self.apiErrorMessage(from: data) ?? error.localizedDescription
+                completion(.failure(AppError("登录结果解析失败：\(message)")))
+            }
+        }.resume()
+    }
+
+    private func promptForPoolCredentials(force: Bool) -> PoolCredentials? {
+        let existing = loadPoolCredentials()
+        let alert = NSAlert()
+        alert.messageText = force ? "设置接口账号" : "首次使用接口同步"
+        alert.informativeText = ""
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+
+        let emailField = NSTextField(string: existing?.email ?? "")
+        emailField.placeholderString = "邮箱"
+        let passwordField = NSSecureTextField(string: existing?.password ?? "")
+        passwordField.placeholderString = "密码"
+        for field in [emailField, passwordField] {
+            field.widthAnchor.constraint(equalToConstant: 320).isActive = true
+            field.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        }
+        let tip = NSTextField(wrappingLabelWithString: "账号密码只保存在本机 macOS 钥匙串，用于 token 失效后自动重新登录。")
+        tip.font = .systemFont(ofSize: 12, weight: .medium)
+        tip.textColor = .secondaryLabelColor
+        tip.maximumNumberOfLines = 2
+        tip.translatesAutoresizingMaskIntoConstraints = false
+        tip.widthAnchor.constraint(equalToConstant: 320).isActive = true
+
+        let stack = NSStackView(views: [tip, emailField, passwordField])
+        stack.orientation = .vertical
+        stack.spacing = 8
+        stack.alignment = .width
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 112))
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 4),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -4)
+        ])
+        alert.accessoryView = container
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        var email = emailField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !email.contains("@"), !email.isEmpty {
+            email += "@qq.com"
+        }
+        let password = passwordField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !email.isEmpty, !password.isEmpty else {
+            showError("接口账号和密码不能为空。")
+            return nil
+        }
+        let credentials = PoolCredentials(email: email, password: password)
+        if savePoolCredentials(credentials) {
+            poolAccessToken = nil
+            poolRefreshToken = nil
+            savePoolState()
+            showFeedback("接口账号已保存到本机钥匙串。", color: .systemGreen)
+        } else {
+            showFeedback("钥匙串保存失败，请稍后重试。", color: .systemRed)
+        }
+        return credentials
+    }
+
+    private static func apiErrorMessage(from data: Data?) -> String? {
+        guard let data, !data.isEmpty else { return nil }
+        if let decoded = try? JSONDecoder().decode(APIErrorResponse.self, from: data),
+           let message = decoded.message,
+           !message.isEmpty {
+            return message
+        }
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            for key in ["message", "detail", "error"] {
+                if let message = object[key] as? String, !message.isEmpty {
+                    return message
+                }
+            }
+        }
+        return nil
     }
 
     private func pasteSmart() {
@@ -941,6 +2830,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 return
             }
             history.append(snapshot)
+            trimBalanceHistory()
             showFeedback("已识别最新截图：\(ocr.accounts.count) 个账号，\(ocr.amounts.count) 个余额。", color: .systemGreen)
         }
         if asInitial ?? false {
@@ -948,7 +2838,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         finishPaste(success: true)
         saveState()
-        refreshOutput()
+        if tabControl.selectedSegment == 2 {
+            switchTab(nil)
+        } else {
+            refreshOutput()
+        }
     }
 
     private func clipboardImage() -> NSImage? {
@@ -1046,6 +2940,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         extractPoolMetrics(from: ocr.text, positionedLines: ocr.lines, date: date)
     }
 
+    private static func poolSnapshot(from summary: APIGroupSummary, date: Date) -> PoolSnapshot {
+        let remaining5h = remainingCapacity(window: "5h", summary: summary)
+        let remaining7d = remainingCapacity(window: "7d", summary: summary)
+        let utilization5h = utilization(window: "5h", summary: summary)
+        let utilization7d = utilization(window: "7d", summary: summary)
+        let concurrentAvailable = max(summary.schedulableAccountCount - summary.rateLimitedAccountCount - summary.codexQuotaProtectedAccountCount - summary.errorAccountCount - summary.disabledAccountCount, 0)
+        return PoolSnapshot(
+            date: date,
+            groupName: summary.groupName,
+            status: statusText(from: summary.groupStatus),
+            total: summary.accountCount,
+            active: summary.activeAccountCount,
+            schedulable: summary.schedulableAccountCount,
+            remaining5h: remaining5h,
+            remaining7d: remaining7d,
+            utilization5h: utilization5h,
+            utilization7d: utilization7d,
+            concurrentAvailable: concurrentAvailable,
+            concurrentTotal: summary.schedulableAccountCount,
+            limited: summary.rateLimitedAccountCount,
+            quotaProtected: summary.codexQuotaProtectedAccountCount,
+            error: summary.errorAccountCount,
+            disabled: summary.disabledAccountCount
+        )
+    }
+
+    private static func remainingCapacity(window: String, summary: APIGroupSummary) -> Int? {
+        guard let item = summary.usageWindows.first(where: { $0.window.caseInsensitiveCompare(window) == .orderedSame }),
+              let percent = item.remainingCapacityPercent else {
+            return nil
+        }
+        return Int((percent / 100).rounded())
+    }
+
+    private static func utilization(window: String, summary: APIGroupSummary) -> Double? {
+        summary.usageWindows.first { $0.window.caseInsensitiveCompare(window) == .orderedSame }?.averageUtilization
+    }
+
+    private static func statusText(from status: String) -> String {
+        switch status.lowercased() {
+        case "active", "normal":
+            return "正常"
+        case "warning":
+            return "警告"
+        case "disabled":
+            return "禁用"
+        default:
+            return status
+        }
+    }
+
     private static func extractPoolMetrics(from text: String, positionedLines: [OCRLine], date: Date) -> PoolSnapshot? {
         let compactText = text.replacingOccurrences(of: " ", with: "")
         let groupName: String
@@ -1087,6 +3032,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             schedulable: schedulable,
             remaining5h: remaining5h,
             remaining7d: remaining7d,
+            utilization5h: nil,
+            utilization7d: nil,
             concurrentAvailable: concurrent.0,
             concurrentTotal: concurrent.1,
             limited: statusCounts.limited,
@@ -1463,24 +3410,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         return Int(compact)
     }
 
-    private var cost: Double {
+    private var ownerCost: Double {
         max(Double(costField.stringValue.replacingOccurrences(of: ",", with: "")) ?? 0, 0)
+    }
+
+    private var partnerCost: Double {
+        max(Double(partnerCostField.stringValue.replacingOccurrences(of: ",", with: "")) ?? 0, 0)
+    }
+
+    private var cost: Double {
+        ownerCost + partnerCost
     }
 
     private func refreshOutput() {
         updateMetrics()
+        updateSettlementOutput()
         updatePoolSummaryLabels()
+        trendChartView.history = poolHistory
+        trendChartView.groups = selectedPoolGroups
+        trendChartView.metric = selectedTrendMetric
+        balanceTrendChartView.history = history
         comparisonTable.reloadData()
         historyTable.reloadData()
         plusPoolHistoryTable.reloadData()
         k12PoolHistoryTable.reloadData()
+        for table in poolHistoryTables.keys {
+            table.reloadData()
+        }
         scrollToLatestRows()
     }
 
     private func scrollToLatestRows() {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            for table in [self.historyTable, self.plusPoolHistoryTable, self.k12PoolHistoryTable] {
+            let tables = [self.historyTable, self.plusPoolHistoryTable, self.k12PoolHistoryTable] + Array(self.poolHistoryTables.keys)
+            for table in tables {
                 let lastRow = table.numberOfRows - 1
                 if lastRow >= 0 {
                     table.scrollRowToVisible(lastRow)
@@ -1491,22 +3455,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func appendPoolSnapshot(_ snapshot: PoolSnapshot) {
         poolHistory.append(snapshot)
+        trimPoolHistory()
         savePoolState()
         finishPaste(success: true)
         showFeedback("已识别 \(snapshot.groupName)：总账号 \(snapshot.total)，并发可用 \(snapshot.concurrentAvailable)/\(snapshot.concurrentTotal)。", color: .systemGreen)
-        if tabControl.selectedSegment != 0 {
-            tabControl.selectedSegment = 0
-            switchTab(nil)
-        } else {
-            refreshOutput()
-        }
+        refreshOutput()
     }
 
     private func poolRows(for tableView: NSTableView) -> [PoolSnapshot] {
-        let groupFilter = tableView == k12PoolHistoryTable ? "K12共享号池" : "PLUS共享号池"
+        let groupFilter = poolHistoryTables[tableView] ?? (tableView == k12PoolHistoryTable ? "K12共享号池" : "PLUS共享号池")
         return poolHistory
             .filter { $0.groupName == groupFilter }
             .sorted { $0.date < $1.date }
+    }
+
+    private func trimBalanceHistory() {
+        guard history.count > maxBalanceHistoryCount else { return }
+        history = Array(history.sorted { $0.date < $1.date }.suffix(maxBalanceHistoryCount))
+        if let initial {
+            history.removeAll { $0.date == initial.date }
+            history.insert(initial, at: 0)
+        }
+    }
+
+    private func trimPoolHistory() {
+        var trimmed: [PoolSnapshot] = []
+        for group in Set(poolHistory.map(\.groupName)) {
+            let rows = poolHistory
+                .filter { $0.groupName == group }
+                .sorted { $0.date < $1.date }
+                .suffix(maxPoolHistoryPerGroup)
+            trimmed.append(contentsOf: rows)
+        }
+        poolHistory = trimmed.sorted { $0.date < $1.date }
     }
 
     private func latestPoolSnapshot(groupName: String) -> PoolSnapshot? {
@@ -1570,6 +3551,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         setMixedTrendCell(cell, base: base, marker: marker, delta: delta)
     }
 
+    private func quotaWindowCell(remaining: Int?, utilization: Double?, previous: Int?) -> NSView {
+        let container = NSView()
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.spacing = 4
+        stack.alignment = .width
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let topRow = NSStackView()
+        topRow.orientation = .horizontal
+        topRow.spacing = 6
+        topRow.alignment = .centerY
+
+        let remainingLabel = NSTextField(labelWithString: "--")
+        remainingLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        remainingLabel.textColor = .labelColor
+        remainingLabel.alignment = .left
+        remainingLabel.lineBreakMode = .byTruncatingTail
+
+        if let remaining {
+            if let previous, previous != remaining {
+                let delta = remaining - previous
+                let marker = delta > 0 ? "↑\(delta)" : "↓\(abs(delta))"
+                let fullText = "剩余数量：\(remaining) \(marker)"
+                let attributed = NSMutableAttributedString(
+                    string: fullText,
+                    attributes: [
+                        .font: remainingLabel.font ?? NSFont.systemFont(ofSize: 12, weight: .semibold),
+                        .foregroundColor: NSColor.labelColor
+                    ]
+                )
+                attributed.addAttribute(
+                    .foregroundColor,
+                    value: delta > 0 ? NSColor.systemGreen : NSColor.systemRed,
+                    range: (fullText as NSString).range(of: marker)
+                )
+                remainingLabel.attributedStringValue = attributed
+            } else {
+                remainingLabel.stringValue = "剩余数量：\(remaining)"
+            }
+        } else {
+            remainingLabel.stringValue = "剩余数量：--"
+            remainingLabel.textColor = .secondaryLabelColor
+        }
+
+        let percentValue = utilization.map { max(0, min($0 / 100.0, 1)) }
+        let percentLabel = NSTextField(labelWithString: percentValue.map { String(format: "%.1f%%", $0 * 100) } ?? "--")
+        percentLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        percentLabel.textColor = .secondaryLabelColor
+        percentLabel.alignment = .right
+        percentLabel.widthAnchor.constraint(equalToConstant: 48).isActive = true
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        topRow.addArrangedSubview(remainingLabel)
+        topRow.addArrangedSubview(spacer)
+        topRow.addArrangedSubview(percentLabel)
+
+        let progress = UsageBarView()
+        progress.value = percentValue ?? 0
+        progress.translatesAutoresizingMaskIntoConstraints = false
+        progress.heightAnchor.constraint(equalToConstant: 8).isActive = true
+        progress.isHidden = percentValue == nil
+
+        stack.addArrangedSubview(topRow)
+        stack.addArrangedSubview(progress)
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+            stack.centerYAnchor.constraint(equalTo: container.centerYAnchor)
+        ])
+        return container
+    }
+
     private func setMixedTrendCell(_ cell: NSTextField, base: String, marker: String, delta: Int) {
         let fullText = "\(base) \(marker)"
         let attributed = NSMutableAttributedString(
@@ -1611,7 +3667,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             labels.change.stringValue = poolDeltaText(for: latest)
             let delta = previousPoolSnapshot(before: latest).map { latest.total - $0.total } ?? 0
             labels.change.textColor = delta > 0 ? .systemGreen : (delta < 0 ? .systemRed : .secondaryLabelColor)
-            labels.time.stringValue = "最新截图：\(formatDate(latest.date))"
+            labels.time.stringValue = "最新记录：\(formatDate(latest.date))"
         }
     }
 
@@ -1769,9 +3825,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
 
         let gross = latest.total - initial.total
-        let netBeforeCost = gross * ((100 - fixedFeePercent) / 100)
-        let currentProfit = netBeforeCost - cost
-        let progress = cost > 0 ? netBeforeCost / cost * 100 : 0
+        let totalCost = cost + partnerCost
+        let currentProfit = gross - totalCost
+        let progress = totalCost > 0 ? gross / totalCost * 100 : 0
         let paybackDelta = currentProfit
 
         setMetric("current", field: currentValue, value: latest.total, suffix: " 元")
@@ -1842,7 +3898,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        if tableView == plusPoolHistoryTable || tableView == k12PoolHistoryTable {
+        if tableView == plusPoolHistoryTable || tableView == k12PoolHistoryTable || poolHistoryTables[tableView] != nil {
             return poolRows(for: tableView).count
         }
         if tableView == comparisonTable {
@@ -1874,30 +3930,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             cell.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -6)
         ])
 
-        if tableView == plusPoolHistoryTable || tableView == k12PoolHistoryTable {
+        if tableView == plusPoolHistoryTable || tableView == k12PoolHistoryTable || poolHistoryTables[tableView] != nil {
             let rows = poolRows(for: tableView)
             guard row < rows.count else { return container }
             let item = rows[row]
-            let previous = previousPoolSnapshot(before: item)
+            let previous = row > 0 ? rows[row - 1] : nil
             switch identifier {
             case "time":
                 cell.stringValue = formatDate(item.date)
             case "total":
                 setTrendCell(cell, current: item.total, previous: previous?.total)
             case "remaining5h":
-                if let value = item.remaining5h {
-                    setTrendCell(cell, current: value, previous: previous?.remaining5h)
-                } else {
-                    cell.stringValue = "--"
-                    cell.textColor = .secondaryLabelColor
-                }
+                return quotaWindowCell(remaining: item.remaining5h, utilization: item.utilization5h, previous: previous?.remaining5h)
             case "remaining7d":
-                if let value = item.remaining7d {
-                    setTrendCell(cell, current: value, previous: previous?.remaining7d)
-                } else {
-                    cell.stringValue = "--"
-                    cell.textColor = .secondaryLabelColor
-                }
+                return quotaWindowCell(remaining: item.remaining7d, utilization: item.utilization7d, previous: previous?.remaining7d)
             case "concurrent":
                 setConcurrentTrendCell(cell, current: item, previous: previous)
             case "limited":
@@ -1971,8 +4017,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             guard let initial else { return container }
             let item = history[row]
             let gross = item.total - initial.total
-            let net = gross * ((100 - fixedFeePercent) / 100)
-            let afterCost = net - cost
+            let afterCost = gross - cost - partnerCost
             switch identifier {
             case "index":
                 cell.stringValue = "\(row + 1)"
@@ -2013,7 +4058,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func buildReport() -> String {
         var lines: [String] = []
-        lines.append("成本合计：\(money(cost)) 元    手续费：固定 15%    到手系数：85.0%")
+        lines.append("总出资：我方 \(money(cost)) 元 + 合作人 \(money(partnerCost)) 元 = \(money(cost + partnerCost)) 元")
         lines.append("")
 
         guard let initial else {
@@ -2031,12 +4076,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return lines.joined(separator: "\n")
         }
 
-        let feeFactor = (100 - fixedFeePercent) / 100
         let gross = latest.total - initial.total
-        let net = gross * feeFactor
-        let currentProfitAfterCost = net - cost
-        let remaining = net - cost
-        let progress = cost > 0 ? net / cost * 100 : 0
+        let currentProfitAfterCost = gross - cost - partnerCost
+        let remaining = currentProfitAfterCost
+        let progress = (cost + partnerCost) > 0 ? gross / (cost + partnerCost) * 100 : 0
         lines.append("最新截图")
         lines.append("  时间：\(formatDate(latest.date))")
         lines.append("  现在余额合计：\(amountList(latest.amounts)) = \(money(latest.total)) 元")
@@ -2045,7 +4088,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         lines.append(balanceTable(initial: initial.amounts, latest: latest.amounts))
         lines.append("")
         lines.append("当前结果")
-        lines.append("  扣成本后当前结果：\(money(currentProfitAfterCost)) 元")
+        lines.append("  净利润：\(money(currentProfitAfterCost)) 元")
         lines.append("")
         lines.append("回本状态")
         lines.append("  回本进度：\(percent(progress))")
@@ -2062,17 +4105,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return "暂无历史记录。复制最新截图后按 Command+V，会自动追加到这里。"
         }
 
-        let feeFactor = (100 - fixedFeePercent) / 100
         var rows = [
             "┌──────┬──────────┬──────────────┬──────────────┬──────────────┬──────────────┐",
-            "│ 序号 │ 时间     │ 余额合计(元) │ 较基准(元)   │ 扣成本结果   │",
+            "│ 序号 │ 时间     │ 余额合计(元) │ 较基准(元)   │ 净利润       │",
             "├──────┼──────────┼──────────────┼──────────────┼──────────────┤"
         ]
 
         for (index, item) in history.enumerated() {
             let gross = item.total - initial.total
-            let net = gross * feeFactor
-            let afterCost = net - cost
+            let afterCost = gross - cost - partnerCost
             rows.append(String(format: "│ %4d │ %-8@ │ %12.2f │ %+12.2f │ %+12.2f │",
                                index + 1,
                                formatDate(item.date) as NSString,
@@ -2131,23 +4172,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func showError(_ message: String) {
-        showFeedback(message, color: .systemRed)
+        feedbackHideTimer?.invalidate()
+        statusLabel.stringValue = message.count > 120 ? String(message.prefix(120)) + "..." : message
+        statusLabel.textColor = .systemRed
+        feedbackBar?.isHidden = false
+        showDetailDialog(title: "处理失败", message: message, style: .warning)
+    }
+
+    private func showDetailDialog(title: String, message: String, style: NSAlert.Style) {
         let alert = NSAlert()
-        alert.messageText = "处理失败"
-        alert.informativeText = message
-        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.alertStyle = style
+        alert.addButton(withTitle: "关闭")
+
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 640, height: 220))
+        textView.string = message
+        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 660, height: 240))
+        scroll.documentView = textView
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.borderType = .lineBorder
+        alert.accessoryView = scroll
         alert.runModal()
     }
 
     private func saveState() {
-        let state = StoredState(cost: cost, initial: initial, history: history)
+        let state = StoredState(
+            cost: ownerCost,
+            partnerCost: partnerCost,
+            initial: initial,
+            history: history,
+            settlement: settlement
+        )
         if let data = try? JSONEncoder().encode(state) {
             UserDefaults.standard.set(data, forKey: "StoredState")
         }
     }
 
     private func savePoolState() {
-        let state = PoolAnalyzerState(history: poolHistory)
+        let state = PoolAnalyzerState(
+            history: poolHistory,
+            selectedGroups: selectedPoolGroups,
+            availableGroups: availablePoolGroups,
+            pollingMinutes: poolPollingMinutes,
+            warningEmail: smtpSettings.recipient,
+            accessToken: poolAccessToken,
+            refreshToken: poolRefreshToken
+        )
         if let data = try? JSONEncoder().encode(state) {
             UserDefaults.standard.set(data, forKey: "PoolAnalyzerState")
         }
@@ -2159,8 +4236,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
         costField.stringValue = money(state.cost)
+        partnerCostField.stringValue = money(state.partnerCost ?? 0)
         initial = state.initial
         history = state.history
+        settlement = state.settlement ?? .default
     }
 
     private func loadPoolState() {
@@ -2169,6 +4248,170 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
         poolHistory = state.history
+        selectedPoolGroups = state.selectedGroups ?? ["PLUS共享号池", "K12共享号池"]
+        availablePoolGroups = state.availableGroups ?? ["PLUS共享号池", "K12共享号池"]
+        poolPollingMinutes = normalizedPollingMinutes(state.pollingMinutes ?? defaultPollingMinutes)
+        poolPollingField.stringValue = money(poolPollingMinutes)
+        smtpSettings = loadSMTPSettings() ?? SMTPSettings(
+            host: SMTPSettings.default.host,
+            port: SMTPSettings.default.port,
+            username: "",
+            password: "",
+            recipient: state.warningEmail ?? SMTPSettings.default.recipient
+        )
+        updatePoolGroupsLabel()
+        poolAccessToken = state.accessToken
+        poolRefreshToken = state.refreshToken
+    }
+
+    private func parsePoolGroups(_ text: String) -> [String] {
+        text
+            .replacingOccurrences(of: "，", with: ",")
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private func normalizedEmail(_ text: String) -> String {
+        var value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !value.contains("@"), !value.isEmpty {
+            value += "@qq.com"
+        }
+        return value
+    }
+
+    private func parseBalanceAccounts(_ text: String) -> [BalanceAccount] {
+        if let jsonAccounts = parseBalanceAccountsJSON(text) {
+            return normalizeBalanceAccounts(jsonAccounts)
+        }
+        return text
+            .split(whereSeparator: \.isNewline)
+            .compactMap { rawLine -> BalanceAccount? in
+                let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !line.isEmpty else { return nil }
+                let parts: [String]
+                if line.contains("---") {
+                    parts = line
+                        .components(separatedBy: "---")
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                } else if line.contains(",") || line.contains("，") {
+                    parts = line
+                        .replacingOccurrences(of: "，", with: ",")
+                        .split(separator: ",", omittingEmptySubsequences: false)
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                } else {
+                    parts = line
+                        .split(whereSeparator: { $0 == " " || $0 == "\t" })
+                        .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+                }
+                guard parts.count >= 2 else { return nil }
+                let name = parts[0]
+                let apiKey = parts.count >= 3 ? parts[2] : parts[1]
+                guard !name.isEmpty, !apiKey.isEmpty, !apiKey.contains("...") else { return nil }
+                return BalanceAccount(name: name, baseURL: defaultBalanceBaseURL, apiKey: apiKey)
+            }
+    }
+
+    private func parseBalanceAccountsJSON(_ text: String) -> [BalanceAccount]? {
+        guard let data = text.data(using: .utf8),
+              let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return nil
+        }
+        let accounts = raw.compactMap { item -> BalanceAccount? in
+            let name = (item["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let apiKey = ((item["api_key"] as? String) ?? (item["apiKey"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty, !apiKey.isEmpty, !apiKey.contains("...") else { return nil }
+            return BalanceAccount(name: name, baseURL: defaultBalanceBaseURL, apiKey: apiKey)
+        }
+        return accounts.isEmpty ? nil : accounts
+    }
+
+    private func normalizeBalanceAccounts(_ accounts: [BalanceAccount]) -> [BalanceAccount] {
+        accounts.map { BalanceAccount(name: $0.name, baseURL: defaultBalanceBaseURL, apiKey: $0.apiKey) }
+    }
+
+    private func formatBalanceAccountsForEditing(_ accounts: [BalanceAccount]) -> String {
+        normalizeBalanceAccounts(accounts).map { "\($0.name)---\($0.apiKey)" }.joined(separator: "\n")
+    }
+
+    private func keychainQuery() -> [String: Any] {
+        keychainQuery(account: "quota-dashboard")
+    }
+
+    private func keychainQuery(account: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "local.gpt.cost.calculator.pool-api",
+            kSecAttrAccount as String: account
+        ]
+    }
+
+    private func savePoolCredentials(_ credentials: PoolCredentials) -> Bool {
+        guard let data = try? JSONEncoder().encode(credentials) else { return false }
+        var query = keychainQuery()
+        SecItemDelete(query as CFDictionary)
+        query[kSecValueData as String] = data
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        return SecItemAdd(query as CFDictionary, nil) == errSecSuccess
+    }
+
+    private func loadPoolCredentials() -> PoolCredentials? {
+        var query = keychainQuery()
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else {
+            return nil
+        }
+        return try? JSONDecoder().decode(PoolCredentials.self, from: data)
+    }
+
+    private func saveSMTPSettings(_ settings: SMTPSettings) -> Bool {
+        guard let data = try? JSONEncoder().encode(settings) else { return false }
+        var query = keychainQuery(account: "pool-warning-smtp")
+        SecItemDelete(query as CFDictionary)
+        query[kSecValueData as String] = data
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        return SecItemAdd(query as CFDictionary, nil) == errSecSuccess
+    }
+
+    private func loadSMTPSettings() -> SMTPSettings? {
+        var query = keychainQuery(account: "pool-warning-smtp")
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else {
+            return nil
+        }
+        return try? JSONDecoder().decode(SMTPSettings.self, from: data)
+    }
+
+    private func saveBalanceAccounts(_ accounts: [BalanceAccount]) -> Bool {
+        guard let data = try? JSONEncoder().encode(normalizeBalanceAccounts(accounts)) else { return false }
+        var query = keychainQuery(account: "balance-accounts")
+        SecItemDelete(query as CFDictionary)
+        query[kSecValueData as String] = data
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        return SecItemAdd(query as CFDictionary, nil) == errSecSuccess
+    }
+
+    private func loadBalanceAccounts() -> [BalanceAccount] {
+        var query = keychainQuery(account: "balance-accounts")
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data,
+              let accounts = try? JSONDecoder().decode([BalanceAccount].self, from: data) else {
+            return []
+        }
+        let normalized = normalizeBalanceAccounts(accounts)
+        if normalized.map(\.baseURL) != accounts.map(\.baseURL) {
+            _ = saveBalanceAccounts(normalized)
+        }
+        return normalized
     }
 }
 
@@ -2181,6 +4424,38 @@ struct AppError: LocalizedError {
 
     var errorDescription: String? {
         message
+    }
+}
+
+private extension KeyedDecodingContainer {
+    func decodeFlexibleInt(forKey key: Key) throws -> Int {
+        try decodeFlexibleOptionalInt(forKey: key) ?? 0
+    }
+
+    func decodeFlexibleOptionalInt(forKey key: Key) throws -> Int? {
+        if let value = try decodeIfPresent(Int.self, forKey: key) {
+            return value
+        }
+        if let value = try decodeIfPresent(Double.self, forKey: key) {
+            return Int(value.rounded())
+        }
+        if let value = try decodeIfPresent(String.self, forKey: key) {
+            return Int(Double(value) ?? 0)
+        }
+        return nil
+    }
+
+    func decodeFlexibleOptionalDouble(forKey key: Key) throws -> Double? {
+        if let value = try decodeIfPresent(Double.self, forKey: key) {
+            return value
+        }
+        if let value = try decodeIfPresent(Int.self, forKey: key) {
+            return Double(value)
+        }
+        if let value = try decodeIfPresent(String.self, forKey: key) {
+            return Double(value)
+        }
+        return nil
     }
 }
 
