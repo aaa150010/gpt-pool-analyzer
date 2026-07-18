@@ -1588,7 +1588,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         title.alignment = .left
         title.translatesAutoresizingMaskIntoConstraints = false
 
-        let hint = NSTextField(labelWithString: "按本次实际提现金额结算；扣成本后算净利润；社会哥固定分成 40%。")
+        let hint = NSTextField(labelWithString: "按本次实际提现金额结算；扣成本后算当前提现利润；社会哥固定分成 40%。")
         hint.font = .systemFont(ofSize: 14, weight: .semibold)
         hint.textColor = .secondaryLabelColor
         hint.lineBreakMode = .byWordWrapping
@@ -1678,7 +1678,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         grid.translatesAutoresizingMaskIntoConstraints = false
 
         let balanceTitle = settlementFormulaTitle("本次提现")
-        let netTitle = settlementFormulaTitle("净利润")
+        let netTitle = settlementFormulaTitle("当前提现利润")
         let settlementTitle = settlementFormulaTitle("结算结果")
         let divider = settlementDivider()
 
@@ -1938,7 +1938,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let settlementLine: String
         if calculation.netOutcome >= 0 {
             netOutcomeLabel = "分成基数 \(money(calculation.settlementBase)) - 总出资 \(money(calculation.totalCost)) = \(money(calculation.netOutcome))"
-            settlementLine = "社会哥应收 = 出资 \(money(partnerCost)) + 净利润 \(money(calculation.netOutcome)) × \(money(calculation.partnerSharePercent))% = \(money(calculation.partnerSettlement))；星星应收 = \(money(calculation.ownerSettlement))"
+            settlementLine = "社会哥应收 = 出资 \(money(partnerCost)) + 当前提现利润 \(money(calculation.netOutcome)) × \(money(calculation.partnerSharePercent))% = \(money(calculation.partnerSettlement))；星星应收 = \(money(calculation.ownerSettlement))"
         } else {
             netOutcomeLabel = "分成基数 \(money(calculation.settlementBase)) - 总出资 \(money(calculation.totalCost)) = \(signedMoney(calculation.netOutcome))，双方各承担 \(money(abs(calculation.netOutcome) / 2))"
             settlementLine = calculation.partnerSettlement >= 0
@@ -1985,7 +1985,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 ("时间", "time", 170),
                 ("余额合计", "total", 190),
                 ("扣成本后", "gross", 190),
-                ("净利润", "afterCost", 210)
+                ("总利润", "afterCost", 210)
             ]
         )
         scroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -2013,7 +2013,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let metricRow = NSStackView(views: [
             metricCard(title: "成本合计", value: costValue, color: .systemBlue),
             metricCard(title: "现在余额合计", value: currentValue, color: .systemTeal),
-            metricCard(title: "净利润", value: resultValue, color: .systemOrange),
+            metricCard(title: "总利润", value: resultValue, color: .systemOrange),
             metricCard(title: "回本状态", value: remainingValue, color: .systemRed),
             metricCard(title: "社会哥应收", value: socialReceivableValue, color: .systemOrange),
             metricCard(title: "星星应收", value: xingReceivableValue, color: .systemIndigo)
@@ -3998,20 +3998,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func updateMetrics() {
         setMetric("cost", field: costValue, value: cost, suffix: " 元")
-        let withdrawal = effectiveWithdrawalAmount
-        let latestTotal = history.last?.total
-        let gross = withdrawal - effectiveBaseDeduction
-        let totalCost = cost
-        let currentProfit = gross - totalCost
-        let paybackDelta = currentProfit
-
+        guard let latestTotal = history.last?.total else {
+            setMetric("current", field: currentValue, value: nil, suffix: " 元")
+            setMetric("net", field: netValue, value: nil, suffix: " 元")
+            setMetric("result", field: resultValue, value: nil, suffix: " 元")
+            setMetricText("remaining", field: remainingValue, text: "--")
+            return
+        }
+        let bookProfit = latestTotal - effectiveBaseDeduction - cost
         setMetric("current", field: currentValue, value: latestTotal, suffix: " 元")
-        setMetric("net", field: netValue, value: currentProfit, suffix: " 元")
-        netValue.textColor = currentProfit >= 0 ? .systemGreen : .systemRed
-        setMetric("result", field: resultValue, value: currentProfit, suffix: " 元")
-        resultValue.textColor = currentProfit >= 0 ? .systemGreen : .systemRed
-        animateMetricNumber("remaining", field: remainingValue, value: paybackDelta) { "\(String(format: "%+.2f", $0)) 元" }
-        remainingValue.textColor = paybackDelta >= 0 ? .systemGreen : .systemRed
+        setMetric("net", field: netValue, value: bookProfit, suffix: " 元")
+        netValue.textColor = bookProfit >= 0 ? .systemGreen : .systemRed
+        setMetric("result", field: resultValue, value: bookProfit, suffix: " 元")
+        resultValue.textColor = bookProfit >= 0 ? .systemGreen : .systemRed
+        animateMetricNumber("remaining", field: remainingValue, value: bookProfit) { "\(String(format: "%+.2f", $0)) 元" }
+        remainingValue.textColor = bookProfit >= 0 ? .systemGreen : .systemRed
     }
 
     private func setMetricText(_ key: String, field: NSTextField, text: String) {
@@ -4233,7 +4234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         lines.append("")
         lines.append("当前结果")
-        lines.append("  净利润：\(money(currentProfitAfterCost)) 元")
+        lines.append("  当前提现利润：\(money(currentProfitAfterCost)) 元")
         lines.append("")
         lines.append("回本状态：\(signedMoney(remaining)) 元")
 
@@ -4247,7 +4248,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         var rows = [
             "┌──────┬──────────┬──────────────┬──────────────┬──────────────┬──────────────┐",
-            "│ 序号 │ 时间     │ 余额合计(元) │ 扣成本后     │ 净利润       │",
+            "│ 序号 │ 时间     │ 余额合计(元) │ 扣成本后     │ 总利润       │",
             "├──────┼──────────┼──────────────┼──────────────┼──────────────┤"
         ]
 
