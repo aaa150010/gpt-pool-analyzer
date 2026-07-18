@@ -71,7 +71,7 @@ struct SettlementState: Codable {
     var withdrawals: [String: Double]
 
     static let `default` = SettlementState(
-        partnerName: "合作人",
+        partnerName: "B方（社会哥）",
         partnerSharePercent: 40,
         payoutRatePercent: 85,
         withdrawals: [:]
@@ -675,7 +675,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let resultValue = NSTextField(labelWithString: "--")
     private let progressValue = NSTextField(labelWithString: "--")
     private let remainingValue = NSTextField(labelWithString: "--")
-    private let partnerNameField = NSTextField(string: "合作人")
+    private let partnerNameField = NSTextField(string: "B方（社会哥）")
     private let partnerShareField = NSTextField(string: "40")
     private let comparisonTable = NSTableView()
     private let historyTable = NSTableView()
@@ -933,9 +933,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         let stack = NSStackView()
         stack.orientation = .vertical
-        stack.spacing = 6
+        stack.spacing = 8
         stack.alignment = .leading
-        stack.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 8, right: 12)
+        stack.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         let inputRow = NSStackView()
@@ -943,28 +943,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         inputRow.spacing = 8
         inputRow.alignment = .centerY
         inputRow.translatesAutoresizingMaskIntoConstraints = false
-        inputRow.addArrangedSubview(label("我方出资"))
+        inputRow.addArrangedSubview(label("A方（星星）出资"))
         inputRow.addArrangedSubview(costField)
-        inputRow.addArrangedSubview(label("合作人出资"))
+        inputRow.addArrangedSubview(label("B方（社会哥）出资"))
         inputRow.addArrangedSubview(partnerCostField)
         inputRow.addArrangedSubview(label("基准余额合计"))
         inputRow.addArrangedSubview(manualBaseField)
         inputRow.addArrangedSubview(label("追加成本"))
         inputRow.addArrangedSubview(addCostField)
         inputRow.addArrangedSubview(addCostButton)
+        let actionRow = NSStackView()
+        actionRow.orientation = .horizontal
+        actionRow.spacing = 8
+        actionRow.alignment = .centerY
+        actionRow.translatesAutoresizingMaskIntoConstraints = false
         for button in Array(buttonRow.arrangedSubviews) {
             buttonRow.removeArrangedSubview(button)
-            inputRow.addArrangedSubview(button)
+            actionRow.addArrangedSubview(button)
         }
 
-        let scroll = NSScrollView()
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.documentView = inputRow
-        scroll.hasHorizontalScroller = true
-        scroll.hasVerticalScroller = false
-        scroll.autohidesScrollers = true
-        scroll.borderType = .noBorder
-        stack.addArrangedSubview(scroll)
+        let inputScroll = horizontalScroll(documentView: inputRow)
+        let actionScroll = horizontalScroll(documentView: actionRow)
+        stack.addArrangedSubview(inputScroll)
+        stack.addArrangedSubview(actionScroll)
 
         panel.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -972,15 +973,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             stack.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
             stack.topAnchor.constraint(equalTo: panel.topAnchor),
             stack.bottomAnchor.constraint(equalTo: panel.bottomAnchor),
-            scroll.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
-            scroll.heightAnchor.constraint(equalToConstant: 34),
-            inputRow.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
-            inputRow.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
-            inputRow.bottomAnchor.constraint(equalTo: scroll.contentView.bottomAnchor),
-            panel.heightAnchor.constraint(equalToConstant: 52)
+            inputScroll.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            inputScroll.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+            inputScroll.heightAnchor.constraint(equalToConstant: 30),
+            actionScroll.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            actionScroll.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+            actionScroll.heightAnchor.constraint(equalToConstant: 32),
+            inputRow.leadingAnchor.constraint(equalTo: inputScroll.contentView.leadingAnchor),
+            inputRow.topAnchor.constraint(equalTo: inputScroll.contentView.topAnchor),
+            inputRow.bottomAnchor.constraint(equalTo: inputScroll.contentView.bottomAnchor),
+            actionRow.leadingAnchor.constraint(equalTo: actionScroll.contentView.leadingAnchor),
+            actionRow.topAnchor.constraint(equalTo: actionScroll.contentView.topAnchor),
+            actionRow.bottomAnchor.constraint(equalTo: actionScroll.contentView.bottomAnchor),
+            panel.heightAnchor.constraint(equalToConstant: 86)
         ])
         return panel
+    }
+
+    private func horizontalScroll(documentView: NSView) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = documentView
+        scroll.hasHorizontalScroller = true
+        scroll.hasVerticalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.borderType = .noBorder
+        return scroll
     }
 
     private func buildTabBar() -> NSView {
@@ -1501,12 +1519,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let comparisonScroll = makeTableScroll(
             table: comparisonTable,
             columns: [
-                ("序号", "index", 80),
-                ("账号", "account", 250),
-                ("基准余额", "base", 135),
-                ("当前余额", "current", 135),
-                ("变化金额", "delta", 145),
-                ("新增百分比", "growth", 145)
+                ("序号", "index", 90),
+                ("账号", "account", 360),
+                ("当前余额", "current", 180)
             ]
         )
         comparisonScroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -1570,12 +1585,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         let titleRow = NSStackView()
         titleRow.orientation = .horizontal
-        titleRow.spacing = 44
+        titleRow.spacing = 28
         titleRow.alignment = .firstBaseline
         titleRow.translatesAutoresizingMaskIntoConstraints = false
         titleRow.addArrangedSubview(title)
         titleRow.addArrangedSubview(hint)
-        title.widthAnchor.constraint(equalToConstant: 172).isActive = true
+        title.widthAnchor.constraint(equalToConstant: 150).isActive = true
 
         configureSettlementField(partnerShareField, placeholder: "40", width: 58)
         partnerShareField.stringValue = money(settlement.partnerSharePercent)
@@ -1585,10 +1600,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         settingsRow.spacing = 8
         settingsRow.alignment = .centerY
         settingsRow.translatesAutoresizingMaskIntoConstraints = false
-        settingsRow.addArrangedSubview(label("对方分成"))
+        settingsRow.addArrangedSubview(label("B方（社会哥）分成"))
         settingsRow.addArrangedSubview(partnerShareField)
         settingsRow.addArrangedSubview(label("%"))
-        let ownerShare = NSTextField(labelWithString: "我方分成 = 100% - 对方分成")
+        let ownerShare = NSTextField(labelWithString: "A方（星星）分成 = 100% - B方（社会哥）分成")
         ownerShare.font = .systemFont(ofSize: 12, weight: .semibold)
         ownerShare.textColor = .secondaryLabelColor
         ownerShare.alignment = .left
@@ -1605,8 +1620,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         resultRow.alignment = .centerY
         resultRow.distribution = .fill
         resultRow.translatesAutoresizingMaskIntoConstraints = false
-        resultRow.addArrangedSubview(settlementResultBlock(title: "合伙人应收", value: partnerTransferValue, color: .systemOrange))
-        resultRow.addArrangedSubview(settlementResultBlock(title: "我方应留", value: ownerReceivesValue, color: .systemIndigo))
+        resultRow.addArrangedSubview(settlementResultBlock(title: "B方（社会哥）应收", value: partnerTransferValue, color: .systemOrange))
+        resultRow.addArrangedSubview(settlementResultBlock(title: "A方（星星）应留", value: ownerReceivesValue, color: .systemIndigo))
 
         let balanceChangeFormula = settlementFormulaValue()
         let netOutcomeFormula = settlementFormulaValue()
@@ -1619,7 +1634,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         let leftColumn = NSStackView()
         leftColumn.orientation = .vertical
-        leftColumn.spacing = 28
+        leftColumn.spacing = 14
         leftColumn.alignment = .width
         leftColumn.translatesAutoresizingMaskIntoConstraints = false
         leftColumn.addArrangedSubview(settingsRow)
@@ -1627,7 +1642,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         let contentRow = NSStackView()
         contentRow.orientation = .horizontal
-        contentRow.spacing = 34
+        contentRow.spacing = 22
         contentRow.alignment = .centerY
         contentRow.translatesAutoresizingMaskIntoConstraints = false
         contentRow.addArrangedSubview(leftColumn)
@@ -1640,14 +1655,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         panel.addSubview(titleRow)
         panel.addSubview(contentRow)
         NSLayoutConstraint.activate([
-            titleRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 48),
-            titleRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -48),
-            titleRow.topAnchor.constraint(equalTo: panel.topAnchor, constant: 28),
-            contentRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 48),
-            contentRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -48),
-            contentRow.topAnchor.constraint(equalTo: titleRow.bottomAnchor, constant: 14),
-            contentRow.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -28),
-            resultRow.widthAnchor.constraint(equalToConstant: 456)
+            titleRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 32),
+            titleRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -32),
+            titleRow.topAnchor.constraint(equalTo: panel.topAnchor, constant: 18),
+            contentRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 32),
+            contentRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -32),
+            contentRow.topAnchor.constraint(equalTo: titleRow.bottomAnchor, constant: 10),
+            contentRow.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -18),
+            resultRow.widthAnchor.constraint(equalToConstant: 416)
         ])
 
         settlementLabels = (partnerTransferValue, ownerReceivesValue, balanceChangeFormula, netOutcomeFormula, settlementLineFormula)
@@ -1691,7 +1706,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             balanceChange.firstBaselineAnchor.constraint(equalTo: balanceTitle.firstBaselineAnchor),
 
             netTitle.leadingAnchor.constraint(equalTo: grid.leadingAnchor),
-            netTitle.topAnchor.constraint(equalTo: balanceTitle.bottomAnchor, constant: 14),
+            netTitle.topAnchor.constraint(equalTo: balanceTitle.bottomAnchor, constant: 10),
             netTitle.widthAnchor.constraint(equalToConstant: 120),
             netOutcome.leadingAnchor.constraint(equalTo: grid.leadingAnchor, constant: formulaLeading),
             netOutcome.trailingAnchor.constraint(equalTo: grid.trailingAnchor),
@@ -1699,10 +1714,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
             divider.leadingAnchor.constraint(equalTo: grid.leadingAnchor),
             divider.trailingAnchor.constraint(equalTo: grid.trailingAnchor),
-            divider.topAnchor.constraint(equalTo: netTitle.bottomAnchor, constant: 14),
+            divider.topAnchor.constraint(equalTo: netTitle.bottomAnchor, constant: 10),
 
             settlementTitle.leadingAnchor.constraint(equalTo: grid.leadingAnchor),
-            settlementTitle.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 14),
+            settlementTitle.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 10),
             settlementTitle.widthAnchor.constraint(equalToConstant: 120),
             settlementLine.leadingAnchor.constraint(equalTo: grid.leadingAnchor, constant: formulaLeading),
             settlementLine.trailingAnchor.constraint(equalTo: grid.trailingAnchor),
@@ -1821,8 +1836,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         content.addArrangedSubview(value)
         card.addSubview(content)
         NSLayoutConstraint.activate([
-            card.widthAnchor.constraint(equalToConstant: 220),
-            card.heightAnchor.constraint(equalToConstant: 86),
+            card.widthAnchor.constraint(equalToConstant: 200),
+            card.heightAnchor.constraint(equalToConstant: 76),
             content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
             content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
             content.centerYAnchor.constraint(equalTo: card.centerYAnchor),
@@ -1877,7 +1892,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let baseTotal = effectiveBaseTotal ?? 0
         let currentTotal = history.last?.total ?? baseTotal
         let balanceChange = currentTotal - baseTotal
-        let totalCost = cost + partnerCost
+        let totalCost = cost
         let netOutcome = balanceChange - totalCost
         let partnerSettlement: Double
         if netOutcome >= 0 {
@@ -1899,7 +1914,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func settlementInputsChanged() {
-        settlement.partnerName = "合作人"
+        settlement.partnerName = "B方（社会哥）"
         settlement.partnerSharePercent = min(max(settlementNumber(from: partnerShareField, fallback: settlement.partnerSharePercent), 0), 100)
 
         saveState()
@@ -1931,12 +1946,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let settlementLine: String
         if calculation.netOutcome >= 0 {
             netOutcomeLabel = "余额变化 \(money(calculation.balanceChange)) - 总出资 \(money(calculation.totalCost)) = \(money(calculation.netOutcome))"
-            settlementLine = "\(settlement.partnerName) 应收 = 出资 \(money(partnerCost)) + 净利润 \(money(calculation.netOutcome)) × \(money(calculation.partnerSharePercent))% = \(money(calculation.partnerSettlement))；我方应留 = \(money(calculation.ownerSettlement))"
+            settlementLine = "B方（社会哥）应收 = 出资 \(money(partnerCost)) + 净利润 \(money(calculation.netOutcome)) × \(money(calculation.partnerSharePercent))% = \(money(calculation.partnerSettlement))；A方（星星）应留 = \(money(calculation.ownerSettlement))"
         } else {
             netOutcomeLabel = "余额变化 \(money(calculation.balanceChange)) - 总出资 \(money(calculation.totalCost)) = \(signedMoney(calculation.netOutcome))，双方各承担 \(money(abs(calculation.netOutcome) / 2))"
             settlementLine = calculation.partnerSettlement >= 0
-                ? "\(settlement.partnerName) 应收 = 出资 \(money(partnerCost)) - 应承担亏损 \(money(abs(calculation.netOutcome) / 2)) = \(money(calculation.partnerSettlement))；我方应留 = \(money(calculation.ownerSettlement))"
-                : "\(settlement.partnerName) 本次应补给我方 \(money(abs(calculation.partnerSettlement)))；我方无需向对方转款"
+                ? "B方（社会哥）应收 = 出资 \(money(partnerCost)) - 应承担亏损 \(money(abs(calculation.netOutcome) / 2)) = \(money(calculation.partnerSettlement))；A方（星星）应留 = \(money(calculation.ownerSettlement))"
+                : "B方（社会哥）本次应补给 A方（星星）\(money(abs(calculation.partnerSettlement)))；A方（星星）无需向 B方（社会哥）转款"
         }
         labels.netOutcome.stringValue = netOutcomeLabel
         labels.settlementLine.stringValue = settlementLine
@@ -2097,7 +2112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let newCost = ownerCost + increment
         costField.stringValue = money(newCost)
         addCostField.stringValue = ""
-        showFeedback("已累加我方出资：\(signedMoney(increment)) 元，我方当前出资 \(money(newCost)) 元。", color: .systemGreen)
+        showFeedback("已累加 A方（星星）出资：\(signedMoney(increment)) 元，A方（星星）当前出资 \(money(newCost)) 元。", color: .systemGreen)
         saveState()
         refreshOutput()
     }
@@ -3931,7 +3946,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
 
         let gross = latest.total - baseTotal
-        let totalCost = cost + partnerCost
+        let totalCost = cost
         let currentProfit = gross - totalCost
         let progress = totalCost > 0 ? gross / totalCost * 100 : 0
         let paybackDelta = currentProfit
@@ -4089,9 +4104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         if tableView == comparisonTable {
             guard let initial, let latest = history.last else { return container }
-            let start = row < initial.amounts.count ? initial.amounts[row] : 0
             let end = row < latest.amounts.count ? latest.amounts[row] : 0
-            let delta = end - start
             let accounts = initial.accounts ?? latest.accounts ?? []
             let account = row < accounts.count ? accounts[row] : "账号 \(row + 1)"
             switch identifier {
@@ -4099,28 +4112,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 cell.stringValue = "\(row + 1)"
             case "account":
                 cell.stringValue = account
-            case "base":
-                cell.stringValue = money(start)
             case "current":
                 cell.stringValue = money(end)
-            case "delta":
-                cell.stringValue = signedMoney(delta)
-                cell.textColor = delta >= 0 ? .systemGreen : .systemRed
-            case "growth":
-                if start == 0 {
-                    cell.stringValue = "--"
-                } else {
-                    let growth = delta / start * 100
-                    cell.stringValue = signedPercent(growth)
-                    cell.textColor = growth >= 0 ? .systemGreen : .systemRed
-                }
-            case "intervalCompare":
-                if let value = intervalComparePercent(row: row) {
-                    cell.stringValue = signedPercent(value)
-                    cell.textColor = value >= 0 ? .systemGreen : .systemRed
-                } else {
-                    cell.stringValue = "--"
-                }
             default:
                 break
             }
@@ -4131,7 +4124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             guard let baseTotal = effectiveBaseTotal else { return container }
             let item = history[row]
             let gross = item.total - baseTotal
-            let afterCost = gross - cost - partnerCost
+            let afterCost = gross - cost
             switch identifier {
             case "index":
                 cell.stringValue = "\(row + 1)"
@@ -4172,7 +4165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func buildReport() -> String {
         var lines: [String] = []
-        lines.append("总出资：我方 \(money(cost)) 元 + 合作人 \(money(partnerCost)) 元 = \(money(cost + partnerCost)) 元")
+        lines.append("总出资：A方（星星）\(money(ownerCost)) 元 + B方（社会哥）\(money(partnerCost)) 元 = \(money(cost)) 元")
         lines.append("")
 
         guard let initial, let baseTotal = effectiveBaseTotal else {
@@ -4191,9 +4184,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
 
         let gross = latest.total - baseTotal
-        let currentProfitAfterCost = gross - cost - partnerCost
+        let currentProfitAfterCost = gross - cost
         let remaining = currentProfitAfterCost
-        let progress = (cost + partnerCost) > 0 ? gross / (cost + partnerCost) * 100 : 0
+        let progress = cost > 0 ? gross / cost * 100 : 0
         lines.append("最新截图")
         lines.append("  时间：\(formatDate(latest.date))")
         lines.append("  现在余额合计：\(amountList(latest.amounts)) = \(money(latest.total)) 元")
@@ -4227,7 +4220,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         for (index, item) in history.enumerated() {
             let gross = item.total - baseTotal
-            let afterCost = gross - cost - partnerCost
+            let afterCost = gross - cost
             rows.append(String(format: "│ %4d │ %-8@ │ %12.2f │ %+12.2f │ %+12.2f │",
                                index + 1,
                                formatDate(item.date) as NSString,
