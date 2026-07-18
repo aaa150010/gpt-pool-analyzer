@@ -59,6 +59,9 @@ struct StoredState: Codable {
     var cost: Double
     var partnerCost: Double?
     var manualBaseTotal: Double?
+    var withdrawalAmount: Double?
+    var useBaseDeduction: Bool?
+    var baseDeductionAmount: Double?
     var initial: Snapshot?
     var history: [Snapshot]
     var settlement: SettlementState?
@@ -71,7 +74,7 @@ struct SettlementState: Codable {
     var withdrawals: [String: Double]
 
     static let `default` = SettlementState(
-        partnerName: "B方（社会哥）",
+        partnerName: "社会哥",
         partnerSharePercent: 40,
         payoutRatePercent: 85,
         withdrawals: [:]
@@ -606,7 +609,7 @@ final class BalanceTrendChartView: NSView {
     }
 
     private func drawEmpty() {
-        let text = "查询为基准后开始显示余额走势"
+        let text = "查询最新余额后开始显示余额走势"
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 14, weight: .semibold),
             .foregroundColor: NSColor.secondaryLabelColor
@@ -655,7 +658,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var window: NSWindow!
     private let costField = NSTextField(string: "200")
     private let partnerCostField = NSTextField(string: "0")
-    private let manualBaseField = NSTextField(string: "")
+    private let withdrawalField = NSTextField(string: "")
+    private let useBaseDeductionButton = NSButton(checkboxWithTitle: "扣基准余额", target: nil, action: nil)
+    private let baseDeductionField = NSTextField(string: "")
     private let addCostField = NSTextField(string: "")
     private let statusLabel = NSTextField(labelWithString: "")
     private var metricAnimations: [String: Timer] = [:]
@@ -669,14 +674,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let pasteDebounceInterval: TimeInterval = 3
 
     private let costValue = NSTextField(labelWithString: "--")
-    private let baseValue = NSTextField(labelWithString: "--")
     private let currentValue = NSTextField(labelWithString: "--")
     private let netValue = NSTextField(labelWithString: "--")
     private let resultValue = NSTextField(labelWithString: "--")
-    private let progressValue = NSTextField(labelWithString: "--")
     private let remainingValue = NSTextField(labelWithString: "--")
-    private let partnerNameField = NSTextField(string: "B方（社会哥）")
-    private let partnerShareField = NSTextField(string: "40")
+    private let socialReceivableValue = NSTextField(labelWithString: "--")
+    private let xingReceivableValue = NSTextField(labelWithString: "--")
+    private let partnerNameField = NSTextField(string: "社会哥")
     private let comparisonTable = NSTableView()
     private let historyTable = NSTableView()
     private let plusPoolHistoryTable = NSTableView()
@@ -698,10 +702,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var poolSummaryLabels: [String: (total: NSTextField, schedulable: NSTextField, status: NSTextField, change: NSTextField, time: NSTextField)] = [:]
     private var poolHistoryTables: [NSTableView: String] = [:]
     private var settlementTextObservers: [NSObjectProtocol] = []
-    private var settlementLabels: (partnerTransfer: NSTextField, ownerReceives: NSTextField, balanceChange: NSTextField, netOutcome: NSTextField, settlementLine: NSTextField)?
+    private var settlementLabels: (balanceChange: NSTextField, netOutcome: NSTextField, settlementLine: NSTextField)?
 
     private var initial: Snapshot?
-    private var manualBaseTotal: Double?
+    private var withdrawalAmount: Double?
+    private var useBaseDeduction = false
+    private var baseDeductionAmount: Double?
     private var history: [Snapshot] = []
     private var poolHistory: [PoolSnapshot] = []
     private var selectedPoolGroups: [String] = ["PLUS共享号池", "K12共享号池"]
@@ -753,17 +759,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         configureField(costField, placeholder: "200")
         configureField(partnerCostField, placeholder: "0")
-        configureField(manualBaseField, placeholder: "可手填")
+        configureField(withdrawalField, placeholder: "2300")
+        configureField(baseDeductionField, placeholder: "128.70")
+        baseDeductionField.isHidden = true
+        useBaseDeductionButton.target = self
+        useBaseDeductionButton.action = #selector(toggleBaseDeduction)
+        useBaseDeductionButton.state = .off
         configureField(addCostField, placeholder: "0")
         addCostField.target = self
         addCostField.action = #selector(addCost)
 
         let initialButton = button("账号配置", action: #selector(editBalanceAccounts))
-        let latestButton = button("查询为基准", action: #selector(queryBalanceAsInitial))
         let queryLatestButton = button("查询最新余额", action: #selector(queryBalanceAsLatest))
         let resetButton = button("一键重置", action: #selector(resetAll))
         let addCostButton = button("累加成本", action: #selector(addCost))
-        let buttonRow = NSStackView(views: [initialButton, latestButton, queryLatestButton, resetButton])
+        let buttonRow = NSStackView(views: [initialButton, queryLatestButton, resetButton])
         buttonRow.orientation = .horizontal
         buttonRow.spacing = 10
         buttonRow.alignment = .centerY
@@ -838,7 +848,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         NotificationCenter.default.addObserver(self, selector: #selector(inputsChanged), name: NSControl.textDidChangeNotification, object: costField)
         NotificationCenter.default.addObserver(self, selector: #selector(inputsChanged), name: NSControl.textDidChangeNotification, object: partnerCostField)
-        NotificationCenter.default.addObserver(self, selector: #selector(inputsChanged), name: NSControl.textDidChangeNotification, object: manualBaseField)
+        NotificationCenter.default.addObserver(self, selector: #selector(inputsChanged), name: NSControl.textDidChangeNotification, object: withdrawalField)
+        NotificationCenter.default.addObserver(self, selector: #selector(inputsChanged), name: NSControl.textDidChangeNotification, object: baseDeductionField)
 
     }
 
@@ -943,12 +954,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         inputRow.spacing = 8
         inputRow.alignment = .centerY
         inputRow.translatesAutoresizingMaskIntoConstraints = false
-        inputRow.addArrangedSubview(label("A方（星星）出资"))
+        inputRow.addArrangedSubview(label("星星出资"))
         inputRow.addArrangedSubview(costField)
-        inputRow.addArrangedSubview(label("B方（社会哥）出资"))
+        inputRow.addArrangedSubview(label("社会哥出资"))
         inputRow.addArrangedSubview(partnerCostField)
-        inputRow.addArrangedSubview(label("基准余额合计"))
-        inputRow.addArrangedSubview(manualBaseField)
+        inputRow.addArrangedSubview(label("本次提现金额"))
+        inputRow.addArrangedSubview(withdrawalField)
+        inputRow.addArrangedSubview(useBaseDeductionButton)
+        inputRow.addArrangedSubview(baseDeductionField)
         inputRow.addArrangedSubview(label("追加成本"))
         inputRow.addArrangedSubview(addCostField)
         inputRow.addArrangedSubview(addCostButton)
@@ -1575,7 +1588,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         title.alignment = .left
         title.translatesAutoresizingMaskIntoConstraints = false
 
-        let hint = NSTextField(labelWithString: "按当前余额合计与基准余额合计的差额结算；盈利先返还双方实际出资，再按比例分利润；亏损双方各承担一半。")
+        let hint = NSTextField(labelWithString: "按本次实际提现金额结算；扣成本后算净利润；社会哥固定分成 40%。")
         hint.font = .systemFont(ofSize: 14, weight: .semibold)
         hint.textColor = .secondaryLabelColor
         hint.lineBreakMode = .byWordWrapping
@@ -1592,36 +1605,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         titleRow.addArrangedSubview(hint)
         title.widthAnchor.constraint(equalToConstant: 150).isActive = true
 
-        configureSettlementField(partnerShareField, placeholder: "40", width: 58)
-        partnerShareField.stringValue = money(settlement.partnerSharePercent)
-
         let settingsRow = NSStackView()
         settingsRow.orientation = .horizontal
         settingsRow.spacing = 8
         settingsRow.alignment = .centerY
         settingsRow.translatesAutoresizingMaskIntoConstraints = false
-        settingsRow.addArrangedSubview(label("B方（社会哥）分成"))
-        settingsRow.addArrangedSubview(partnerShareField)
-        settingsRow.addArrangedSubview(label("%"))
-        let ownerShare = NSTextField(labelWithString: "A方（星星）分成 = 100% - B方（社会哥）分成")
+        settingsRow.addArrangedSubview(label("社会哥分成 40%"))
+        let ownerShare = NSTextField(labelWithString: "星星分成 60%")
         ownerShare.font = .systemFont(ofSize: 12, weight: .semibold)
         ownerShare.textColor = .secondaryLabelColor
         ownerShare.alignment = .left
         settingsRow.addArrangedSubview(ownerShare)
-
-        let partnerTransferValue = settlementMetricValue()
-        let ownerReceivesValue = settlementMetricValue()
-        partnerTransferValue.font = .systemFont(ofSize: 24, weight: .bold)
-        ownerReceivesValue.font = .systemFont(ofSize: 24, weight: .bold)
-
-        let resultRow = NSStackView()
-        resultRow.orientation = .horizontal
-        resultRow.spacing = 16
-        resultRow.alignment = .centerY
-        resultRow.distribution = .fill
-        resultRow.translatesAutoresizingMaskIntoConstraints = false
-        resultRow.addArrangedSubview(settlementResultBlock(title: "B方（社会哥）应收", value: partnerTransferValue, color: .systemOrange))
-        resultRow.addArrangedSubview(settlementResultBlock(title: "A方（星星）应留", value: ownerReceivesValue, color: .systemIndigo))
 
         let balanceChangeFormula = settlementFormulaValue()
         let netOutcomeFormula = settlementFormulaValue()
@@ -1646,11 +1640,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         contentRow.alignment = .centerY
         contentRow.translatesAutoresizingMaskIntoConstraints = false
         contentRow.addArrangedSubview(leftColumn)
-        contentRow.addArrangedSubview(resultRow)
         leftColumn.setContentHuggingPriority(.defaultLow, for: .horizontal)
         leftColumn.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
-        resultRow.setContentHuggingPriority(.required, for: .horizontal)
-        resultRow.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         panel.addSubview(titleRow)
         panel.addSubview(contentRow)
@@ -1661,11 +1652,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             contentRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 32),
             contentRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -32),
             contentRow.topAnchor.constraint(equalTo: titleRow.bottomAnchor, constant: 10),
-            contentRow.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -18),
-            resultRow.widthAnchor.constraint(equalToConstant: 416)
+            contentRow.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -18)
         ])
 
-        settlementLabels = (partnerTransferValue, ownerReceivesValue, balanceChangeFormula, netOutcomeFormula, settlementLineFormula)
+        settlementLabels = (balanceChangeFormula, netOutcomeFormula, settlementLineFormula)
         updateSettlementOutput()
         return panel
     }
@@ -1687,7 +1677,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let grid = NSView()
         grid.translatesAutoresizingMaskIntoConstraints = false
 
-        let balanceTitle = settlementFormulaTitle("余额变化")
+        let balanceTitle = settlementFormulaTitle("本次提现")
         let netTitle = settlementFormulaTitle("净利润")
         let settlementTitle = settlementFormulaTitle("结算结果")
         let divider = settlementDivider()
@@ -1857,9 +1847,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private struct SettlementCalculation {
-        let baseTotal: Double
-        let currentTotal: Double
-        let balanceChange: Double
+        let withdrawalAmount: Double
+        let baseDeduction: Double
+        let settlementBase: Double
         let totalCost: Double
         let netOutcome: Double
         let partnerSettlement: Double
@@ -1888,12 +1878,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func settlementCalculation() -> SettlementCalculation {
-        let partnerSharePercent = min(max(settlementNumber(from: partnerShareField, fallback: settlement.partnerSharePercent), 0), 100)
-        let baseTotal = effectiveBaseTotal ?? 0
-        let currentTotal = history.last?.total ?? baseTotal
-        let balanceChange = currentTotal - baseTotal
+        let partnerSharePercent = 40.0
+        let withdrawalAmount = effectiveWithdrawalAmount
+        let baseDeduction = effectiveBaseDeduction
+        let settlementBase = withdrawalAmount - baseDeduction
         let totalCost = cost
-        let netOutcome = balanceChange - totalCost
+        let netOutcome = settlementBase - totalCost
         let partnerSettlement: Double
         if netOutcome >= 0 {
             partnerSettlement = partnerCost + netOutcome * partnerSharePercent / 100
@@ -1902,20 +1892,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
 
         return SettlementCalculation(
-            baseTotal: baseTotal,
-            currentTotal: currentTotal,
-            balanceChange: balanceChange,
+            withdrawalAmount: withdrawalAmount,
+            baseDeduction: baseDeduction,
+            settlementBase: settlementBase,
             totalCost: totalCost,
             netOutcome: netOutcome,
             partnerSettlement: partnerSettlement,
-            ownerSettlement: balanceChange - partnerSettlement,
+            ownerSettlement: withdrawalAmount - partnerSettlement,
             partnerSharePercent: partnerSharePercent
         )
     }
 
     @objc private func settlementInputsChanged() {
-        settlement.partnerName = "B方（社会哥）"
-        settlement.partnerSharePercent = min(max(settlementNumber(from: partnerShareField, fallback: settlement.partnerSharePercent), 0), 100)
+        settlement.partnerName = "社会哥"
+        settlement.partnerSharePercent = 40
 
         saveState()
         updateSettlementOutput()
@@ -1926,32 +1916,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let calculation = settlementCalculation()
 
         animateMetricNumber(
-            "settlement.partnerTransfer",
-            field: labels.partnerTransfer,
+            "settlement.socialReceivable",
+            field: socialReceivableValue,
             value: calculation.partnerSettlement,
-            formatter: { value in value >= 0 ? String(format: "%.2f", value) : "-\(String(format: "%.2f", abs(value)))" }
+            formatter: { value in "\(value >= 0 ? "" : "-")\(String(format: "%.2f", abs(value))) 元" }
         )
-        labels.partnerTransfer.textColor = calculation.partnerSettlement >= 0 ? .systemOrange : .systemRed
+        socialReceivableValue.textColor = calculation.partnerSettlement >= 0 ? .systemOrange : .systemRed
         animateMetricNumber(
-            "settlement.ownerReceives",
-            field: labels.ownerReceives,
+            "settlement.xingReceivable",
+            field: xingReceivableValue,
             value: calculation.ownerSettlement,
-            formatter: { String(format: "%.2f", $0) }
+            formatter: { "\(String(format: "%.2f", $0)) 元" }
         )
-        labels.ownerReceives.textColor = calculation.ownerSettlement >= 0 ? .systemIndigo : .systemRed
+        xingReceivableValue.textColor = calculation.ownerSettlement >= 0 ? .systemIndigo : .systemRed
 
-        labels.balanceChange.stringValue = "当前余额 \(money(calculation.currentTotal)) - 基准余额 \(money(calculation.baseTotal)) = \(signedMoney(calculation.balanceChange))"
+        labels.balanceChange.stringValue = calculation.baseDeduction > 0
+            ? "本次提现 \(money(calculation.withdrawalAmount)) - 基准余额 \(money(calculation.baseDeduction)) = \(money(calculation.settlementBase))"
+            : "本次提现金额 = \(money(calculation.withdrawalAmount))"
 
         let netOutcomeLabel: String
         let settlementLine: String
         if calculation.netOutcome >= 0 {
-            netOutcomeLabel = "余额变化 \(money(calculation.balanceChange)) - 总出资 \(money(calculation.totalCost)) = \(money(calculation.netOutcome))"
-            settlementLine = "B方（社会哥）应收 = 出资 \(money(partnerCost)) + 净利润 \(money(calculation.netOutcome)) × \(money(calculation.partnerSharePercent))% = \(money(calculation.partnerSettlement))；A方（星星）应留 = \(money(calculation.ownerSettlement))"
+            netOutcomeLabel = "分成基数 \(money(calculation.settlementBase)) - 总出资 \(money(calculation.totalCost)) = \(money(calculation.netOutcome))"
+            settlementLine = "社会哥应收 = 出资 \(money(partnerCost)) + 净利润 \(money(calculation.netOutcome)) × \(money(calculation.partnerSharePercent))% = \(money(calculation.partnerSettlement))；星星应收 = \(money(calculation.ownerSettlement))"
         } else {
-            netOutcomeLabel = "余额变化 \(money(calculation.balanceChange)) - 总出资 \(money(calculation.totalCost)) = \(signedMoney(calculation.netOutcome))，双方各承担 \(money(abs(calculation.netOutcome) / 2))"
+            netOutcomeLabel = "分成基数 \(money(calculation.settlementBase)) - 总出资 \(money(calculation.totalCost)) = \(signedMoney(calculation.netOutcome))，双方各承担 \(money(abs(calculation.netOutcome) / 2))"
             settlementLine = calculation.partnerSettlement >= 0
-                ? "B方（社会哥）应收 = 出资 \(money(partnerCost)) - 应承担亏损 \(money(abs(calculation.netOutcome) / 2)) = \(money(calculation.partnerSettlement))；A方（星星）应留 = \(money(calculation.ownerSettlement))"
-                : "B方（社会哥）本次应补给 A方（星星）\(money(abs(calculation.partnerSettlement)))；A方（星星）无需向 B方（社会哥）转款"
+                ? "社会哥应收 = 出资 \(money(partnerCost)) - 应承担亏损 \(money(abs(calculation.netOutcome) / 2)) = \(money(calculation.partnerSettlement))；星星应收 = \(money(calculation.ownerSettlement))"
+                : "社会哥本次应补给星星 \(money(abs(calculation.partnerSettlement)))；星星无需向社会哥转款"
         }
         labels.netOutcome.stringValue = netOutcomeLabel
         labels.settlementLine.stringValue = settlementLine
@@ -1968,21 +1960,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         stack.alignment = .width
         stack.translatesAutoresizingMaskIntoConstraints = false
 
+        let title = NSTextField(labelWithString: "成本历史")
+        title.font = .systemFont(ofSize: 14, weight: .bold)
+        title.textColor = .secondaryLabelColor
+        let clearButton = button("一键清空", action: #selector(confirmClearCostHistory))
+        clearButton.controlSize = .regular
+        clearButton.font = .systemFont(ofSize: 12, weight: .semibold)
+        clearButton.toolTip = "清理成本历史表"
+
+        let header = NSStackView()
+        header.orientation = .horizontal
+        header.spacing = 8
+        header.alignment = .centerY
+        let headerSpacer = NSView()
+        headerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        header.addArrangedSubview(title)
+        header.addArrangedSubview(headerSpacer)
+        header.addArrangedSubview(clearButton)
+
         let scroll = makeTableScroll(
             table: historyTable,
             columns: [
                 ("序号", "index", 90),
                 ("时间", "time", 170),
                 ("余额合计", "total", 190),
-                ("较基准", "gross", 190),
+                ("扣成本后", "gross", 190),
                 ("净利润", "afterCost", 210)
             ]
         )
         scroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
         scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 390).isActive = true
 
+        stack.addArrangedSubview(header)
         stack.addArrangedSubview(scroll)
         NSLayoutConstraint.activate([
+            header.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
             scroll.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: stack.trailingAnchor)
         ])
@@ -1999,12 +2012,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func buildMetricRow() -> NSStackView {
         let metricRow = NSStackView(views: [
             metricCard(title: "成本合计", value: costValue, color: .systemBlue),
-            metricCard(title: "基准余额合计", value: baseValue, color: .systemPurple),
             metricCard(title: "现在余额合计", value: currentValue, color: .systemTeal),
             metricCard(title: "净利润", value: resultValue, color: .systemOrange),
-            metricCard(title: "回本进度", value: progressValue, color: .systemPink),
             metricCard(title: "回本状态", value: remainingValue, color: .systemRed),
-            metricCard(title: "当前收益", value: netValue, color: .systemGreen)
+            metricCard(title: "社会哥应收", value: socialReceivableValue, color: .systemOrange),
+            metricCard(title: "星星应收", value: xingReceivableValue, color: .systemIndigo)
         ])
         metricRow.orientation = .horizontal
         metricRow.spacing = 12
@@ -2097,9 +2109,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func inputsChanged() {
-        manualBaseTotal = manualBaseInputValue()
+        withdrawalAmount = moneyInputValue(withdrawalField)
+        baseDeductionAmount = moneyInputValue(baseDeductionField)
         saveState()
         updateSettlementOutput()
+        refreshOutput()
+    }
+
+    @objc private func toggleBaseDeduction() {
+        useBaseDeduction = useBaseDeductionButton.state == .on
+        baseDeductionField.isHidden = !useBaseDeduction
+        if useBaseDeduction {
+            baseDeductionAmount = moneyInputValue(baseDeductionField)
+        }
+        saveState()
         refreshOutput()
     }
 
@@ -2112,7 +2135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let newCost = ownerCost + increment
         costField.stringValue = money(newCost)
         addCostField.stringValue = ""
-        showFeedback("已累加 A方（星星）出资：\(signedMoney(increment)) 元，A方（星星）当前出资 \(money(newCost)) 元。", color: .systemGreen)
+        showFeedback("已累加星星出资：\(signedMoney(increment)) 元，星星当前出资 \(money(newCost)) 元。", color: .systemGreen)
         saveState()
         refreshOutput()
     }
@@ -2122,18 +2145,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func importLatest() {
-        guard initial != nil else {
-            showError("请先粘贴基准截图。")
-            return
-        }
         pasteFromClipboard(asInitial: false)
     }
 
     @objc private func resetAll() {
         initial = nil
         history = []
-        manualBaseTotal = nil
-        manualBaseField.stringValue = ""
+        withdrawalAmount = nil
+        baseDeductionAmount = nil
+        useBaseDeduction = false
+        withdrawalField.stringValue = ""
+        baseDeductionField.stringValue = ""
+        baseDeductionField.isHidden = true
+        useBaseDeductionButton.state = .off
         partnerCostField.stringValue = "0"
         settlement = .default
         UserDefaults.standard.removeObject(forKey: "StoredState")
@@ -2246,7 +2270,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func queryBalanceAsInitial() {
-        queryBalances(asInitial: true, manual: true)
+        queryBalances(asInitial: false, manual: true)
     }
 
     @objc private func queryBalanceAsLatest() {
@@ -2263,7 +2287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
         balanceQueryInProgress = true
-        showFeedback(asInitial ? "正在查询基准余额..." : "正在查询最新余额...", color: .white, autoHide: false)
+        showFeedback("正在查询最新余额...", color: .white, autoHide: false)
         fetchAllBalances { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -2286,18 +2310,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let amounts = items.map(\.balance)
         let accounts = items.map { $0.account.name }
         let snapshot = Snapshot(date: Date(), total: amounts.reduce(0, +), amounts: amounts, accounts: accounts)
-        if asInitial || initial == nil {
+        if initial == nil {
             initial = snapshot
-            manualBaseTotal = snapshot.total
-            manualBaseField.stringValue = money(snapshot.total)
-            history = [snapshot]
-            settlement.withdrawals = [:]
-            showFeedback("已查询为基准余额：\(money(snapshot.total))。", color: .systemGreen)
-        } else {
-            history.append(snapshot)
-            trimBalanceHistory()
-            showFeedback("已查询最新余额：\(money(snapshot.total))。", color: .systemGreen)
         }
+        history.append(snapshot)
+        trimBalanceHistory()
+        if withdrawalField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let roundedWithdrawal = roundedWithdrawalAmount(snapshot.total)
+            withdrawalAmount = roundedWithdrawal
+            withdrawalField.stringValue = money(roundedWithdrawal)
+        }
+        showFeedback("已查询最新余额：\(money(snapshot.total))。", color: .systemGreen)
         saveState()
         refreshOutput()
     }
@@ -2423,7 +2446,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func restartBalancePollingTimer() {
         balancePollingTimer?.invalidate()
         balancePollingTimer = Timer.scheduledTimer(withTimeInterval: defaultPollingMinutes * 60, repeats: true) { [weak self] _ in
-            guard let self, self.initial != nil else { return }
+            guard let self else { return }
             self.queryBalances(asInitial: false, manual: false)
         }
     }
@@ -2469,6 +2492,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         poolHistory.removeAll { $0.groupName == groupName }
         savePoolState()
         showFeedback("\(groupName) 已全部清除，移除 \(beforeCount) 条。", color: .systemGreen)
+        refreshOutput()
+    }
+
+    @objc private func confirmClearCostHistory() {
+        guard !history.isEmpty else {
+            showFeedback("成本历史暂无可清空的数据。", color: .systemOrange)
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "清空成本历史？"
+        alert.informativeText = "可以只保留最新一条成本历史，或清除下面表格的全部历史。出资、提现金额和账号配置不会被清空。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "清除到剩余最后一条")
+        alert.addButton(withTitle: "全部清除")
+        alert.addButton(withTitle: "取消")
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            trimCostHistoryToLatest()
+        case .alertSecondButtonReturn:
+            clearCostHistory()
+        default:
+            break
+        }
+    }
+
+    private func trimCostHistoryToLatest() {
+        guard let latest = history.last else { return }
+        let beforeCount = history.count
+        history = [latest]
+        saveState()
+        showFeedback("成本历史已清除到只剩最新 1 条，移除 \(max(beforeCount - 1, 0)) 条。", color: .systemGreen)
+        refreshOutput()
+    }
+
+    private func clearCostHistory() {
+        let beforeCount = history.count
+        history = []
+        saveState()
+        showFeedback("成本历史已全部清除，移除 \(beforeCount) 条。", color: .systemGreen)
         refreshOutput()
     }
 
@@ -3527,16 +3591,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         max(Double(partnerCostField.stringValue.replacingOccurrences(of: ",", with: "")) ?? 0, 0)
     }
 
-    private func manualBaseInputValue() -> Double? {
-        let raw = manualBaseField.stringValue
+    private func moneyInputValue(_ field: NSTextField) -> Double? {
+        let raw = field.stringValue
             .replacingOccurrences(of: ",", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty, let value = Double(raw), value >= 0 else { return nil }
         return value
     }
 
-    private var effectiveBaseTotal: Double? {
-        manualBaseInputValue() ?? manualBaseTotal ?? initial?.total
+    private var effectiveWithdrawalAmount: Double {
+        moneyInputValue(withdrawalField) ?? withdrawalAmount ?? history.last?.total ?? 0
+    }
+
+    private func roundedWithdrawalAmount(_ value: Double) -> Double {
+        floor(max(value, 0) / 100) * 100
+    }
+
+    private var effectiveBaseDeduction: Double {
+        guard useBaseDeduction else { return 0 }
+        return moneyInputValue(baseDeductionField) ?? baseDeductionAmount ?? 0
     }
 
     private var cost: Double {
@@ -3925,38 +3998,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func updateMetrics() {
         setMetric("cost", field: costValue, value: cost, suffix: " 元")
-        guard let baseTotal = effectiveBaseTotal else {
-            setMetric("base", field: baseValue, value: nil, suffix: " 元")
-            setMetric("current", field: currentValue, value: nil, suffix: " 元")
-            setMetric("net", field: netValue, value: nil, suffix: " 元")
-            setMetric("result", field: resultValue, value: nil, suffix: " 元")
-            setMetric("progress", field: progressValue, value: nil, suffix: "%")
-            setMetricText("remaining", field: remainingValue, text: "--")
-            return
-        }
-
-        setMetric("base", field: baseValue, value: baseTotal, suffix: " 元")
-        guard let latest = history.last else {
-            setMetric("current", field: currentValue, value: nil, suffix: " 元")
-            setMetric("net", field: netValue, value: nil, suffix: " 元")
-            setMetric("result", field: resultValue, value: nil, suffix: " 元")
-            setMetric("progress", field: progressValue, value: nil, suffix: "%")
-            setMetricText("remaining", field: remainingValue, text: "--")
-            return
-        }
-
-        let gross = latest.total - baseTotal
+        let withdrawal = effectiveWithdrawalAmount
+        let latestTotal = history.last?.total
+        let gross = withdrawal - effectiveBaseDeduction
         let totalCost = cost
         let currentProfit = gross - totalCost
-        let progress = totalCost > 0 ? gross / totalCost * 100 : 0
         let paybackDelta = currentProfit
 
-        setMetric("current", field: currentValue, value: latest.total, suffix: " 元")
+        setMetric("current", field: currentValue, value: latestTotal, suffix: " 元")
         setMetric("net", field: netValue, value: currentProfit, suffix: " 元")
         netValue.textColor = currentProfit >= 0 ? .systemGreen : .systemRed
         setMetric("result", field: resultValue, value: currentProfit, suffix: " 元")
         resultValue.textColor = currentProfit >= 0 ? .systemGreen : .systemRed
-        setMetric("progress", field: progressValue, value: progress, suffix: "%", decimals: 1)
         animateMetricNumber("remaining", field: remainingValue, value: paybackDelta) { "\(String(format: "%+.2f", $0)) 元" }
         remainingValue.textColor = paybackDelta >= 0 ? .systemGreen : .systemRed
     }
@@ -4121,9 +4174,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
 
         if tableView == historyTable {
-            guard let baseTotal = effectiveBaseTotal else { return container }
             let item = history[row]
-            let gross = item.total - baseTotal
+            let gross = item.total
             let afterCost = gross - cost
             switch identifier {
             case "index":
@@ -4165,61 +4217,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func buildReport() -> String {
         var lines: [String] = []
-        lines.append("总出资：A方（星星）\(money(ownerCost)) 元 + B方（社会哥）\(money(partnerCost)) 元 = \(money(cost)) 元")
+        lines.append("总出资：星星 \(money(ownerCost)) 元 + 社会哥 \(money(partnerCost)) 元 = \(money(cost)) 元")
         lines.append("")
 
-        guard let initial, let baseTotal = effectiveBaseTotal else {
-            lines.append("请先复制基准截图并按 Command+V。")
-            return lines.joined(separator: "\n")
-        }
-
-        lines.append("基准截图")
-        lines.append("  时间：\(formatDate(initial.date))")
-        lines.append("  基准余额合计：\(money(baseTotal)) 元")
-        lines.append("")
-
-        guard let latest = history.last else {
-            lines.append("请继续复制最新截图并按 Command+V。")
-            return lines.joined(separator: "\n")
-        }
-
-        let gross = latest.total - baseTotal
+        let withdrawal = effectiveWithdrawalAmount
+        let baseDeduction = effectiveBaseDeduction
+        let gross = withdrawal - baseDeduction
         let currentProfitAfterCost = gross - cost
         let remaining = currentProfitAfterCost
-        let progress = cost > 0 ? gross / cost * 100 : 0
-        lines.append("最新截图")
-        lines.append("  时间：\(formatDate(latest.date))")
-        lines.append("  现在余额合计：\(amountList(latest.amounts)) = \(money(latest.total)) 元")
-        lines.append("")
-        lines.append("各号余额对比")
-        lines.append(balanceTable(initial: initial.amounts, latest: latest.amounts))
+        lines.append("提现结算")
+        lines.append("  本次提现金额：\(money(withdrawal)) 元")
+        if baseDeduction > 0 {
+            lines.append("  扣基准余额：\(money(baseDeduction)) 元")
+            lines.append("  分成基数：\(money(gross)) 元")
+        }
         lines.append("")
         lines.append("当前结果")
         lines.append("  净利润：\(money(currentProfitAfterCost)) 元")
         lines.append("")
-        lines.append("回本状态")
-        lines.append("  回本进度：\(percent(progress))")
-        lines.append("  距离回本还差：\(money(remaining)) 元")
+        lines.append("回本状态：\(signedMoney(remaining)) 元")
 
         return lines.joined(separator: "\n")
     }
 
     private func buildHistoryReport() -> String {
-        guard let baseTotal = effectiveBaseTotal else {
-            return "请先复制基准截图并按 Command+V。"
-        }
         guard !history.isEmpty else {
             return "暂无历史记录。复制最新截图后按 Command+V，会自动追加到这里。"
         }
 
         var rows = [
             "┌──────┬──────────┬──────────────┬──────────────┬──────────────┬──────────────┐",
-            "│ 序号 │ 时间     │ 余额合计(元) │ 较基准(元)   │ 净利润       │",
+            "│ 序号 │ 时间     │ 余额合计(元) │ 扣成本后     │ 净利润       │",
             "├──────┼──────────┼──────────────┼──────────────┼──────────────┤"
         ]
 
         for (index, item) in history.enumerated() {
-            let gross = item.total - baseTotal
+            let gross = item.total
             let afterCost = gross - cost
             rows.append(String(format: "│ %4d │ %-8@ │ %12.2f │ %+12.2f │ %+12.2f │",
                                index + 1,
@@ -4230,23 +4263,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
 
         rows.append("└──────┴──────────┴──────────────┴──────────────┴──────────────┘")
-        return rows.joined(separator: "\n")
-    }
-
-    private func balanceTable(initial: [Double], latest: [Double]) -> String {
-        var rows = [
-            "  ┌──────┬──────────────┬──────────────┬──────────────┐",
-            "  │ 账号 │ 基准余额(元) │ 当前余额(元) │ 变化金额(元) │",
-            "  ├──────┼──────────────┼──────────────┼──────────────┤"
-        ]
-        let count = max(initial.count, latest.count)
-        for index in 0..<count {
-            let start = index < initial.count ? initial[index] : 0
-            let end = index < latest.count ? latest[index] : 0
-            let delta = end - start
-            rows.append(String(format: "  │ %4d │ %12.2f │ %12.2f │ %+12.2f │", index + 1, start, end, delta))
-        }
-        rows.append("  └──────┴──────────────┴──────────────┴──────────────┘")
         return rows.joined(separator: "\n")
     }
 
@@ -4313,7 +4329,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let state = StoredState(
             cost: ownerCost,
             partnerCost: partnerCost,
-            manualBaseTotal: manualBaseInputValue() ?? manualBaseTotal,
+            manualBaseTotal: nil,
+            withdrawalAmount: moneyInputValue(withdrawalField) ?? withdrawalAmount,
+            useBaseDeduction: useBaseDeduction,
+            baseDeductionAmount: moneyInputValue(baseDeductionField) ?? baseDeductionAmount,
             initial: initial,
             history: history,
             settlement: settlement
@@ -4345,8 +4364,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         costField.stringValue = money(state.cost)
         partnerCostField.stringValue = money(state.partnerCost ?? 0)
-        manualBaseTotal = state.manualBaseTotal
-        manualBaseField.stringValue = state.manualBaseTotal.map { money($0) } ?? ""
+        withdrawalAmount = state.withdrawalAmount
+        useBaseDeduction = state.useBaseDeduction ?? false
+        baseDeductionAmount = state.baseDeductionAmount ?? state.manualBaseTotal
+        withdrawalField.stringValue = state.withdrawalAmount.map { money($0) } ?? ""
+        baseDeductionField.stringValue = baseDeductionAmount.map { money($0) } ?? ""
+        baseDeductionField.isHidden = !useBaseDeduction
+        useBaseDeductionButton.state = useBaseDeduction ? .on : .off
         initial = state.initial
         history = state.history
         settlement = state.settlement ?? .default
