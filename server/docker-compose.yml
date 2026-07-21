@@ -11,3 +11,10 @@ services:
       - ./data:/data
     ports:
       - "127.0.0.1:8095:8095"
+    networks:
+      - default
+      - note_default
+
+networks:
+  note_default:
+    external: true

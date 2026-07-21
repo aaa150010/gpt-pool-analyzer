@@ -125,6 +125,12 @@ def get_setting(key: str, default: Any) -> Any:
         return loads(row["value"], default) if row else default
 
 
+def update_stored_cost(delta: float) -> None:
+    stored = get_setting("stored_state", {})
+    stored["cost"] = max(flexible_number(stored.get("cost")) + delta, 0)
+    set_setting("stored_state", stored)
+
+
 def flexible_number(value: Any, default: float = 0) -> float:
     if value is None:
         return default
@@ -210,6 +216,14 @@ def insert_cost_addition(item: dict[str, Any]) -> None:
                 item.get("createdAt") or item.get("created_at") or utc_now(),
             ),
         )
+
+
+def clear_cost_additions() -> float:
+    with connect() as conn:
+        row = conn.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM cost_additions").fetchone()
+        total = flexible_number(row["total"] if row else 0)
+        conn.execute("DELETE FROM cost_additions")
+    return total
 
 
 def balance_history() -> list[dict[str, Any]]:
@@ -470,4 +484,22 @@ async def refresh() -> dict[str, Any]:
     if not initialized():
         raise HTTPException(status_code=409, detail="Not initialized")
     await poll_once()
+    return {"ok": True, "state": current_state()}
+
+
+@app.post(f"{API_PREFIX}/cost-additions")
+async def add_cost_addition(payload: dict[str, Any]) -> dict[str, Any]:
+    if not initialized():
+        raise HTTPException(status_code=409, detail="Not initialized")
+    insert_cost_addition(payload)
+    update_stored_cost(flexible_number(payload.get("amount")))
+    return {"ok": True, "state": current_state()}
+
+
+@app.delete(f"{API_PREFIX}/cost-additions")
+async def delete_cost_additions() -> dict[str, Any]:
+    if not initialized():
+        raise HTTPException(status_code=409, detail="Not initialized")
+    total = clear_cost_additions()
+    update_stored_cost(-total)
     return {"ok": True, "state": current_state()}

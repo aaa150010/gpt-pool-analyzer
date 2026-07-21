@@ -2254,6 +2254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         showFeedback("已累加星星出资：\(signedMoney(increment)) 元\(noteText)，星星当前出资 \(money(newCost)) 元。", color: .systemGreen)
         saveState()
         refreshOutput()
+        syncCostAdditionToServer(addition)
     }
 
     @objc private func showCostAdditionHistory() {
@@ -2320,6 +2321,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         saveState()
         refreshOutput()
         showFeedback("已清空 \(removedCount) 条累加成本，星星当前出资 \(money(newCost)) 元。", color: .systemGreen)
+        clearServerCostAdditions()
     }
 
     @objc private func importInitial() {
@@ -4660,6 +4662,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 UserDefaults.standard.set(true, forKey: "ServerInitialized")
                 self.showFeedback("服务器初始化完成，上传按钮已隐藏。", color: .systemGreen)
                 self.fetchServerState(manual: false)
+            }
+        }.resume()
+    }
+
+    private func syncCostAdditionToServer(_ addition: CostAddition) {
+        guard serverInitialized else { return }
+        guard let url = URL(string: "\(analyzerServerBaseURL)/cost-additions") else { return }
+        guard let body = try? serverEncoder().encode(addition) else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let error {
+                    self.showFeedback("累加成本已保存在本机；服务器同步失败：\(error.localizedDescription)", color: .systemOrange, autoHide: false)
+                    return
+                }
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard (200..<300).contains(statusCode), let data else {
+                    self.showFeedback("累加成本已保存在本机；服务器同步失败：HTTP \(statusCode)", color: .systemOrange, autoHide: false)
+                    return
+                }
+                if let decoded = try? self.serverDecoder().decode(ServerRefreshResponse.self, from: data),
+                   let state = decoded.state {
+                    self.applyServerState(state, manual: false)
+                }
+            }
+        }.resume()
+    }
+
+    private func clearServerCostAdditions() {
+        guard serverInitialized else { return }
+        guard let url = URL(string: "\(analyzerServerBaseURL)/cost-additions") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let error {
+                    self.showFeedback("累加成本已在本机清空；服务器同步失败：\(error.localizedDescription)", color: .systemOrange, autoHide: false)
+                    return
+                }
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard (200..<300).contains(statusCode), let data else {
+                    self.showFeedback("累加成本已在本机清空；服务器同步失败：HTTP \(statusCode)", color: .systemOrange, autoHide: false)
+                    return
+                }
+                if let decoded = try? self.serverDecoder().decode(ServerRefreshResponse.self, from: data),
+                   let state = decoded.state {
+                    self.applyServerState(state, manual: false)
+                }
             }
         }.resume()
     }
