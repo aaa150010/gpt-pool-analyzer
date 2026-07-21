@@ -1,0 +1,13 @@
+services:
+  gpt-analyzer:
+    build: .
+    container_name: gpt-analyzer-server
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+      POLL_INTERVAL_SECONDS: "300"
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:8095:8095"

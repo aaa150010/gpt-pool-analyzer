@@ -7,6 +7,7 @@ private let maxBalanceHistoryCount = 1000
 private let maxPoolHistoryPerGroup = 1000
 private let defaultPollingMinutes: Double = 5
 private let defaultBalanceBaseURL = "https://api.ai-pixel.online"
+private let analyzerServerBaseURL = "https://lynote.xyz/gpt-api"
 
 private func drawTimeAxis(in rect: NSRect, minDate: Date, maxDate: Date, tickCount: Int = 5) {
     let formatter = DateFormatter()
@@ -64,6 +65,7 @@ struct StoredState: Codable {
     var baseDeductionAmount: Double?
     var initial: Snapshot?
     var history: [Snapshot]
+    var costAdditions: [CostAddition]?
     var settlement: SettlementState?
 }
 
@@ -79,6 +81,14 @@ struct SettlementState: Codable {
         payoutRatePercent: 85,
         withdrawals: [:]
     )
+}
+
+struct CostAddition: Codable {
+    var id: String
+    var date: Date
+    var note: String
+    var amount: Double
+    var createdAt: Date
 }
 
 struct PoolSnapshot: Codable {
@@ -238,6 +248,26 @@ struct BalanceQueryItem {
     var account: BalanceAccount
     var balance: Double
     var unit: String
+}
+
+struct ServerBootstrapPayload: Codable {
+    var storedState: StoredState
+    var poolState: PoolAnalyzerState
+    var balanceAccounts: [BalanceAccount]
+    var poolCredentials: PoolCredentials?
+    var smtpSettings: SMTPSettings
+}
+
+struct ServerStateResponse: Codable {
+    var initialized: Bool
+    var storedState: StoredState?
+    var poolState: PoolAnalyzerState?
+    var balanceAccounts: [BalanceAccount]?
+}
+
+struct ServerRefreshResponse: Codable {
+    var ok: Bool
+    var state: ServerStateResponse?
 }
 
 enum PoolTrendMetric: Int, CaseIterable {
@@ -661,8 +691,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let withdrawalField = NSTextField(string: "")
     private let useBaseDeductionButton = NSButton(checkboxWithTitle: "扣基准余额", target: nil, action: nil)
     private let baseDeductionField = NSTextField(string: "")
-    private let addCostField = NSTextField(string: "")
     private let statusLabel = NSTextField(labelWithString: "")
+    private let serverSyncButton = NSButton(title: "上传服务器", target: nil, action: nil)
     private var metricAnimations: [String: Timer] = [:]
     private var displayedMetricValues: [String: Double] = [:]
     private var poolAnimations: [String: Timer] = [:]
@@ -709,9 +739,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var useBaseDeduction = false
     private var baseDeductionAmount: Double?
     private var history: [Snapshot] = []
+    private var costAdditions: [CostAddition] = []
     private var poolHistory: [PoolSnapshot] = []
     private var selectedPoolGroups: [String] = ["PLUS共享号池", "K12共享号池"]
     private var availablePoolGroups: [String] = ["PLUS共享号池", "K12共享号池"]
+    private var hasLocalPoolSelection = false
     private var poolAccessToken: String?
     private var poolRefreshToken: String?
     private var poolRefreshInProgress = false
@@ -723,17 +755,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var balanceAccounts: [BalanceAccount] = []
     private var balancePollingTimer: Timer?
     private var balanceQueryInProgress = false
+    private var serverSyncInProgress = false
+    private var serverInitialized = false {
+        didSet {
+            serverSyncButton.isHidden = serverInitialized
+        }
+    }
     private var settlement = SettlementState.default
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard !activateExistingInstanceIfNeeded() else { return }
         buildMenu()
         buildWindow()
         loadState()
         loadPoolState()
         balanceAccounts = loadBalanceAccounts()
+        if UserDefaults.standard.bool(forKey: "ServerInitialized") {
+            serverInitialized = true
+        } else {
+            serverSyncButton.isHidden = true
+        }
         refreshOutput()
         restartPoolPollingTimer()
         restartBalancePollingTimer()
+        fetchServerState(manual: false)
+    }
+
+    private func activateExistingInstanceIfNeeded() -> Bool {
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return false }
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        let existing = NSRunningApplication
+            .runningApplications(withBundleIdentifier: bundleIdentifier)
+            .first { $0.processIdentifier != currentPID && !$0.isTerminated }
+        guard let existing else { return false }
+        existing.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        NSApp.terminate(nil)
+        return true
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -765,15 +822,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         useBaseDeductionButton.target = self
         useBaseDeductionButton.action = #selector(toggleBaseDeduction)
         useBaseDeductionButton.state = .off
-        configureField(addCostField, placeholder: "0")
-        addCostField.target = self
-        addCostField.action = #selector(addCost)
 
         let initialButton = button("账号配置", action: #selector(editBalanceAccounts))
         let queryLatestButton = button("查询最新余额", action: #selector(queryBalanceAsLatest))
         let resetButton = button("一键重置", action: #selector(resetAll))
         let addCostButton = button("累加成本", action: #selector(addCost))
-        let buttonRow = NSStackView(views: [initialButton, queryLatestButton, resetButton])
+        let costAdditionHistoryButton = button("累加历史", action: #selector(showCostAdditionHistory))
+        serverSyncButton.target = self
+        serverSyncButton.action = #selector(uploadInitialStateToServer)
+        serverSyncButton.bezelStyle = .rounded
+        serverSyncButton.controlSize = .large
+        serverSyncButton.font = .systemFont(ofSize: 13, weight: .semibold)
+        serverSyncButton.isHidden = true
+        serverSyncButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
+        let buttonRow = NSStackView(views: [initialButton, queryLatestButton, resetButton, serverSyncButton])
         buttonRow.orientation = .horizontal
         buttonRow.spacing = 10
         buttonRow.alignment = .centerY
@@ -789,7 +851,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         root.alignment = .width
         root.translatesAutoresizingMaskIntoConstraints = false
 
-        let costTopPanel = buildTopPanel(buttonRow: buttonRow, addCostButton: addCostButton)
+        let costTopPanel = buildTopPanel(
+            buttonRow: buttonRow,
+            addCostButton: addCostButton,
+            costAdditionHistoryButton: costAdditionHistoryButton
+        )
         topPanel = costTopPanel
         let tabBar = buildTabBar()
         let feedback = buildFeedbackBar()
@@ -938,7 +1004,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         return button
     }
 
-    private func buildTopPanel(buttonRow: NSStackView, addCostButton: NSButton) -> NSView {
+    private func buildTopPanel(
+        buttonRow: NSStackView,
+        addCostButton: NSButton,
+        costAdditionHistoryButton: NSButton
+    ) -> NSView {
         let panel = NSView()
         panel.translatesAutoresizingMaskIntoConstraints = false
 
@@ -962,9 +1032,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         inputRow.addArrangedSubview(withdrawalField)
         inputRow.addArrangedSubview(useBaseDeductionButton)
         inputRow.addArrangedSubview(baseDeductionField)
-        inputRow.addArrangedSubview(label("追加成本"))
-        inputRow.addArrangedSubview(addCostField)
         inputRow.addArrangedSubview(addCostButton)
+        inputRow.addArrangedSubview(costAdditionHistoryButton)
         let actionRow = NSStackView()
         actionRow.orientation = .horizontal
         actionRow.spacing = 8
@@ -1133,9 +1202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             nextView.topAnchor.constraint(equalTo: contentHost.topAnchor),
             nextView.bottomAnchor.constraint(equalTo: contentHost.bottomAnchor)
         ])
-        if tabControl.selectedSegment == 1 {
-            scrollToLatestRows()
-        }
+        scrollToLatestRows()
     }
 
     private func buildPoolPanel() -> NSView {
@@ -1626,33 +1693,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             settlementLine: settlementLineFormula
         )
 
-        let leftColumn = NSStackView()
-        leftColumn.orientation = .vertical
-        leftColumn.spacing = 14
-        leftColumn.alignment = .width
-        leftColumn.translatesAutoresizingMaskIntoConstraints = false
-        leftColumn.addArrangedSubview(settingsRow)
-        leftColumn.addArrangedSubview(formulaGrid)
-
-        let contentRow = NSStackView()
-        contentRow.orientation = .horizontal
-        contentRow.spacing = 22
-        contentRow.alignment = .centerY
-        contentRow.translatesAutoresizingMaskIntoConstraints = false
-        contentRow.addArrangedSubview(leftColumn)
-        leftColumn.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        leftColumn.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
-
         panel.addSubview(titleRow)
-        panel.addSubview(contentRow)
+        panel.addSubview(settingsRow)
+        panel.addSubview(formulaGrid)
         NSLayoutConstraint.activate([
             titleRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 32),
             titleRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -32),
             titleRow.topAnchor.constraint(equalTo: panel.topAnchor, constant: 18),
-            contentRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 32),
-            contentRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -32),
-            contentRow.topAnchor.constraint(equalTo: titleRow.bottomAnchor, constant: 10),
-            contentRow.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -18)
+            settingsRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 32),
+            settingsRow.trailingAnchor.constraint(lessThanOrEqualTo: panel.trailingAnchor, constant: -32),
+            settingsRow.topAnchor.constraint(equalTo: titleRow.bottomAnchor, constant: 14),
+            formulaGrid.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 32),
+            formulaGrid.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -32),
+            formulaGrid.topAnchor.constraint(equalTo: settingsRow.bottomAnchor, constant: 16),
+            formulaGrid.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -18)
         ])
 
         settlementLabels = (balanceChangeFormula, netOutcomeFormula, settlementLineFormula)
@@ -1661,11 +1715,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func settlementFormulaValue(isResult: Bool = false) -> NSTextField {
-        let value = NSTextField(wrappingLabelWithString: "")
+        let value = NSTextField(labelWithString: "")
         value.font = isResult ? .systemFont(ofSize: 13, weight: .bold) : .monospacedSystemFont(ofSize: 13, weight: .medium)
-        value.textColor = isResult ? .labelColor : .secondaryLabelColor
-        value.maximumNumberOfLines = 2
-        value.lineBreakMode = .byWordWrapping
+        value.textColor = .labelColor
+        value.maximumNumberOfLines = 1
+        value.lineBreakMode = .byClipping
         value.alignment = .left
         value.translatesAutoresizingMaskIntoConstraints = false
         value.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -1680,35 +1734,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let balanceTitle = settlementFormulaTitle("本次提现")
         let netTitle = settlementFormulaTitle("当前提现利润")
         let settlementTitle = settlementFormulaTitle("结算结果")
-        let divider = settlementDivider()
 
-        for view in [balanceTitle, netTitle, divider, settlementTitle, balanceChange, netOutcome, settlementLine] {
+        for view in [balanceTitle, netTitle, settlementTitle, balanceChange, netOutcome, settlementLine] {
             grid.addSubview(view)
         }
 
-        let formulaLeading: CGFloat = 150
+        let formulaLeading: CGFloat = 132
         NSLayoutConstraint.activate([
             balanceTitle.leadingAnchor.constraint(equalTo: grid.leadingAnchor),
             balanceTitle.topAnchor.constraint(equalTo: grid.topAnchor),
-            balanceTitle.widthAnchor.constraint(equalToConstant: 120),
+            balanceTitle.widthAnchor.constraint(equalToConstant: 110),
             balanceChange.leadingAnchor.constraint(equalTo: grid.leadingAnchor, constant: formulaLeading),
             balanceChange.trailingAnchor.constraint(equalTo: grid.trailingAnchor),
             balanceChange.firstBaselineAnchor.constraint(equalTo: balanceTitle.firstBaselineAnchor),
 
             netTitle.leadingAnchor.constraint(equalTo: grid.leadingAnchor),
-            netTitle.topAnchor.constraint(equalTo: balanceTitle.bottomAnchor, constant: 10),
-            netTitle.widthAnchor.constraint(equalToConstant: 120),
+            netTitle.topAnchor.constraint(equalTo: balanceTitle.bottomAnchor, constant: 14),
+            netTitle.widthAnchor.constraint(equalToConstant: 110),
             netOutcome.leadingAnchor.constraint(equalTo: grid.leadingAnchor, constant: formulaLeading),
             netOutcome.trailingAnchor.constraint(equalTo: grid.trailingAnchor),
             netOutcome.firstBaselineAnchor.constraint(equalTo: netTitle.firstBaselineAnchor),
 
-            divider.leadingAnchor.constraint(equalTo: grid.leadingAnchor),
-            divider.trailingAnchor.constraint(equalTo: grid.trailingAnchor),
-            divider.topAnchor.constraint(equalTo: netTitle.bottomAnchor, constant: 10),
-
             settlementTitle.leadingAnchor.constraint(equalTo: grid.leadingAnchor),
-            settlementTitle.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 10),
-            settlementTitle.widthAnchor.constraint(equalToConstant: 120),
+            settlementTitle.topAnchor.constraint(equalTo: netTitle.bottomAnchor, constant: 14),
+            settlementTitle.widthAnchor.constraint(equalToConstant: 110),
             settlementLine.leadingAnchor.constraint(equalTo: grid.leadingAnchor, constant: formulaLeading),
             settlementLine.trailingAnchor.constraint(equalTo: grid.trailingAnchor),
             settlementLine.firstBaselineAnchor.constraint(equalTo: settlementTitle.firstBaselineAnchor),
@@ -2127,17 +2176,150 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func addCost() {
-        let increment = Double(addCostField.stringValue.replacingOccurrences(of: ",", with: "")) ?? 0
+        let alert = NSAlert()
+        alert.messageText = "累加成本"
+        alert.informativeText = "填写日期、备注和金额，确认后会追加到星星出资。"
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "取消")
+
+        let datePicker = NSDatePicker()
+        datePicker.datePickerStyle = .textFieldAndStepper
+        datePicker.datePickerElements = [.yearMonthDay]
+        datePicker.dateValue = Date()
+        datePicker.translatesAutoresizingMaskIntoConstraints = false
+        datePicker.widthAnchor.constraint(equalToConstant: 220).isActive = true
+
+        let noteField = NSTextField(string: "")
+        noteField.placeholderString = "备注"
+        noteField.translatesAutoresizingMaskIntoConstraints = false
+        noteField.widthAnchor.constraint(equalToConstant: 220).isActive = true
+
+        let amountField = NSTextField(string: "")
+        amountField.placeholderString = "金额"
+        amountField.alignment = .right
+        amountField.translatesAutoresizingMaskIntoConstraints = false
+        amountField.widthAnchor.constraint(equalToConstant: 220).isActive = true
+
+        let rows: [(String, NSView)] = [
+            ("日期", datePicker),
+            ("备注", noteField),
+            ("金额", amountField)
+        ]
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.spacing = 8
+        stack.alignment = .leading
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        for row in rows {
+            let line = NSStackView()
+            line.orientation = .horizontal
+            line.spacing = 10
+            line.alignment = .centerY
+            let title = label(row.0)
+            title.widthAnchor.constraint(equalToConstant: 42).isActive = true
+            line.addArrangedSubview(title)
+            line.addArrangedSubview(row.1)
+            stack.addArrangedSubview(line)
+        }
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 112))
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -8)
+        ])
+        alert.accessoryView = container
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let increment = moneyInputValue(amountField) ?? 0
         guard increment != 0 else {
             showFeedback("请输入要累加的成本金额。", color: .systemOrange)
             return
         }
+        let note = noteField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let addition = CostAddition(
+            id: UUID().uuidString,
+            date: datePicker.dateValue,
+            note: note,
+            amount: increment,
+            createdAt: Date()
+        )
+        costAdditions.append(addition)
+        costAdditions.sort { $0.date < $1.date }
         let newCost = ownerCost + increment
         costField.stringValue = money(newCost)
-        addCostField.stringValue = ""
-        showFeedback("已累加星星出资：\(signedMoney(increment)) 元，星星当前出资 \(money(newCost)) 元。", color: .systemGreen)
+        let noteText = note.isEmpty ? "" : "（\(note)）"
+        showFeedback("已累加星星出资：\(signedMoney(increment)) 元\(noteText)，星星当前出资 \(money(newCost)) 元。", color: .systemGreen)
         saveState()
         refreshOutput()
+    }
+
+    @objc private func showCostAdditionHistory() {
+        guard !costAdditions.isEmpty else {
+            showFeedback("暂无累加成本历史。", color: .systemOrange)
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "累加成本历史"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "关闭")
+        alert.addButton(withTitle: "一键清空")
+
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 640, height: 220))
+        textView.string = costAdditionHistoryText()
+        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 660, height: 240))
+        scroll.documentView = textView
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.borderType = .lineBorder
+        alert.accessoryView = scroll
+
+        if alert.runModal() == .alertSecondButtonReturn {
+            confirmClearCostAdditions()
+        }
+    }
+
+    private func costAdditionHistoryText() -> String {
+        let rows = costAdditions.sorted { $0.date < $1.date }
+        var lines = [
+            "│ 序号 │ 日期                │ 金额         │ 备注 │",
+            "├──────┼─────────────────────┼──────────────┼──────┤"
+        ]
+        for (index, item) in rows.enumerated() {
+            let note = item.note.isEmpty ? "-" : item.note
+            lines.append("│ \(index + 1) │ \(formatDate(item.date)) │ \(signedMoney(item.amount)) │ \(note) │")
+        }
+        lines.append("")
+        lines.append("合计：\(signedMoney(rows.reduce(0) { $0 + $1.amount })) 元")
+        return lines.joined(separator: "\n")
+    }
+
+    private func confirmClearCostAdditions() {
+        guard !costAdditions.isEmpty else { return }
+        let alert = NSAlert()
+        alert.messageText = "清空累加成本？"
+        alert.informativeText = "会删除全部累加成本历史，并从星星出资里扣回这些追加金额。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "确认清空")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let total = costAdditions.reduce(0) { $0 + $1.amount }
+        let newCost = max(ownerCost - total, 0)
+        let removedCount = costAdditions.count
+        costAdditions = []
+        costField.stringValue = money(newCost)
+        saveState()
+        refreshOutput()
+        showFeedback("已清空 \(removedCount) 条累加成本，星星当前出资 \(money(newCost)) 元。", color: .systemGreen)
     }
 
     @objc private func importInitial() {
@@ -2159,6 +2341,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         baseDeductionField.isHidden = true
         useBaseDeductionButton.state = .off
         partnerCostField.stringValue = "0"
+        costAdditions = []
         settlement = .default
         UserDefaults.standard.removeObject(forKey: "StoredState")
         showFeedback("成本计算数据已重置。", color: .systemGreen)
@@ -2278,32 +2461,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func queryBalances(asInitial: Bool, manual: Bool) {
-        guard !balanceAccounts.isEmpty else {
-            if manual { editBalanceAccounts() }
-            return
-        }
-        guard !balanceQueryInProgress else {
-            if manual { showFeedback("正在查询余额，请稍等。", color: .systemOrange) }
-            return
-        }
-        balanceQueryInProgress = true
-        showFeedback("正在查询最新余额...", color: .white, autoHide: false)
-        fetchAllBalances { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.balanceQueryInProgress = false
-                switch result {
-                case .success(let items):
-                    self.applyBalanceItems(items, asInitial: asInitial)
-                case .failure(let error):
-                    if manual {
-                        self.showError(error.localizedDescription)
-                    } else {
-                        self.showFeedback("自动余额查询失败：\(error.localizedDescription)", color: .systemOrange)
-                    }
-                }
-            }
-        }
+        refreshServerData(manual: manual)
     }
 
     private func applyBalanceItems(_ items: [BalanceQueryItem], asInitial: Bool) {
@@ -2585,22 +2743,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func selectPoolGroups() {
-        poolGroupsButton.isEnabled = false
-        showFeedback("正在读取平台共享容量池分组...", color: .white, autoHide: false)
-        fetchQuotaDashboard(retryAfterLogin: true) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.poolGroupsButton.isEnabled = true
-                switch result {
-                case .success(let summaries):
-                    let groups = summaries.map(\.groupName).filter { !$0.isEmpty }
-                    self.availablePoolGroups = groups.isEmpty ? self.availablePoolGroups : groups
-                    self.presentPoolGroupPicker()
-                case .failure(let error):
-                    self.showError(error.localizedDescription)
-                }
-            }
-        }
+        fetchServerState(manual: false)
+        presentPoolGroupPicker()
     }
 
     @objc private func editPoolCredentials() {
@@ -2620,35 +2764,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func refreshPoolsFromAPI(isAutomatic: Bool) {
-        let groups = selectedPoolGroups
-        guard !groups.isEmpty else {
-            showError("请至少填写一个要同步的分组名称。")
-            return
-        }
-        savePoolState()
-        guard !poolRefreshInProgress else {
-            if !isAutomatic {
-                showFeedback("正在刷新账号池，请稍等。", color: .systemOrange)
-            }
-            return
-        }
-        poolRefreshInProgress = true
-        poolRefreshButton.isEnabled = false
-        showFeedback(isAutomatic ? "正在自动同步平台共享容量池..." : "正在同步平台共享容量池...", color: .white, autoHide: false)
-
-        fetchQuotaDashboard(retryAfterLogin: true) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.poolRefreshInProgress = false
-                self.poolRefreshButton.isEnabled = true
-                switch result {
-                case .success(let summaries):
-                    self.applyDashboardSummaries(summaries, selectedGroups: groups)
-                case .failure(let error):
-                    self.showError(error.localizedDescription)
-                }
-            }
-        }
+        refreshServerData(manual: !isAutomatic)
     }
 
     private func restartPoolPollingTimer() {
@@ -2708,8 +2824,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
         selectedPoolGroups = selected
+        hasLocalPoolSelection = true
         savePoolState()
         updatePoolGroupsLabel()
+        if tabControl.selectedSegment == 1 {
+            switchTab(nil)
+            refreshOutput()
+        } else {
+            refreshOutput()
+        }
         showFeedback("已选择：\(selected.joined(separator: "、"))", color: .systemGreen)
     }
 
@@ -3635,15 +3758,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func scrollToLatestRows() {
-        DispatchQueue.main.async { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
             guard let self else { return }
-            let tables = [self.historyTable, self.plusPoolHistoryTable, self.k12PoolHistoryTable] + Array(self.poolHistoryTables.keys)
+            let tables = [self.comparisonTable, self.historyTable, self.plusPoolHistoryTable, self.k12PoolHistoryTable] + Array(self.poolHistoryTables.keys)
             for table in tables {
-                let lastRow = table.numberOfRows - 1
-                if lastRow >= 0 {
-                    table.scrollRowToVisible(lastRow)
-                }
+                self.smoothScrollToLastRow(table)
             }
+        }
+    }
+
+    private func smoothScrollToLastRow(_ table: NSTableView) {
+        let lastRow = table.numberOfRows - 1
+        guard lastRow >= 0 else { return }
+        table.layoutSubtreeIfNeeded()
+        guard let scrollView = table.enclosingScrollView else {
+            table.scrollRowToVisible(lastRow)
+            return
+        }
+        let clipView = scrollView.contentView
+        let rowRect = table.rect(ofRow: lastRow)
+        let maxY = max(table.bounds.height - clipView.bounds.height, 0)
+        let targetY = min(max(rowRect.maxY - clipView.bounds.height + 6, 0), maxY)
+        var targetOrigin = clipView.bounds.origin
+        targetOrigin.y = targetY
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.28
+            context.allowsImplicitAnimation = true
+            clipView.animator().setBoundsOrigin(targetOrigin)
+        } completionHandler: {
+            scrollView.reflectScrolledClipView(clipView)
         }
     }
 
@@ -4326,8 +4469,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         alert.runModal()
     }
 
-    private func saveState() {
-        let state = StoredState(
+    private func serverEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
+    }
+
+    private func serverDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }
+
+    private func currentStoredState() -> StoredState {
+        StoredState(
             cost: ownerCost,
             partnerCost: partnerCost,
             manualBaseTotal: nil,
@@ -4336,15 +4491,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             baseDeductionAmount: moneyInputValue(baseDeductionField) ?? baseDeductionAmount,
             initial: initial,
             history: history,
+            costAdditions: costAdditions,
             settlement: settlement
         )
-        if let data = try? JSONEncoder().encode(state) {
-            UserDefaults.standard.set(data, forKey: "StoredState")
-        }
     }
 
-    private func savePoolState() {
-        let state = PoolAnalyzerState(
+    private func currentPoolState() -> PoolAnalyzerState {
+        PoolAnalyzerState(
             history: poolHistory,
             selectedGroups: selectedPoolGroups,
             availableGroups: availablePoolGroups,
@@ -4353,6 +4506,173 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             accessToken: poolAccessToken,
             refreshToken: poolRefreshToken
         )
+    }
+
+    private func applyServerState(_ response: ServerStateResponse, manual: Bool) {
+        serverInitialized = response.initialized
+        UserDefaults.standard.set(response.initialized, forKey: "ServerInitialized")
+        if let state = response.storedState {
+            costField.stringValue = money(state.cost)
+            partnerCostField.stringValue = money(state.partnerCost ?? 0)
+            withdrawalAmount = state.withdrawalAmount
+            useBaseDeduction = state.useBaseDeduction ?? false
+            baseDeductionAmount = state.baseDeductionAmount ?? state.manualBaseTotal
+            withdrawalField.stringValue = state.withdrawalAmount.map { money($0) } ?? ""
+            baseDeductionField.stringValue = baseDeductionAmount.map { money($0) } ?? ""
+            baseDeductionField.isHidden = !useBaseDeduction
+            useBaseDeductionButton.state = useBaseDeduction ? .on : .off
+            initial = state.initial
+            history = state.history
+            costAdditions = state.costAdditions ?? []
+            settlement = state.settlement ?? .default
+            saveState()
+        }
+        if let state = response.poolState {
+            poolHistory = state.history
+            if !hasLocalPoolSelection {
+                selectedPoolGroups = state.selectedGroups ?? selectedPoolGroups
+            }
+            availablePoolGroups = state.availableGroups ?? availablePoolGroups
+            poolPollingMinutes = normalizedPollingMinutes(state.pollingMinutes ?? poolPollingMinutes)
+            poolPollingField.stringValue = money(poolPollingMinutes)
+            updatePoolGroupsLabel()
+            savePoolState()
+        }
+        refreshOutput()
+        if manual {
+            showFeedback(response.initialized ? "已从服务器同步最新数据。" : "服务器还未初始化，请先上传服务器。", color: .systemGreen)
+        }
+    }
+
+    private func fetchServerState(manual: Bool = false) {
+        guard let url = URL(string: "\(analyzerServerBaseURL)/state") else { return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let error {
+                    if manual { self.showError("服务器状态读取失败：\(error.localizedDescription)") }
+                    return
+                }
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard (200..<300).contains(statusCode), let data else {
+                    if manual { self.showError("服务器状态读取失败：HTTP \(statusCode)") }
+                    return
+                }
+                do {
+                    let decoded = try self.serverDecoder().decode(ServerStateResponse.self, from: data)
+                    self.applyServerState(decoded, manual: manual)
+                } catch {
+                    if manual { self.showError("服务器状态解析失败：\(error.localizedDescription)") }
+                }
+            }
+        }.resume()
+    }
+
+    private func refreshServerData(manual: Bool) {
+        guard !serverSyncInProgress else {
+            if manual { showFeedback("正在同步服务器，请稍等。", color: .systemOrange) }
+            return
+        }
+        guard let url = URL(string: "\(analyzerServerBaseURL)/refresh") else { return }
+        serverSyncInProgress = true
+        if manual { showFeedback("正在请求服务器刷新数据...", color: .white, autoHide: false) }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.serverSyncInProgress = false
+                if let error {
+                    if manual { self.showError("服务器刷新失败：\(error.localizedDescription)") }
+                    return
+                }
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard (200..<300).contains(statusCode), let data else {
+                    if manual {
+                        let message = statusCode == 409 ? "服务器还未初始化，请先上传服务器。" : "服务器刷新失败：HTTP \(statusCode)"
+                        self.showError(message)
+                    }
+                    return
+                }
+                do {
+                    let decoded = try self.serverDecoder().decode(ServerRefreshResponse.self, from: data)
+                    if let state = decoded.state {
+                        self.applyServerState(state, manual: manual)
+                    } else {
+                        self.fetchServerState(manual: manual)
+                    }
+                } catch {
+                    if manual { self.showError("服务器刷新结果解析失败：\(error.localizedDescription)") }
+                }
+            }
+        }.resume()
+    }
+
+    @objc private func uploadInitialStateToServer() {
+        guard !serverInitialized else { return }
+        guard !serverSyncInProgress else {
+            showFeedback("正在同步服务器，请稍等。", color: .systemOrange)
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "上传到服务器？"
+        alert.informativeText = "这会把当前本机历史、余额账号配置和账号池接口账号作为服务器唯一初始化数据。成功后其他客户端只能读取，不能再上传覆盖。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "确认上传")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let url = URL(string: "\(analyzerServerBaseURL)/bootstrap") else { return }
+
+        let payload = ServerBootstrapPayload(
+            storedState: currentStoredState(),
+            poolState: currentPoolState(),
+            balanceAccounts: balanceAccounts,
+            poolCredentials: loadPoolCredentials(),
+            smtpSettings: smtpSettings
+        )
+        guard let body = try? serverEncoder().encode(payload) else {
+            showError("服务器初始化数据编码失败。")
+            return
+        }
+
+        serverSyncInProgress = true
+        showFeedback("正在上传服务器初始化数据...", color: .white, autoHide: false)
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.serverSyncInProgress = false
+                if let error {
+                    self.showError("上传服务器失败：\(error.localizedDescription)")
+                    return
+                }
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard (200..<300).contains(statusCode) else {
+                    let message = statusCode == 409 ? "服务器已经初始化，不能再次上传覆盖。" : "上传服务器失败：HTTP \(statusCode)"
+                    self.showError(message)
+                    self.fetchServerState(manual: false)
+                    return
+                }
+                self.serverInitialized = true
+                UserDefaults.standard.set(true, forKey: "ServerInitialized")
+                self.showFeedback("服务器初始化完成，上传按钮已隐藏。", color: .systemGreen)
+                self.fetchServerState(manual: false)
+            }
+        }.resume()
+    }
+
+    private func saveState() {
+        let state = currentStoredState()
+        if let data = try? JSONEncoder().encode(state) {
+            UserDefaults.standard.set(data, forKey: "StoredState")
+        }
+    }
+
+    private func savePoolState() {
+        let state = currentPoolState()
         if let data = try? JSONEncoder().encode(state) {
             UserDefaults.standard.set(data, forKey: "PoolAnalyzerState")
         }
@@ -4374,6 +4694,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         useBaseDeductionButton.state = useBaseDeduction ? .on : .off
         initial = state.initial
         history = state.history
+        costAdditions = state.costAdditions ?? []
         settlement = state.settlement ?? .default
     }
 
@@ -4384,6 +4705,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         poolHistory = state.history
         selectedPoolGroups = state.selectedGroups ?? ["PLUS共享号池", "K12共享号池"]
+        hasLocalPoolSelection = state.selectedGroups != nil
         availablePoolGroups = state.availableGroups ?? ["PLUS共享号池", "K12共享号池"]
         poolPollingMinutes = normalizedPollingMinutes(state.pollingMinutes ?? defaultPollingMinutes)
         poolPollingField.stringValue = money(poolPollingMinutes)
