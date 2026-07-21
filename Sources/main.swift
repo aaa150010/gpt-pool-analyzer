@@ -756,6 +756,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var balancePollingTimer: Timer?
     private var balanceQueryInProgress = false
     private var serverSyncInProgress = false
+    private var storedStateSyncTimer: Timer?
     private var serverInitialized = false {
         didSet {
             serverSyncButton.isHidden = serverInitialized
@@ -802,6 +803,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         feedbackHideTimer?.invalidate()
         poolPollingTimer?.invalidate()
         balancePollingTimer?.invalidate()
+        storedStateSyncTimer?.invalidate()
     }
 
     private func buildWindow() {
@@ -2163,6 +2165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         saveState()
         updateSettlementOutput()
         refreshOutput()
+        scheduleStoredStateSyncToServer()
     }
 
     @objc private func toggleBaseDeduction() {
@@ -2173,6 +2176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         saveState()
         refreshOutput()
+        scheduleStoredStateSyncToServer()
     }
 
     @objc private func addCost() {
@@ -4510,17 +4514,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         )
     }
 
+    private func setTextFieldFromServer(_ field: NSTextField, value: String) {
+        guard field.currentEditor() == nil else { return }
+        if field.stringValue != value {
+            field.stringValue = value
+        }
+    }
+
     private func applyServerState(_ response: ServerStateResponse, manual: Bool) {
         serverInitialized = response.initialized
         UserDefaults.standard.set(response.initialized, forKey: "ServerInitialized")
         if let state = response.storedState {
-            costField.stringValue = money(state.cost)
-            partnerCostField.stringValue = money(state.partnerCost ?? 0)
+            setTextFieldFromServer(costField, value: money(state.cost))
+            setTextFieldFromServer(partnerCostField, value: money(state.partnerCost ?? 0))
             withdrawalAmount = state.withdrawalAmount
             useBaseDeduction = state.useBaseDeduction ?? false
             baseDeductionAmount = state.baseDeductionAmount ?? state.manualBaseTotal
-            withdrawalField.stringValue = state.withdrawalAmount.map { money($0) } ?? ""
-            baseDeductionField.stringValue = baseDeductionAmount.map { money($0) } ?? ""
+            setTextFieldFromServer(withdrawalField, value: state.withdrawalAmount.map { money($0) } ?? "")
+            setTextFieldFromServer(baseDeductionField, value: baseDeductionAmount.map { money($0) } ?? "")
             baseDeductionField.isHidden = !useBaseDeduction
             useBaseDeductionButton.state = useBaseDeduction ? .on : .off
             initial = state.initial
@@ -4709,6 +4720,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
                 guard (200..<300).contains(statusCode), let data else {
                     self.showFeedback("累加成本已在本机清空；服务器同步失败：HTTP \(statusCode)", color: .systemOrange, autoHide: false)
+                    return
+                }
+                if let decoded = try? self.serverDecoder().decode(ServerRefreshResponse.self, from: data),
+                   let state = decoded.state {
+                    self.applyServerState(state, manual: false)
+                }
+            }
+        }.resume()
+    }
+
+    private func scheduleStoredStateSyncToServer() {
+        guard serverInitialized else { return }
+        storedStateSyncTimer?.invalidate()
+        storedStateSyncTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: false) { [weak self] _ in
+            self?.syncStoredStateToServer()
+        }
+    }
+
+    private func syncStoredStateToServer() {
+        guard serverInitialized else { return }
+        guard let url = URL(string: "\(analyzerServerBaseURL)/stored-state") else { return }
+        guard let body = try? serverEncoder().encode(currentStoredState()) else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let error {
+                    self.showFeedback("本机输入已保存；服务器同步失败：\(error.localizedDescription)", color: .systemOrange, autoHide: false)
+                    return
+                }
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard (200..<300).contains(statusCode), let data else {
+                    self.showFeedback("本机输入已保存；服务器同步失败：HTTP \(statusCode)", color: .systemOrange, autoHide: false)
                     return
                 }
                 if let decoded = try? self.serverDecoder().decode(ServerRefreshResponse.self, from: data),

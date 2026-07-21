@@ -487,6 +487,15 @@ async def refresh() -> dict[str, Any]:
     return {"ok": True, "state": current_state()}
 
 
+@app.put(f"{API_PREFIX}/stored-state")
+async def update_stored_state(payload: dict[str, Any]) -> dict[str, Any]:
+    if not initialized():
+        raise HTTPException(status_code=409, detail="Not initialized")
+    stored_state = payload.get("storedState") or payload
+    set_setting("stored_state", compact_stored_state(stored_state))
+    return {"ok": True, "state": current_state()}
+
+
 @app.post(f"{API_PREFIX}/cost-additions")
 async def add_cost_addition(payload: dict[str, Any]) -> dict[str, Any]:
     if not initialized():
