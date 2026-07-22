@@ -367,26 +367,38 @@ def usage_window(summary: dict[str, Any], name: str) -> dict[str, Any]:
     return {}
 
 
+def remaining_capacity(window: dict[str, Any]) -> int | None:
+    percent = window.get("remaining_capacity_percent")
+    if percent is None:
+        return None
+    return int(round(flexible_number(percent) / 100))
+
+
 def pool_snapshot_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
     window5h = usage_window(summary, "5h")
     window7d = usage_window(summary, "7d")
+    limited = flexible_int(summary.get("rate_limited_account_count"))
+    quota_protected = flexible_int(summary.get("codex_quota_protected_account_count"))
+    error = flexible_int(summary.get("error_account_count"))
+    disabled = flexible_int(summary.get("disabled_account_count"))
+    schedulable = flexible_int(summary.get("schedulable_account_count"))
     return {
         "date": utc_now(),
         "groupName": summary.get("group_name") or "",
         "status": summary.get("group_status") or "",
         "total": flexible_int(summary.get("account_count")),
         "active": flexible_int(summary.get("active_account_count")),
-        "schedulable": flexible_int(summary.get("schedulable_account_count")),
-        "remaining5h": window5h.get("account_count"),
-        "remaining7d": window7d.get("account_count"),
+        "schedulable": schedulable,
+        "remaining5h": remaining_capacity(window5h),
+        "remaining7d": remaining_capacity(window7d),
         "utilization5h": window5h.get("average_utilization"),
         "utilization7d": window7d.get("average_utilization"),
-        "concurrentAvailable": flexible_int(summary.get("schedulable_account_count")),
-        "concurrentTotal": flexible_int(summary.get("account_count")),
-        "limited": flexible_int(summary.get("rate_limited_account_count")),
-        "quotaProtected": flexible_int(summary.get("codex_quota_protected_account_count")),
-        "error": flexible_int(summary.get("error_account_count")),
-        "disabled": flexible_int(summary.get("disabled_account_count")),
+        "concurrentAvailable": max(schedulable - limited - quota_protected - error - disabled, 0),
+        "concurrentTotal": schedulable,
+        "limited": limited,
+        "quotaProtected": quota_protected,
+        "error": error,
+        "disabled": disabled,
     }
 
 
