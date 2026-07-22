@@ -705,10 +705,10 @@ final class BalanceTrendChartView: NSView {
         formatter.dateFormat = "MM-dd HH:mm:ss"
         let title = formatter.string(from: point.date)
         var lines = [
-            "余额合计  \(formatMoney(point.total))"
+            "合计 \(formatMoney(point.total))"
         ]
         if currentCost > 0 {
-            lines.append("扣成本后  \(formatSignedMoney(point.total - currentCost))")
+            lines.append("扣后 \(formatSignedMoney(point.total - currentCost))")
         }
         let accountLines = accountBreakdownLines(for: point)
         if !accountLines.isEmpty {
@@ -727,12 +727,13 @@ final class BalanceTrendChartView: NSView {
             (title as NSString).size(withAttributes: titleAttrs).width,
             lines.map { ($0 as NSString).size(withAttributes: rowAttrs).width }.max() ?? 0
         )
-        let width = min(max(contentWidth + 30, 190), max(plotRect.width - 16, 190))
-        let height = CGFloat(28 + lines.count * 19)
+        let width = min(max(contentWidth + 28, 220), max(bounds.width - 20, 220))
+        let height = CGFloat(26 + lines.count * 17)
         var x = anchor.x + 12
-        if x + width > plotRect.maxX { x = anchor.x - width - 12 }
-        x = min(max(x, plotRect.minX + 8), plotRect.maxX - width - 8)
-        let y = min(max(anchor.y - height / 2, plotRect.minY + 4), plotRect.maxY - height - 4)
+        let containerRect = bounds.insetBy(dx: 10, dy: 8)
+        if x + width > containerRect.maxX { x = anchor.x - width - 12 }
+        x = min(max(x, containerRect.minX), containerRect.maxX - width)
+        let y = min(max(anchor.y - height / 2, containerRect.minY), containerRect.maxY - height)
         let rect = NSRect(x: x, y: y, width: width, height: height)
 
         NSColor.windowBackgroundColor.withAlphaComponent(0.96).setFill()
@@ -742,17 +743,32 @@ final class BalanceTrendChartView: NSView {
 
         title.draw(in: NSRect(x: rect.minX + 12, y: rect.minY + 8, width: rect.width - 24, height: 16), withAttributes: titleAttrs)
         for (index, line) in lines.enumerated() {
-            let rowY = rect.minY + 30 + CGFloat(index * 19)
+            let rowY = rect.minY + 28 + CGFloat(index * 17)
             line.draw(in: NSRect(x: rect.minX + 12, y: rowY, width: rect.width - 24, height: 16), withAttributes: rowAttrs)
         }
     }
 
     private func accountBreakdownLines(for point: Snapshot) -> [String] {
         let names = point.accounts ?? []
-        let maxVisibleAccounts = 6
-        var lines = point.amounts.prefix(maxVisibleAccounts).enumerated().map { index, amount in
-            let name = index < names.count ? names[index] : "账号 \(index + 1)"
-            return "\(name)  \(formatMoney(amount))"
+        let maxVisibleAccounts = 7
+        let items = point.amounts.prefix(maxVisibleAccounts).enumerated().map { index, amount in
+            let name = index < names.count ? names[index].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+            let displayName = name.isEmpty ? "账号\(index + 1)" : name
+            return "\(displayName)  \(formatMoney(amount))"
+        }
+        let leftColumnWidth = max(items.enumerated().compactMap { index, item in
+            index.isMultiple(of: 2) ? item.count : nil
+        }.max() ?? 0, 18) + 4
+        var lines: [String] = []
+        var index = 0
+        while index < items.count {
+            let left = items[index].padding(toLength: leftColumnWidth, withPad: " ", startingAt: 0)
+            if index + 1 < items.count {
+                lines.append("\(left)\(items[index + 1])")
+            } else {
+                lines.append(items[index])
+            }
+            index += 2
         }
         if point.amounts.count > maxVisibleAccounts {
             lines.append("另 \(point.amounts.count - maxVisibleAccounts) 个账号...")
@@ -1169,20 +1185,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         inputRow.addArrangedSubview(baseDeductionField)
         inputRow.addArrangedSubview(addCostButton)
         inputRow.addArrangedSubview(costAdditionHistoryButton)
-        let actionRow = NSStackView()
-        actionRow.orientation = .horizontal
-        actionRow.spacing = 8
-        actionRow.alignment = .centerY
-        actionRow.translatesAutoresizingMaskIntoConstraints = false
         for button in Array(buttonRow.arrangedSubviews) {
             buttonRow.removeArrangedSubview(button)
-            actionRow.addArrangedSubview(button)
+            inputRow.addArrangedSubview(button)
         }
 
         let inputScroll = horizontalScroll(documentView: inputRow)
-        let actionScroll = horizontalScroll(documentView: actionRow)
         stack.addArrangedSubview(inputScroll)
-        stack.addArrangedSubview(actionScroll)
 
         panel.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -1192,17 +1201,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             stack.bottomAnchor.constraint(equalTo: panel.bottomAnchor),
             inputScroll.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
             inputScroll.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
-            inputScroll.heightAnchor.constraint(equalToConstant: 30),
-            actionScroll.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
-            actionScroll.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
-            actionScroll.heightAnchor.constraint(equalToConstant: 32),
+            inputScroll.heightAnchor.constraint(equalToConstant: 34),
             inputRow.leadingAnchor.constraint(equalTo: inputScroll.contentView.leadingAnchor),
             inputRow.topAnchor.constraint(equalTo: inputScroll.contentView.topAnchor),
             inputRow.bottomAnchor.constraint(equalTo: inputScroll.contentView.bottomAnchor),
-            actionRow.leadingAnchor.constraint(equalTo: actionScroll.contentView.leadingAnchor),
-            actionRow.topAnchor.constraint(equalTo: actionScroll.contentView.topAnchor),
-            actionRow.bottomAnchor.constraint(equalTo: actionScroll.contentView.bottomAnchor),
-            panel.heightAnchor.constraint(equalToConstant: 86)
+            panel.heightAnchor.constraint(equalToConstant: 50)
         ])
         return panel
     }
@@ -1782,7 +1785,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         balanceTrendChartView.layer?.borderColor = NSColor.separatorColor.cgColor
         balanceTrendChartView.layer?.borderWidth = 1
         balanceTrendChartView.layer?.cornerRadius = 8
-        balanceTrendChartView.heightAnchor.constraint(equalToConstant: 180).isActive = true
+        balanceTrendChartView.heightAnchor.constraint(equalToConstant: 260).isActive = true
 
         let settlementPanel = buildSettlementPanel()
         stack.addArrangedSubview(balanceTrendChartView)
