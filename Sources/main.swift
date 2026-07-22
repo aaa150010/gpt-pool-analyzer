@@ -570,21 +570,52 @@ final class BalanceTrendChartView: NSView {
     var history: [Snapshot] = [] {
         didSet { needsDisplay = true }
     }
+    var currentCost: Double = 0 {
+        didSet { needsDisplay = true }
+    }
+
+    private var trackingArea: NSTrackingArea?
+    private var hoverLocation: NSPoint?
 
     override var isFlipped: Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        hoverLocation = convert(event.locationInWindow, from: nil)
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hoverLocation = nil
+        needsDisplay = true
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         NSColor.white.setFill()
         bounds.fill()
         let rect = bounds.insetBy(dx: 54, dy: 34)
-        let points = history.sorted { $0.date < $1.date }.map { ($0.date, $0.total) }
-        guard points.count >= 2, let minDate = points.map(\.0).min(), let maxDate = points.map(\.0).max() else {
+        let points = history.sorted { $0.date < $1.date }
+        guard points.count >= 2, let minDate = points.map(\.date).min(), let maxDate = points.map(\.date).max() else {
             drawEmpty()
             return
         }
-        let minValue = max((points.map(\.1).min() ?? 0) * 0.96, 0)
-        let maxValue = max((points.map(\.1).max() ?? 1) * 1.04, minValue + 1)
+        let minValue = max((points.map(\.total).min() ?? 0) * 0.96, 0)
+        let maxValue = max((points.map(\.total).max() ?? 1) * 1.04, minValue + 1)
         let timeSpan = max(maxDate.timeIntervalSince(minDate), 1)
         let valueSpan = max(maxValue - minValue, 1)
         drawGrid(in: rect, minValue: minValue, maxValue: maxValue)
@@ -592,20 +623,21 @@ final class BalanceTrendChartView: NSView {
         path.lineWidth = 2.6
         path.lineJoinStyle = .round
         for (index, point) in points.enumerated() {
-            let x = rect.minX + CGFloat(point.0.timeIntervalSince(minDate) / timeSpan) * rect.width
-            let y = rect.maxY - CGFloat((point.1 - minValue) / valueSpan) * rect.height
+            let x = rect.minX + CGFloat(point.date.timeIntervalSince(minDate) / timeSpan) * rect.width
+            let y = rect.maxY - CGFloat((point.total - minValue) / valueSpan) * rect.height
             index == 0 ? path.move(to: NSPoint(x: x, y: y)) : path.line(to: NSPoint(x: x, y: y))
         }
         NSColor.systemGreen.setStroke()
         path.stroke()
         if let latest = points.last {
-            let x = rect.minX + CGFloat(latest.0.timeIntervalSince(minDate) / timeSpan) * rect.width
-            let y = rect.maxY - CGFloat((latest.1 - minValue) / valueSpan) * rect.height
+            let x = rect.minX + CGFloat(latest.date.timeIntervalSince(minDate) / timeSpan) * rect.width
+            let y = rect.maxY - CGFloat((latest.total - minValue) / valueSpan) * rect.height
             NSColor.systemGreen.setFill()
             NSBezierPath(ovalIn: NSRect(x: x - 4, y: y - 4, width: 8, height: 8)).fill()
         }
         drawTimeAxis(in: rect, minDate: minDate, maxDate: maxDate)
-        drawLatest(points.last?.1 ?? 0, in: rect)
+        drawLatest(points.last?.total ?? 0, in: rect)
+        drawTooltipIfNeeded(points: points, in: rect, minDate: minDate, timeSpan: timeSpan, minValue: minValue, valueSpan: valueSpan)
     }
 
     private func drawGrid(in rect: NSRect, minValue: Double, maxValue: Double) {
@@ -636,6 +668,104 @@ final class BalanceTrendChartView: NSView {
             .foregroundColor: NSColor.systemGreen
         ]
         text.draw(in: NSRect(x: rect.minX, y: 8, width: 240, height: 20), withAttributes: attrs)
+    }
+
+    private func drawTooltipIfNeeded(
+        points: [Snapshot],
+        in plotRect: NSRect,
+        minDate: Date,
+        timeSpan: TimeInterval,
+        minValue: Double,
+        valueSpan: Double
+    ) {
+        guard let hoverLocation, plotRect.contains(hoverLocation) else { return }
+        let ratio = max(0, min((hoverLocation.x - plotRect.minX) / plotRect.width, 1))
+        let targetDate = minDate.addingTimeInterval(TimeInterval(ratio) * timeSpan)
+        guard let point = points.min(by: {
+            abs($0.date.timeIntervalSince(targetDate)) < abs($1.date.timeIntervalSince(targetDate))
+        }) else { return }
+
+        let x = plotRect.minX + CGFloat(point.date.timeIntervalSince(minDate) / timeSpan) * plotRect.width
+        let y = plotRect.maxY - CGFloat((point.total - minValue) / valueSpan) * plotRect.height
+        NSColor.secondaryLabelColor.withAlphaComponent(0.5).setStroke()
+        let guide = NSBezierPath()
+        guide.lineWidth = 1
+        guide.move(to: NSPoint(x: x, y: plotRect.minY))
+        guide.line(to: NSPoint(x: x, y: plotRect.maxY))
+        guide.stroke()
+
+        NSColor.systemGreen.setFill()
+        NSBezierPath(ovalIn: NSRect(x: x - 4.5, y: y - 4.5, width: 9, height: 9)).fill()
+        drawTooltipBox(for: point, anchor: NSPoint(x: x, y: hoverLocation.y), in: plotRect)
+    }
+
+    private func drawTooltipBox(for point: Snapshot, anchor: NSPoint, in plotRect: NSRect) {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "MM-dd HH:mm:ss"
+        let title = formatter.string(from: point.date)
+        var lines = [
+            "余额合计  \(formatMoney(point.total))"
+        ]
+        if currentCost > 0 {
+            lines.append("扣成本后  \(formatSignedMoney(point.total - currentCost))")
+        }
+        let accountLines = accountBreakdownLines(for: point)
+        if !accountLines.isEmpty {
+            lines.append(contentsOf: accountLines)
+        }
+
+        let titleAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .bold),
+            .foregroundColor: NSColor.labelColor
+        ]
+        let rowAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.labelColor
+        ]
+        let contentWidth = max(
+            (title as NSString).size(withAttributes: titleAttrs).width,
+            lines.map { ($0 as NSString).size(withAttributes: rowAttrs).width }.max() ?? 0
+        )
+        let width = min(max(contentWidth + 30, 190), max(plotRect.width - 16, 190))
+        let height = CGFloat(28 + lines.count * 19)
+        var x = anchor.x + 12
+        if x + width > plotRect.maxX { x = anchor.x - width - 12 }
+        x = min(max(x, plotRect.minX + 8), plotRect.maxX - width - 8)
+        let y = min(max(anchor.y - height / 2, plotRect.minY + 4), plotRect.maxY - height - 4)
+        let rect = NSRect(x: x, y: y, width: width, height: height)
+
+        NSColor.windowBackgroundColor.withAlphaComponent(0.96).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).fill()
+        NSColor.separatorColor.setStroke()
+        NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).stroke()
+
+        title.draw(in: NSRect(x: rect.minX + 12, y: rect.minY + 8, width: rect.width - 24, height: 16), withAttributes: titleAttrs)
+        for (index, line) in lines.enumerated() {
+            let rowY = rect.minY + 30 + CGFloat(index * 19)
+            line.draw(in: NSRect(x: rect.minX + 12, y: rowY, width: rect.width - 24, height: 16), withAttributes: rowAttrs)
+        }
+    }
+
+    private func accountBreakdownLines(for point: Snapshot) -> [String] {
+        let names = point.accounts ?? []
+        let maxVisibleAccounts = 6
+        var lines = point.amounts.prefix(maxVisibleAccounts).enumerated().map { index, amount in
+            let name = index < names.count ? names[index] : "账号 \(index + 1)"
+            return "\(name)  \(formatMoney(amount))"
+        }
+        if point.amounts.count > maxVisibleAccounts {
+            lines.append("另 \(point.amounts.count - maxVisibleAccounts) 个账号...")
+        }
+        return lines
+    }
+
+    private func formatMoney(_ value: Double) -> String {
+        String(format: "%.2f", value)
+    }
+
+    private func formatSignedMoney(_ value: Double) -> String {
+        String(format: "%+.2f", value)
     }
 
     private func drawEmpty() {
@@ -729,8 +859,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var topPanel: NSView?
     private var metricWrap: NSView?
     private var activeContentView: NSView?
+    private var activeTabIndex: Int?
+    private var tabContentViews: [Int: NSView] = [:]
     private var poolSummaryLabels: [String: (total: NSTextField, schedulable: NSTextField, status: NSTextField, change: NSTextField, time: NSTextField)] = [:]
     private var poolHistoryTables: [NSTableView: String] = [:]
+    private var poolRowsCache: [String: [PoolSnapshot]] = [:]
     private var settlementTextObservers: [NSObjectProtocol] = []
     private var settlementLabels: (balanceChange: NSTextField, netOutcome: NSTextField, settlementLine: NSTextField)?
 
@@ -1180,31 +1313,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func switchTab(_ sender: Any?) {
-        activeContentView?.removeFromSuperview()
+        let selectedIndex = tabControl.selectedSegment
+        if activeTabIndex == selectedIndex, activeContentView != nil {
+            refreshVisibleContent()
+            scrollToLatestRows(animated: true)
+            return
+        }
         let isAccountTab = tabControl.selectedSegment == 0 || tabControl.selectedSegment == 1
         topPanel?.isHidden = isAccountTab
         metricWrap?.isHidden = isAccountTab
-        let nextView: NSView
-        switch tabControl.selectedSegment {
-        case 1:
-            nextView = buildPoolPanel()
-        case 2:
-            nextView = buildCalcPanel()
-        case 3:
-            nextView = buildHistoryPanel()
-        default:
-            nextView = buildTrendPanel()
-        }
+
+        activeContentView?.isHidden = true
+        let nextView = tabContentView(for: selectedIndex)
         activeContentView = nextView
-        nextView.translatesAutoresizingMaskIntoConstraints = false
-        contentHost.addSubview(nextView)
+        activeTabIndex = selectedIndex
+        nextView.isHidden = false
+        refreshVisibleContent()
+        scrollToLatestRows(animated: true)
+    }
+
+    private func tabContentView(for index: Int) -> NSView {
+        if let cached = tabContentViews[index] {
+            return cached
+        }
+        let view: NSView
+        switch index {
+        case 1:
+            view = buildPoolPanel()
+        case 2:
+            view = buildCalcPanel()
+        case 3:
+            view = buildHistoryPanel()
+        default:
+            view = buildTrendPanel()
+        }
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.isHidden = true
+        contentHost.addSubview(view)
         NSLayoutConstraint.activate([
-            nextView.leadingAnchor.constraint(equalTo: contentHost.leadingAnchor),
-            nextView.trailingAnchor.constraint(equalTo: contentHost.trailingAnchor),
-            nextView.topAnchor.constraint(equalTo: contentHost.topAnchor),
-            nextView.bottomAnchor.constraint(equalTo: contentHost.bottomAnchor)
+            view.leadingAnchor.constraint(equalTo: contentHost.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: contentHost.trailingAnchor),
+            view.topAnchor.constraint(equalTo: contentHost.topAnchor),
+            view.bottomAnchor.constraint(equalTo: contentHost.bottomAnchor)
         ])
-        scrollToLatestRows()
+        tabContentViews[index] = view
+        return view
+    }
+
+    private func invalidateTabContent(_ index: Int) {
+        guard let view = tabContentViews.removeValue(forKey: index) else { return }
+        if view === activeContentView {
+            activeContentView = nil
+            activeTabIndex = nil
+        }
+        view.removeFromSuperview()
+        if index == 1 {
+            poolHistoryTables = [:]
+            poolRowsCache.removeAll()
+        }
     }
 
     private func buildPoolPanel() -> NSView {
@@ -1610,6 +1776,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         comparisonScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 250).isActive = true
 
         balanceTrendChartView.history = history
+        balanceTrendChartView.currentCost = cost
         balanceTrendChartView.translatesAutoresizingMaskIntoConstraints = false
         balanceTrendChartView.wantsLayer = true
         balanceTrendChartView.layer?.borderColor = NSColor.separatorColor.cgColor
@@ -2829,9 +2996,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         hasLocalPoolSelection = true
         savePoolState()
         updatePoolGroupsLabel()
+        invalidateTabContent(1)
         if tabControl.selectedSegment == 1 {
             switchTab(nil)
-            refreshOutput()
         } else {
             refreshOutput()
         }
@@ -3136,11 +3303,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         finishPaste(success: true)
         saveState()
-        if tabControl.selectedSegment == 2 {
-            switchTab(nil)
-        } else {
-            refreshOutput()
-        }
+        refreshOutput()
     }
 
     private func clipboardImage() -> NSImage? {
@@ -3743,33 +3906,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func refreshOutput() {
         updateMetrics()
-        updateSettlementOutput()
-        updatePoolSummaryLabels()
-        trendChartView.history = poolHistory
-        trendChartView.groups = selectedPoolGroups
-        trendChartView.metric = selectedTrendMetric
-        balanceTrendChartView.history = history
-        comparisonTable.reloadData()
-        historyTable.reloadData()
-        plusPoolHistoryTable.reloadData()
-        k12PoolHistoryTable.reloadData()
-        for table in poolHistoryTables.keys {
-            table.reloadData()
-        }
-        scrollToLatestRows()
+        refreshVisibleContent()
+        scrollToLatestRows(animated: false)
     }
 
-    private func scrollToLatestRows() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+    private func refreshVisibleContent() {
+        switch tabControl.selectedSegment {
+        case 1:
+            updatePoolGroupsLabel()
+            updatePoolSummaryLabels()
+            rebuildPoolRowsCache()
+            for table in poolHistoryTables.keys {
+                table.reloadData()
+            }
+        case 2:
+            updateSettlementOutput()
+            balanceTrendChartView.history = history
+            balanceTrendChartView.currentCost = cost
+            comparisonTable.reloadData()
+        case 3:
+            historyTable.reloadData()
+        default:
+            trendChartView.history = poolHistory
+            trendChartView.groups = selectedPoolGroups
+            trendChartView.metric = selectedTrendMetric
+        }
+    }
+
+    private func scrollToLatestRows(animated: Bool) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
             guard let self else { return }
-            let tables = [self.comparisonTable, self.historyTable, self.plusPoolHistoryTable, self.k12PoolHistoryTable] + Array(self.poolHistoryTables.keys)
-            for table in tables {
-                self.smoothScrollToLastRow(table)
+            for table in self.tablesForCurrentTab() {
+                self.scrollToLastRow(table, animated: animated)
             }
         }
     }
 
-    private func smoothScrollToLastRow(_ table: NSTableView) {
+    private func tablesForCurrentTab() -> [NSTableView] {
+        switch tabControl.selectedSegment {
+        case 1:
+            return Array(poolHistoryTables.keys)
+        case 2:
+            return [comparisonTable]
+        case 3:
+            return [historyTable]
+        default:
+            return []
+        }
+    }
+
+    private func scrollToLastRow(_ table: NSTableView, animated: Bool) {
         let lastRow = table.numberOfRows - 1
         guard lastRow >= 0 else { return }
         table.layoutSubtreeIfNeeded()
@@ -3781,10 +3967,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let rowRect = table.rect(ofRow: lastRow)
         let maxY = max(table.bounds.height - clipView.bounds.height, 0)
         let targetY = min(max(rowRect.maxY - clipView.bounds.height + 6, 0), maxY)
+        guard abs(clipView.bounds.origin.y - targetY) > 1 else { return }
         var targetOrigin = clipView.bounds.origin
         targetOrigin.y = targetY
+        guard animated else {
+            clipView.setBoundsOrigin(targetOrigin)
+            scrollView.reflectScrolledClipView(clipView)
+            return
+        }
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.28
+            context.duration = 0.18
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             context.allowsImplicitAnimation = true
             clipView.animator().setBoundsOrigin(targetOrigin)
         } completionHandler: {
@@ -3803,8 +3996,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func poolRows(for tableView: NSTableView) -> [PoolSnapshot] {
         let groupFilter = poolHistoryTables[tableView] ?? (tableView == k12PoolHistoryTable ? "K12共享号池" : "PLUS共享号池")
-        return poolHistory
-            .filter { $0.groupName == groupFilter }
+        if let cached = poolRowsCache[groupFilter] {
+            return cached
+        }
+        return sortedPoolRows(groupName: groupFilter)
+    }
+
+    private func rebuildPoolRowsCache() {
+        poolRowsCache = Dictionary(grouping: poolHistory, by: \.groupName)
+            .mapValues { $0.sorted { $0.date < $1.date } }
+    }
+
+    private func sortedPoolRows(groupName: String) -> [PoolSnapshot] {
+        poolHistory
+            .filter { $0.groupName == groupName }
             .sorted { $0.date < $1.date }
     }
 
@@ -3820,13 +4025,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func trimPoolHistory() {
         var trimmed: [PoolSnapshot] = []
         for group in Set(poolHistory.map(\.groupName)) {
-            let rows = poolHistory
-                .filter { $0.groupName == group }
-                .sorted { $0.date < $1.date }
+            let rows = sortedPoolRows(groupName: group)
                 .suffix(maxPoolHistoryPerGroup)
             trimmed.append(contentsOf: rows)
         }
         poolHistory = trimmed.sorted { $0.date < $1.date }
+        poolRowsCache.removeAll()
     }
 
     private func latestPoolSnapshot(groupName: String) -> PoolSnapshot? {
@@ -4019,8 +4223,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
 
-        let steps = 20
-        let interval = 0.018
+        let steps = 8
+        let interval = 0.02
         var step = 0
         poolAnimations[key] = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self, weak field] timer in
             guard let self, let field else {
@@ -4063,8 +4267,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
 
-        let steps = 20
-        let interval = 0.018
+        let steps = 8
+        let interval = 0.02
         var step = 0
         poolAnimations[animationKey] = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self, weak field] timer in
             guard let self, let field else {
@@ -4192,8 +4396,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
 
-        let duration = 1.5
-        let interval = 1.0 / 60.0
+        let duration = 0.24
+        let interval = 1.0 / 50.0
         let steps = max(1, Int(duration / interval))
         var step = 0
         metricAnimations[key] = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self, weak field] timer in
@@ -4206,7 +4410,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             let eased = 1 - pow(1 - rawProgress, 3)
             let current = startValue + (value - startValue) * eased
             field.stringValue = formatter(current)
-            self.resizeMetricField(field)
             if step >= steps {
                 field.stringValue = formatter(value)
                 self.resizeMetricField(field)
