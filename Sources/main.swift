@@ -2609,10 +2609,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func restartBalancePollingTimer() {
         balancePollingTimer?.invalidate()
-        balancePollingTimer = Timer.scheduledTimer(withTimeInterval: defaultPollingMinutes * 60, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.queryBalances(asInitial: false, manual: false)
-        }
     }
 
     @objc private func confirmClearPoolHistory(_ sender: NSButton) {
@@ -2777,7 +2773,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         poolPollingTimer?.invalidate()
         let interval = normalizedPollingMinutes(poolPollingMinutes) * 60
         poolPollingTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            self?.refreshPoolsFromAPI(isAutomatic: true)
+            self?.fetchServerState(manual: false)
         }
     }
 

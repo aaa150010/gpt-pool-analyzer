@@ -23,6 +23,15 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def parse_time(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -171,7 +180,50 @@ def insert_balance_snapshot(snapshot: dict[str, Any]) -> None:
 
 
 def insert_pool_snapshot(snapshot: dict[str, Any]) -> None:
+    group_name = snapshot.get("groupName") or snapshot.get("group_name") or ""
+    snapshot_date = snapshot.get("date") or utc_now()
+    values = (
+        snapshot.get("status") or "",
+        flexible_int(snapshot.get("total")),
+        flexible_int(snapshot.get("active")),
+        flexible_int(snapshot.get("schedulable")),
+        snapshot.get("remaining5h"),
+        snapshot.get("remaining7d"),
+        snapshot.get("utilization5h"),
+        snapshot.get("utilization7d"),
+        flexible_int(snapshot.get("concurrentAvailable")),
+        flexible_int(snapshot.get("concurrentTotal")),
+        flexible_int(snapshot.get("limited")),
+        flexible_int(snapshot.get("quotaProtected")),
+        flexible_int(snapshot.get("error")),
+        flexible_int(snapshot.get("disabled")),
+    )
     with connect() as conn:
+        latest = conn.execute(
+            "SELECT * FROM pool_history WHERE group_name = ? ORDER BY date DESC, id DESC LIMIT 1",
+            (group_name,),
+        ).fetchone()
+        latest_time = parse_time(latest["date"]) if latest else None
+        current_time = parse_time(snapshot_date)
+        if latest and latest_time and current_time and abs((current_time - latest_time).total_seconds()) <= 60:
+            latest_values = (
+                latest["status"],
+                latest["total"],
+                latest["active"],
+                latest["schedulable"],
+                latest["remaining5h"],
+                latest["remaining7d"],
+                latest["utilization5h"],
+                latest["utilization7d"],
+                latest["concurrent_available"],
+                latest["concurrent_total"],
+                latest["limited"],
+                latest["quota_protected"],
+                latest["error"],
+                latest["disabled"],
+            )
+            if latest_values == values:
+                return
         conn.execute(
             """
             INSERT INTO pool_history(
@@ -181,22 +233,9 @@ def insert_pool_snapshot(snapshot: dict[str, Any]) -> None:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                snapshot.get("date") or utc_now(),
-                snapshot.get("groupName") or snapshot.get("group_name") or "",
-                snapshot.get("status") or "",
-                flexible_int(snapshot.get("total")),
-                flexible_int(snapshot.get("active")),
-                flexible_int(snapshot.get("schedulable")),
-                snapshot.get("remaining5h"),
-                snapshot.get("remaining7d"),
-                snapshot.get("utilization5h"),
-                snapshot.get("utilization7d"),
-                flexible_int(snapshot.get("concurrentAvailable")),
-                flexible_int(snapshot.get("concurrentTotal")),
-                flexible_int(snapshot.get("limited")),
-                flexible_int(snapshot.get("quotaProtected")),
-                flexible_int(snapshot.get("error")),
-                flexible_int(snapshot.get("disabled")),
+                snapshot_date,
+                group_name,
+                *values,
             ),
         )
 
