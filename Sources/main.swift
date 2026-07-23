@@ -5,6 +5,7 @@ import Vision
 
 private let maxBalanceHistoryCount = 1000
 private let maxPoolHistoryPerGroup = 1000
+private let dataRetentionSeconds: TimeInterval = 24 * 60 * 60
 private let defaultPollingMinutes: Double = 5
 private let defaultBalanceBaseURL = "https://api.ai-pixel.online"
 private let analyzerServerBaseURL = "https://lynote.xyz/gpt-api"
@@ -268,6 +269,19 @@ struct ServerStateResponse: Codable {
 struct ServerRefreshResponse: Codable {
     var ok: Bool
     var state: ServerStateResponse?
+}
+
+struct BalanceAccountsResponse: Codable {
+    var accounts: [BalanceAccount]
+}
+
+struct BalanceAccountsPayload: Codable {
+    var accounts: [BalanceAccount]
+}
+
+struct BalanceAccountsUpdateResponse: Codable {
+    var ok: Bool
+    var count: Int?
 }
 
 enum PoolTrendMetric: Int, CaseIterable {
@@ -919,7 +933,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         buildWindow()
         loadState()
         loadPoolState()
-        balanceAccounts = loadBalanceAccounts()
         if UserDefaults.standard.bool(forKey: "ServerInitialized") {
             serverInitialized = true
         } else {
@@ -2525,9 +2538,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func editBalanceAccounts() {
+        showFeedback("正在读取服务器账号配置...", color: .white, autoHide: false)
+        fetchBalanceAccountsFromServer { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let accounts):
+                self.balanceAccounts = accounts
+                self.presentBalanceAccountsEditor()
+            case .failure(let error):
+                self.showError("服务器账号配置读取失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func presentBalanceAccountsEditor() {
         let alert = NSAlert()
         alert.messageText = "余额账号配置"
-        alert.informativeText = "每行一个账号：名称---api_key。接口地址统一使用 \(defaultBalanceBaseURL)，密钥保存在本机钥匙串。"
+        alert.informativeText = "每行一个账号：名称---api_key。接口地址统一使用 \(defaultBalanceBaseURL)，配置保存在服务器，本机不再访问钥匙串。"
         alert.addButton(withTitle: "保存")
         alert.addButton(withTitle: "导入")
         alert.addButton(withTitle: "导出脱敏")
@@ -2570,11 +2597,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
         balanceAccounts = accounts
-        if saveBalanceAccounts(accounts) {
-            showFeedback("余额账号已保存。", color: .systemGreen)
-        } else {
-            showFeedback("余额账号保存失败。", color: .systemRed)
-        }
+        saveBalanceAccountsToServer(accounts)
     }
 
     private func importBalanceAccountsFromPasteboard(into textView: NSTextView) {
@@ -2588,10 +2611,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
         balanceAccounts = accounts
-        if saveBalanceAccounts(accounts) {
-            showFeedback("已从剪贴板导入 \(accounts.count) 个余额账号。", color: .systemGreen)
-        }
         textView.string = formatBalanceAccountsForEditing(accounts)
+        saveBalanceAccountsToServer(accounts, successMessage: "已从剪贴板导入并保存 \(accounts.count) 个余额账号。")
+    }
+
+    private func fetchBalanceAccountsFromServer(completion: @escaping (Result<[BalanceAccount], Error>) -> Void) {
+        guard let url = URL(string: "\(analyzerServerBaseURL)/balance-accounts") else {
+            completion(.failure(AppError("服务器地址无效。")))
+            return
+        }
+        URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard self != nil else { return }
+                if let error {
+                    completion(.failure(error))
+                    return
+                }
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard (200..<300).contains(statusCode), let data else {
+                    completion(.failure(AppError("HTTP \(statusCode)")))
+                    return
+                }
+                do {
+                    let decoded = try JSONDecoder().decode(BalanceAccountsResponse.self, from: data)
+                    completion(.success(decoded.accounts))
+                } catch {
+                    completion(.failure(error))
+                }
+            }
+        }.resume()
+    }
+
+    private func saveBalanceAccountsToServer(_ accounts: [BalanceAccount], successMessage: String? = nil) {
+        guard let url = URL(string: "\(analyzerServerBaseURL)/balance-accounts") else {
+            showError("服务器地址无效。")
+            return
+        }
+        guard let body = try? serverEncoder().encode(BalanceAccountsPayload(accounts: normalizeBalanceAccounts(accounts))) else {
+            showError("账号配置编码失败。")
+            return
+        }
+        showFeedback("正在保存服务器账号配置...", color: .white, autoHide: false)
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let error {
+                    self.showError("服务器账号配置保存失败：\(error.localizedDescription)")
+                    return
+                }
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard (200..<300).contains(statusCode) else {
+                    self.showError("服务器账号配置保存失败：HTTP \(statusCode)")
+                    return
+                }
+                if let data, let decoded = try? self.serverDecoder().decode(BalanceAccountsUpdateResponse.self, from: data) {
+                    self.showFeedback(successMessage ?? "服务器余额账号已保存：\(decoded.count ?? accounts.count) 个。", color: .systemGreen)
+                } else {
+                    self.showFeedback(successMessage ?? "服务器余额账号已保存：\(accounts.count) 个。", color: .systemGreen)
+                }
+                self.refreshServerData(manual: true)
+            }
+        }.resume()
     }
 
     private func exportBalanceAccounts(masked: Bool) {
@@ -4017,15 +4101,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func trimBalanceHistory() {
-        guard history.count > maxBalanceHistoryCount else { return }
-        history = Array(history.sorted { $0.date < $1.date }.suffix(maxBalanceHistoryCount))
+        let cutoff = Date().addingTimeInterval(-dataRetentionSeconds)
+        history = history.filter { snapshot in
+            snapshot.date >= cutoff || snapshot.date == initial?.date
+        }
+        if history.count > maxBalanceHistoryCount {
+            history = Array(history.sorted { $0.date < $1.date }.suffix(maxBalanceHistoryCount))
+        }
         if let initial {
             history.removeAll { $0.date == initial.date }
             history.insert(initial, at: 0)
         }
+        trimCostAdditions()
     }
 
     private func trimPoolHistory() {
+        let cutoff = Date().addingTimeInterval(-dataRetentionSeconds)
+        poolHistory = poolHistory.filter { $0.date >= cutoff }
         var trimmed: [PoolSnapshot] = []
         for group in Set(poolHistory.map(\.groupName)) {
             let rows = sortedPoolRows(groupName: group)
@@ -4034,6 +4126,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
         poolHistory = trimmed.sorted { $0.date < $1.date }
         poolRowsCache.removeAll()
+    }
+
+    private func trimCostAdditions() {
+        let cutoff = Date().addingTimeInterval(-dataRetentionSeconds)
+        costAdditions.removeAll { $0.createdAt < cutoff }
     }
 
     private func latestPoolSnapshot(groupName: String) -> PoolSnapshot? {
@@ -4739,11 +4836,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             initial = state.initial
             history = state.history
             costAdditions = state.costAdditions ?? []
+            trimBalanceHistory()
             settlement = state.settlement ?? .default
             saveState()
         }
         if let state = response.poolState {
             poolHistory = state.history
+            trimPoolHistory()
             if !hasLocalPoolSelection {
                 selectedPoolGroups = state.selectedGroups ?? selectedPoolGroups
             }
@@ -4999,6 +5098,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         initial = state.initial
         history = state.history
         costAdditions = state.costAdditions ?? []
+        trimBalanceHistory()
         settlement = state.settlement ?? .default
     }
 
@@ -5008,6 +5108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
         poolHistory = state.history
+        trimPoolHistory()
         selectedPoolGroups = state.selectedGroups ?? ["PLUS共享号池", "K12共享号池"]
         hasLocalPoolSelection = state.selectedGroups != nil
         availablePoolGroups = state.availableGroups ?? ["PLUS共享号池", "K12共享号池"]

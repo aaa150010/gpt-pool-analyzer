@@ -3,7 +3,7 @@ import json
 import os
 import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +15,7 @@ API_PREFIX = "/gpt-api"
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DB_PATH = DATA_DIR / "app.db"
 POLL_INTERVAL_SECONDS = max(int(os.getenv("POLL_INTERVAL_SECONDS", "300")), 60)
+DATA_RETENTION_SECONDS = max(int(os.getenv("DATA_RETENTION_SECONDS", "86400")), 3600)
 POOL_DASHBOARD_URL = "https://cf.ai-pixel.online/api/v1/accounts/quota-dashboard?timezone=Asia%2FShanghai"
 POOL_LOGIN_URL = "https://cf.ai-pixel.online/api/v1/auth/login"
 
@@ -177,6 +178,15 @@ def insert_balance_snapshot(snapshot: dict[str, Any]) -> None:
                 dumps(snapshot.get("accounts") or []),
             ),
         )
+
+
+def cleanup_old_data() -> None:
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=DATA_RETENTION_SECONDS)).replace(microsecond=0)
+    cutoff_text = cutoff.isoformat().replace("+00:00", "Z")
+    with connect() as conn:
+        conn.execute("DELETE FROM balance_history WHERE date < ?", (cutoff_text,))
+        conn.execute("DELETE FROM pool_history WHERE date < ?", (cutoff_text,))
+        conn.execute("DELETE FROM cost_additions WHERE created_at < ?", (cutoff_text,))
 
 
 def insert_pool_snapshot(snapshot: dict[str, Any]) -> None:
@@ -466,6 +476,7 @@ async def poll_pools(client: httpx.AsyncClient) -> None:
 async def poll_once() -> None:
     if not initialized():
         return
+    cleanup_old_data()
     async with httpx.AsyncClient() as client:
         for task in [poll_balances, poll_pools]:
             try:
@@ -473,6 +484,7 @@ async def poll_once() -> None:
             except Exception as exc:
                 set_setting("last_poll_error", {"time": utc_now(), "message": str(exc)})
         set_setting("last_poll_at", utc_now())
+    cleanup_old_data()
 
 
 async def poll_loop() -> None:
@@ -484,6 +496,7 @@ async def poll_loop() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    cleanup_old_data()
     task = asyncio.create_task(poll_loop())
     try:
         yield
@@ -536,6 +549,35 @@ async def refresh() -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="Not initialized")
     await poll_once()
     return {"ok": True, "state": current_state()}
+
+
+@app.get(f"{API_PREFIX}/balance-accounts")
+async def get_balance_accounts() -> dict[str, Any]:
+    if not initialized():
+        raise HTTPException(status_code=409, detail="Not initialized")
+    return {"accounts": get_setting("balance_accounts", [])}
+
+
+@app.put(f"{API_PREFIX}/balance-accounts")
+async def update_balance_accounts(payload: dict[str, Any]) -> dict[str, Any]:
+    if not initialized():
+        raise HTTPException(status_code=409, detail="Not initialized")
+    accounts = payload.get("accounts") or payload.get("balanceAccounts") or []
+    if not isinstance(accounts, list) or not accounts:
+        raise HTTPException(status_code=400, detail="accounts required")
+    normalized = []
+    for item in accounts:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        base_url = str(item.get("baseURL") or item.get("base_url") or "").strip().rstrip("/")
+        api_key = str(item.get("apiKey") or item.get("api_key") or "").strip()
+        if name and base_url and api_key:
+            normalized.append({"name": name, "baseURL": base_url, "apiKey": api_key})
+    if not normalized:
+        raise HTTPException(status_code=400, detail="no valid accounts")
+    set_setting("balance_accounts", normalized)
+    return {"ok": True, "count": len(normalized)}
 
 
 @app.put(f"{API_PREFIX}/stored-state")
