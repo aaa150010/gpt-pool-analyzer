@@ -18,8 +18,28 @@ let entries: [(String, Int)] = [
 ]
 
 for (name, size) in entries {
-    let image = NSImage(size: NSSize(width: size, height: size))
-    image.lockFocus()
+    guard let rep = NSBitmapImageRep(
+        bitmapDataPlanes: nil,
+        pixelsWide: size,
+        pixelsHigh: size,
+        bitsPerSample: 8,
+        samplesPerPixel: 4,
+        hasAlpha: true,
+        isPlanar: false,
+        colorSpaceName: .deviceRGB,
+        bytesPerRow: size * 4,
+        bitsPerPixel: 32
+    ) else {
+        fatalError("Failed to create icon bitmap")
+    }
+
+    rep.size = NSSize(width: size, height: size)
+    guard let context = NSGraphicsContext(bitmapImageRep: rep) else {
+        fatalError("Failed to create icon graphics context")
+    }
+
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = context
 
     let rect = NSRect(x: 0, y: 0, width: size, height: size)
     let inset = CGFloat(size) * 0.045
@@ -73,11 +93,9 @@ for (name, size) in entries {
         NSBezierPath(ovalIn: dotRect).fill()
     }
 
-    image.unlockFocus()
+    NSGraphicsContext.restoreGraphicsState()
 
-    guard let tiff = image.tiffRepresentation,
-          let rep = NSBitmapImageRep(data: tiff),
-          let data = rep.representation(using: .png, properties: [:]) else {
+    guard let data = rep.representation(using: .png, properties: [:]) else {
         fatalError("Failed to create icon png")
     }
     try data.write(to: output.appendingPathComponent(name))

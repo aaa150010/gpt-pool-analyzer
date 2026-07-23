@@ -1343,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "gpt-analyzer"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "tauri",
  "tauri-build",
