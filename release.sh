@@ -43,9 +43,19 @@ UPDATE_DIR="$RELEASE_DIR/updates"
 SPARKLE_DIR="$PROJECT_DIR/.cache/sparkle/Sparkle-$SPARKLE_VERSION"
 mkdir -p "$UPDATE_DIR"
 
-cp "dist/GPT分析器.dmg" "$RELEASE_DIR/GPTAnalyzer-$VERSION.dmg"
 cp "dist/GPT分析器.zip" "$UPDATE_DIR/GPTAnalyzer-$VERSION.zip"
 cp RELEASE_NOTES.md "$UPDATE_DIR/GPTAnalyzer-$VERSION.md"
+
+RELEASE_ASSETS=(
+    "$RELEASE_DIR/GPTAnalyzer-$VERSION.zip"
+    "$RELEASE_DIR/appcast.xml"
+    "$RELEASE_DIR/SHA256SUMS.txt"
+)
+
+if [[ -f "dist/GPT分析器.dmg" ]]; then
+    cp "dist/GPT分析器.dmg" "$RELEASE_DIR/GPTAnalyzer-$VERSION.dmg"
+    RELEASE_ASSETS=("$RELEASE_DIR/GPTAnalyzer-$VERSION.dmg" "${RELEASE_ASSETS[@]}")
+fi
 
 "$SPARKLE_DIR/bin/generate_appcast" \
     --account "$SPARKLE_ACCOUNT" \
@@ -57,10 +67,10 @@ cp RELEASE_NOTES.md "$UPDATE_DIR/GPTAnalyzer-$VERSION.md"
     "$UPDATE_DIR"
 
 mv "$UPDATE_DIR/GPTAnalyzer-$VERSION.zip" "$RELEASE_DIR/GPTAnalyzer-$VERSION.zip"
-shasum -a 256 \
-    "$RELEASE_DIR/GPTAnalyzer-$VERSION.dmg" \
-    "$RELEASE_DIR/GPTAnalyzer-$VERSION.zip" \
-    > "$RELEASE_DIR/SHA256SUMS.txt"
+shasum -a 256 "$RELEASE_DIR/GPTAnalyzer-$VERSION.zip" > "$RELEASE_DIR/SHA256SUMS.txt"
+if [[ -f "$RELEASE_DIR/GPTAnalyzer-$VERSION.dmg" ]]; then
+    shasum -a 256 "$RELEASE_DIR/GPTAnalyzer-$VERSION.dmg" >> "$RELEASE_DIR/SHA256SUMS.txt"
+fi
 
 if [[ -n "$(git status --porcelain -- Info.plist RELEASE_NOTES.md)" ]]; then
     git add Info.plist RELEASE_NOTES.md
@@ -72,10 +82,7 @@ git push origin main
 git push origin "$TAG"
 
 gh release create "$TAG" \
-    "$RELEASE_DIR/GPTAnalyzer-$VERSION.dmg" \
-    "$RELEASE_DIR/GPTAnalyzer-$VERSION.zip" \
-    "$RELEASE_DIR/appcast.xml" \
-    "$RELEASE_DIR/SHA256SUMS.txt" \
+    "${RELEASE_ASSETS[@]}" \
     --repo "$REPOSITORY" \
     --title "GPT分析器 $VERSION" \
     --notes-file RELEASE_NOTES.md

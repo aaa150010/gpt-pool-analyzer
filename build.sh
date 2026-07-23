@@ -98,14 +98,17 @@ codesign --verify --deep --strict "$APP_DIR"
 cp -R "$APP_DIR" "$STAGE_DIR/$APP_NAME.app"
 ln -s /Applications "$STAGE_DIR/Applications"
 
-hdiutil create \
+if ! hdiutil create \
     -volname "$APP_NAME" \
     -srcfolder "$STAGE_DIR" \
     -ov \
     -format UDZO \
-    "$DMG_PATH"
+    "$DMG_PATH"; then
+    rm -f "$DMG_PATH"
+    echo "Warning: DMG creation failed; continuing with the ZIP update package." >&2
+fi
 
 ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP_PATH"
 
-echo "$DMG_PATH"
+[[ -f "$DMG_PATH" ]] && echo "$DMG_PATH"
 echo "$ZIP_PATH"
