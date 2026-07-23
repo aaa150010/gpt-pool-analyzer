@@ -1,8 +1,8 @@
-.DS_Store
+node_modules/
 .cache/
+.cargo/
+dist-web/
+src-tauri/target/
 build/
 dist/
-*.dmg
-*.zip
-*.key
-*.private
+.DS_Store

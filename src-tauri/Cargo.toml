@@ -1,0 +1,17 @@
+[package]
+name = "gpt-analyzer"
+version = "2.0.0"
+description = "91"
+authors = ["lwh"]
+edition = "2021"
+
+[lib]
+name = "gpt_analyzer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"

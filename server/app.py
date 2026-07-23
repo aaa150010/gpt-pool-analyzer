@@ -11,12 +11,13 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 
 API_PREFIX = "/gpt-api"
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DB_PATH = DATA_DIR / "app.db"
-POLL_INTERVAL_SECONDS = max(int(os.getenv("POLL_INTERVAL_SECONDS", "300")), 60)
+POLL_INTERVAL_SECONDS = 300
 DATA_RETENTION_SECONDS = max(int(os.getenv("DATA_RETENTION_SECONDS", "86400")), 3600)
 POOL_DASHBOARD_URL = "https://cf.ai-pixel.online/api/v1/accounts/quota-dashboard?timezone=Asia%2FShanghai"
 POOL_LOGIN_URL = "https://cf.ai-pixel.online/api/v1/auth/login"
@@ -582,6 +583,12 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="GPT Analyzer Server", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get(f"{API_PREFIX}/health")
@@ -703,6 +710,18 @@ async def update_stored_state(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="Not initialized")
     stored_state = payload.get("storedState") or payload
     set_setting("stored_state", compact_stored_state(stored_state))
+    return {"ok": True, "state": current_state()}
+
+
+@app.put(f"{API_PREFIX}/pool-state")
+async def update_pool_state(payload: dict[str, Any]) -> dict[str, Any]:
+    if not initialized():
+        raise HTTPException(status_code=409, detail="Not initialized")
+    incoming = compact_pool_state(payload.get("poolState") or payload)
+    incoming["pollingMinutes"] = 5
+    existing = get_setting("pool_state", {})
+    existing.update(incoming)
+    set_setting("pool_state", existing)
     return {"ok": True, "state": current_state()}
 
 

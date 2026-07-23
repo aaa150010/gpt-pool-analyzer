@@ -22,54 +22,39 @@ for (name, size) in entries {
     image.lockFocus()
 
     let rect = NSRect(x: 0, y: 0, width: size, height: size)
-    let corner = CGFloat(size) * 0.22
-    let path = NSBezierPath(roundedRect: rect.insetBy(dx: CGFloat(size) * 0.035, dy: CGFloat(size) * 0.035), xRadius: corner, yRadius: corner)
+    let inset = CGFloat(size) * 0.045
+    let corner = CGFloat(size) * 0.24
+    let path = NSBezierPath(roundedRect: rect.insetBy(dx: inset, dy: inset), xRadius: corner, yRadius: corner)
 
     let gradient = NSGradient(colors: [
-        NSColor(calibratedRed: 0.02, green: 0.64, blue: 0.74, alpha: 1),
-        NSColor(calibratedRed: 0.06, green: 0.33, blue: 0.90, alpha: 1)
+        NSColor(calibratedRed: 0.10, green: 0.45, blue: 0.98, alpha: 1),
+        NSColor(calibratedRed: 0.00, green: 0.68, blue: 0.58, alpha: 1)
     ])!
-    gradient.draw(in: path, angle: 45)
+    gradient.draw(in: path, angle: -35)
 
-    NSColor.white.withAlphaComponent(0.16).setStroke()
-    path.lineWidth = max(1, CGFloat(size) * 0.018)
+    NSColor.white.withAlphaComponent(0.26).setStroke()
+    path.lineWidth = max(1, CGFloat(size) * 0.02)
     path.stroke()
 
-    let title = "GPT"
-    let titleSize = CGFloat(size) * 0.23
-    let attrs: [NSAttributedString.Key: Any] = [
-        .font: NSFont.boldSystemFont(ofSize: titleSize),
-        .foregroundColor: NSColor.white
-    ]
-    let textSize = title.size(withAttributes: attrs)
-    title.draw(at: NSPoint(x: (CGFloat(size) - textSize.width) / 2, y: CGFloat(size) * 0.66), withAttributes: attrs)
+    let panel = NSRect(x: CGFloat(size) * 0.20, y: CGFloat(size) * 0.23, width: CGFloat(size) * 0.60, height: CGFloat(size) * 0.54)
+    let panelPath = NSBezierPath(roundedRect: panel, xRadius: CGFloat(size) * 0.055, yRadius: CGFloat(size) * 0.055)
+    NSColor.white.withAlphaComponent(0.94).setFill()
+    panelPath.fill()
 
-    let lensCenter = NSPoint(x: CGFloat(size) * 0.38, y: CGFloat(size) * 0.36)
-    let lensRadius = CGFloat(size) * 0.13
-    let lensRect = NSRect(
-        x: lensCenter.x - lensRadius,
-        y: lensCenter.y - lensRadius,
-        width: lensRadius * 2,
-        height: lensRadius * 2
-    )
-    let lens = NSBezierPath(ovalIn: lensRect)
-    NSColor.white.withAlphaComponent(0.92).setStroke()
-    lens.lineWidth = max(2, CGFloat(size) * 0.035)
-    lens.stroke()
-
-    let handle = NSBezierPath()
-    handle.move(to: NSPoint(x: lensCenter.x + lensRadius * 0.72, y: lensCenter.y - lensRadius * 0.72))
-    handle.line(to: NSPoint(x: CGFloat(size) * 0.58, y: CGFloat(size) * 0.16))
-    handle.lineWidth = max(2, CGFloat(size) * 0.04)
-    handle.lineCapStyle = .round
-    handle.stroke()
+    NSColor(calibratedRed: 0.10, green: 0.45, blue: 0.98, alpha: 0.18).setFill()
+    for index in 0..<3 {
+        let y = panel.minY + CGFloat(size) * (0.12 + CGFloat(index) * 0.12)
+        let row = NSBezierPath(roundedRect: NSRect(x: panel.minX + CGFloat(size) * 0.07, y: y, width: panel.width - CGFloat(size) * 0.14, height: CGFloat(size) * 0.035), xRadius: CGFloat(size) * 0.018, yRadius: CGFloat(size) * 0.018)
+        row.fill()
+    }
 
     let graph = NSBezierPath()
-    graph.move(to: NSPoint(x: CGFloat(size) * 0.52, y: CGFloat(size) * 0.34))
-    graph.line(to: NSPoint(x: CGFloat(size) * 0.62, y: CGFloat(size) * 0.44))
-    graph.line(to: NSPoint(x: CGFloat(size) * 0.70, y: CGFloat(size) * 0.38))
-    graph.line(to: NSPoint(x: CGFloat(size) * 0.82, y: CGFloat(size) * 0.53))
-    NSColor.white.setStroke()
+    graph.move(to: NSPoint(x: CGFloat(size) * 0.28, y: CGFloat(size) * 0.58))
+    graph.line(to: NSPoint(x: CGFloat(size) * 0.40, y: CGFloat(size) * 0.50))
+    graph.line(to: NSPoint(x: CGFloat(size) * 0.50, y: CGFloat(size) * 0.56))
+    graph.line(to: NSPoint(x: CGFloat(size) * 0.62, y: CGFloat(size) * 0.42))
+    graph.line(to: NSPoint(x: CGFloat(size) * 0.72, y: CGFloat(size) * 0.48))
+    NSColor(calibratedRed: 0.05, green: 0.40, blue: 0.95, alpha: 1).setStroke()
     graph.lineWidth = max(2, CGFloat(size) * 0.042)
     graph.lineCapStyle = .round
     graph.lineJoinStyle = .round
@@ -77,13 +62,14 @@ for (name, size) in entries {
 
     let dotRadius = CGFloat(size) * 0.035
     for point in [
-        NSPoint(x: CGFloat(size) * 0.52, y: CGFloat(size) * 0.34),
-        NSPoint(x: CGFloat(size) * 0.62, y: CGFloat(size) * 0.44),
-        NSPoint(x: CGFloat(size) * 0.70, y: CGFloat(size) * 0.38),
-        NSPoint(x: CGFloat(size) * 0.82, y: CGFloat(size) * 0.53)
+        NSPoint(x: CGFloat(size) * 0.28, y: CGFloat(size) * 0.58),
+        NSPoint(x: CGFloat(size) * 0.40, y: CGFloat(size) * 0.50),
+        NSPoint(x: CGFloat(size) * 0.50, y: CGFloat(size) * 0.56),
+        NSPoint(x: CGFloat(size) * 0.62, y: CGFloat(size) * 0.42),
+        NSPoint(x: CGFloat(size) * 0.72, y: CGFloat(size) * 0.48)
     ] {
         let dotRect = NSRect(x: point.x - dotRadius, y: point.y - dotRadius, width: dotRadius * 2, height: dotRadius * 2)
-        NSColor.white.setFill()
+        NSColor(calibratedRed: 0.00, green: 0.70, blue: 0.55, alpha: 1).setFill()
         NSBezierPath(ovalIn: dotRect).fill()
     }
 
