@@ -80,4 +80,6 @@ gh release create "$TAG" \
     --title "GPT分析器 $VERSION" \
     --notes-file RELEASE_NOTES.md
 
+rm -rf "$PROJECT_DIR/build/GPT分析器.app" "$PROJECT_DIR/build/dmg-stage"
+
 echo "Release $TAG is available at https://github.com/$REPOSITORY/releases/tag/$TAG"
