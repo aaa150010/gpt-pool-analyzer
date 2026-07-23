@@ -1,9 +1,11 @@
 import asyncio
 import json
 import os
+import smtplib
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
@@ -167,6 +169,23 @@ def compact_pool_state(raw: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
+def normalize_pool_credentials(raw: dict[str, Any]) -> dict[str, str]:
+    return {
+        "email": str(raw.get("email") or "").strip(),
+        "password": str(raw.get("password") or "").strip(),
+    }
+
+
+def normalize_smtp_settings(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "host": str(raw.get("host") or "smtp.qq.com").strip(),
+        "port": flexible_int(raw.get("port"), 465),
+        "username": str(raw.get("username") or "").strip(),
+        "password": str(raw.get("password") or "").strip(),
+        "recipient": str(raw.get("recipient") or "").strip(),
+    }
+
+
 def insert_balance_snapshot(snapshot: dict[str, Any]) -> None:
     with connect() as conn:
         conn.execute(
@@ -248,6 +267,63 @@ def insert_pool_snapshot(snapshot: dict[str, Any]) -> None:
                 *values,
             ),
         )
+
+
+def warning_dedup_seen(key: str) -> bool:
+    values = get_setting("pool_warning_dedup", [])
+    if key in values:
+        return True
+    values.append(key)
+    set_setting("pool_warning_dedup", values[-500:])
+    return False
+
+
+def send_warning_email(subject: str, body: str) -> None:
+    settings = normalize_smtp_settings(get_setting("smtp_settings", {}))
+    if not settings["recipient"] or not settings["host"] or not settings["username"] or not settings["password"]:
+        set_setting("last_warning_email_error", {"time": utc_now(), "message": "smtp settings incomplete"})
+        return
+
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = settings["username"]
+    message["To"] = settings["recipient"]
+    message.set_content(body)
+    try:
+        with smtplib.SMTP_SSL(settings["host"], int(settings["port"]), timeout=20) as smtp:
+            smtp.login(settings["username"], settings["password"])
+            smtp.send_message(message)
+        set_setting("last_warning_email", {"time": utc_now(), "subject": subject, "recipient": settings["recipient"]})
+    except Exception as exc:
+        set_setting("last_warning_email_error", {"time": utc_now(), "message": str(exc)})
+
+
+def check_pool_drop_warning(snapshot: dict[str, Any]) -> None:
+    group_name = snapshot.get("groupName") or snapshot.get("group_name") or ""
+    snapshot_time = parse_time(snapshot.get("date")) or datetime.now(timezone.utc)
+    snapshot_date = snapshot_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    window_start = (snapshot_time - timedelta(minutes=10)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with connect() as conn:
+        baseline = conn.execute(
+            """
+            SELECT total FROM pool_history
+            WHERE group_name = ? AND date >= ? AND date < ?
+            ORDER BY date ASC, id ASC LIMIT 1
+            """,
+            (group_name, window_start, snapshot_date),
+        ).fetchone()
+    if not baseline:
+        return
+    drop = flexible_int(baseline["total"]) - flexible_int(snapshot.get("total"))
+    if drop <= 100:
+        return
+    minute_key = int(snapshot_time.timestamp() / 60)
+    dedup_key = f"{group_name}:{minute_key}"
+    if warning_dedup_seen(dedup_key):
+        return
+    body = f"{group_name} 10 分钟内减少 {drop} 个账号（{baseline['total']} -> {snapshot.get('total')}）。"
+    set_setting("last_pool_warning", {"time": snapshot_date, "message": body})
+    send_warning_email("GPT分析器掉号预警", body)
 
 
 def insert_cost_addition(item: dict[str, Any]) -> None:
@@ -469,8 +545,9 @@ async def poll_pools(client: httpx.AsyncClient) -> None:
     pool_state["availableGroups"] = [item.get("group_name") for item in summaries if item.get("group_name")]
     set_setting("pool_state", pool_state)
     for summary in summaries:
-        group_name = summary.get("group_name") or ""
-        insert_pool_snapshot(pool_snapshot_from_summary(summary))
+        snapshot = pool_snapshot_from_summary(summary)
+        insert_pool_snapshot(snapshot)
+        check_pool_drop_warning(snapshot)
 
 
 async def poll_once() -> None:
@@ -578,6 +655,46 @@ async def update_balance_accounts(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="no valid accounts")
     set_setting("balance_accounts", normalized)
     return {"ok": True, "count": len(normalized)}
+
+
+@app.get(f"{API_PREFIX}/pool-credentials")
+async def get_pool_credentials() -> dict[str, Any]:
+    if not initialized():
+        raise HTTPException(status_code=409, detail="Not initialized")
+    return {"credentials": normalize_pool_credentials(get_setting("pool_credentials", {}))}
+
+
+@app.put(f"{API_PREFIX}/pool-credentials")
+async def update_pool_credentials(payload: dict[str, Any]) -> dict[str, Any]:
+    if not initialized():
+        raise HTTPException(status_code=409, detail="Not initialized")
+    credentials = normalize_pool_credentials(payload.get("credentials") or payload)
+    if not credentials["email"] or not credentials["password"]:
+        raise HTTPException(status_code=400, detail="credentials required")
+    set_setting("pool_credentials", credentials)
+    set_setting("pool_access_token", "")
+    return {"ok": True}
+
+
+@app.get(f"{API_PREFIX}/smtp-settings")
+async def get_smtp_settings() -> dict[str, Any]:
+    if not initialized():
+        raise HTTPException(status_code=409, detail="Not initialized")
+    return {"settings": normalize_smtp_settings(get_setting("smtp_settings", {}))}
+
+
+@app.put(f"{API_PREFIX}/smtp-settings")
+async def update_smtp_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    if not initialized():
+        raise HTTPException(status_code=409, detail="Not initialized")
+    settings = normalize_smtp_settings(payload.get("settings") or payload)
+    if not settings["recipient"]:
+        raise HTTPException(status_code=400, detail="recipient required")
+    set_setting("smtp_settings", settings)
+    pool_state = get_setting("pool_state", {})
+    pool_state["warningEmail"] = settings["recipient"]
+    set_setting("pool_state", pool_state)
+    return {"ok": True}
 
 
 @app.put(f"{API_PREFIX}/stored-state")

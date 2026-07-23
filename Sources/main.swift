@@ -284,6 +284,22 @@ struct BalanceAccountsUpdateResponse: Codable {
     var count: Int?
 }
 
+struct SMTPSettingsResponse: Codable {
+    var settings: SMTPSettings
+}
+
+struct SMTPSettingsPayload: Codable {
+    var settings: SMTPSettings
+}
+
+struct PoolCredentialsResponse: Codable {
+    var credentials: PoolCredentials
+}
+
+struct PoolCredentialsPayload: Codable {
+    var credentials: PoolCredentials
+}
+
 enum PoolTrendMetric: Int, CaseIterable {
     case remaining5h
     case remaining7d
@@ -2685,6 +2701,126 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }.resume()
     }
 
+    private func fetchSMTPSettingsFromServer(completion: @escaping (Result<SMTPSettings, Error>) -> Void) {
+        guard let url = URL(string: "\(analyzerServerBaseURL)/smtp-settings") else {
+            completion(.failure(AppError("服务器地址无效。")))
+            return
+        }
+        URLSession.shared.dataTask(with: url) { data, response, error in
+            DispatchQueue.main.async {
+                if let error {
+                    completion(.failure(error))
+                    return
+                }
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard (200..<300).contains(statusCode), let data else {
+                    completion(.failure(AppError("HTTP \(statusCode)")))
+                    return
+                }
+                do {
+                    let decoded = try JSONDecoder().decode(SMTPSettingsResponse.self, from: data)
+                    completion(.success(decoded.settings))
+                } catch {
+                    completion(.failure(error))
+                }
+            }
+        }.resume()
+    }
+
+    private func saveSMTPSettingsToServer(_ settings: SMTPSettings) {
+        guard let url = URL(string: "\(analyzerServerBaseURL)/smtp-settings") else {
+            showError("服务器地址无效。")
+            return
+        }
+        guard let body = try? serverEncoder().encode(SMTPSettingsPayload(settings: settings)) else {
+            showError("预警设置编码失败。")
+            return
+        }
+        showFeedback("正在保存服务器预警设置...", color: .white, autoHide: false)
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let error {
+                    self.showError("服务器预警设置保存失败：\(error.localizedDescription)")
+                    return
+                }
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard (200..<300).contains(statusCode) else {
+                    self.showError("服务器预警设置保存失败：HTTP \(statusCode)")
+                    return
+                }
+                self.showFeedback("服务器掉号预警设置已保存。", color: .systemGreen)
+                self.fetchServerState(manual: false)
+            }
+        }.resume()
+    }
+
+    private func fetchPoolCredentialsFromServer(completion: @escaping (Result<PoolCredentials?, Error>) -> Void) {
+        guard let url = URL(string: "\(analyzerServerBaseURL)/pool-credentials") else {
+            completion(.failure(AppError("服务器地址无效。")))
+            return
+        }
+        URLSession.shared.dataTask(with: url) { data, response, error in
+            DispatchQueue.main.async {
+                if let error {
+                    completion(.failure(error))
+                    return
+                }
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard (200..<300).contains(statusCode), let data else {
+                    completion(.failure(AppError("HTTP \(statusCode)")))
+                    return
+                }
+                do {
+                    let decoded = try JSONDecoder().decode(PoolCredentialsResponse.self, from: data)
+                    let credentials = decoded.credentials.email.isEmpty ? nil : decoded.credentials
+                    completion(.success(credentials))
+                } catch {
+                    completion(.failure(error))
+                }
+            }
+        }.resume()
+    }
+
+    private func savePoolCredentialsToServer(_ credentials: PoolCredentials) {
+        guard let url = URL(string: "\(analyzerServerBaseURL)/pool-credentials") else {
+            showError("服务器地址无效。")
+            return
+        }
+        guard let body = try? serverEncoder().encode(PoolCredentialsPayload(credentials: credentials)) else {
+            showError("接口账号编码失败。")
+            return
+        }
+        showFeedback("正在保存服务器接口账号...", color: .white, autoHide: false)
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let error {
+                    self.showError("服务器接口账号保存失败：\(error.localizedDescription)")
+                    return
+                }
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard (200..<300).contains(statusCode) else {
+                    self.showError("服务器接口账号保存失败：HTTP \(statusCode)")
+                    return
+                }
+                self.poolAccessToken = nil
+                self.poolRefreshToken = nil
+                self.savePoolState()
+                self.showFeedback("服务器接口账号已保存。", color: .systemGreen)
+                self.refreshServerData(manual: true)
+            }
+        }.resume()
+    }
+
     private func exportBalanceAccounts(masked: Bool) {
         let payload = balanceAccounts.map {
             [
@@ -2958,10 +3094,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func editWarningSettings() {
-        let existing = loadSMTPSettings() ?? smtpSettings
+        showFeedback("正在读取服务器预警设置...", color: .white, autoHide: false)
+        fetchSMTPSettingsFromServer { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let settings):
+                self.smtpSettings = settings
+                self.presentWarningSettingsEditor(existing: settings)
+            case .failure(let error):
+                self.showError("服务器预警设置读取失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func presentWarningSettingsEditor(existing: SMTPSettings) {
         let alert = NSAlert()
         alert.messageText = "掉号预警设置"
-        alert.informativeText = "QQ 邮箱 SMTP：进入 QQ 邮箱网页版 -> 设置 -> 账号 -> POP3/IMAP/SMTP 服务，开启后生成授权码。服务器 smtp.qq.com，端口 465，密码填授权码。"
+        alert.informativeText = "配置保存在服务器，由服务器定时轮询时发送掉号预警。QQ 邮箱密码填 SMTP 授权码。"
         alert.addButton(withTitle: "保存")
         alert.addButton(withTitle: "取消")
 
@@ -3000,9 +3149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             password: passwordField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
             recipient: normalizedEmail(recipientField.stringValue)
         )
-        _ = saveSMTPSettings(smtpSettings)
-        savePoolState()
-        showFeedback("掉号预警设置已保存。", color: .systemGreen)
+        saveSMTPSettingsToServer(smtpSettings)
     }
 
     @objc private func selectPoolGroups() {
@@ -3011,7 +3158,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func editPoolCredentials() {
-        _ = promptForPoolCredentials(force: true)
+        showFeedback("正在读取服务器接口账号...", color: .white, autoHide: false)
+        fetchPoolCredentialsFromServer { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let credentials):
+                self.presentPoolCredentialsEditor(existing: credentials)
+            case .failure(let error):
+                self.showError("服务器接口账号读取失败：\(error.localizedDescription)")
+            }
+        }
     }
 
     @objc private func poolPollingChanged() {
@@ -3257,9 +3413,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func promptForPoolCredentials(force: Bool) -> PoolCredentials? {
-        let existing = loadPoolCredentials()
+        presentPoolCredentialsEditor(existing: nil, title: force ? "设置接口账号" : "首次使用接口同步")
+        return nil
+    }
+
+    private func presentPoolCredentialsEditor(existing: PoolCredentials?, title: String = "设置接口账号") {
         let alert = NSAlert()
-        alert.messageText = force ? "设置接口账号" : "首次使用接口同步"
+        alert.messageText = title
         alert.informativeText = ""
         alert.addButton(withTitle: "保存")
         alert.addButton(withTitle: "取消")
@@ -3272,7 +3432,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             field.widthAnchor.constraint(equalToConstant: 320).isActive = true
             field.heightAnchor.constraint(equalToConstant: 28).isActive = true
         }
-        let tip = NSTextField(wrappingLabelWithString: "账号密码只保存在本机 macOS 钥匙串，用于 token 失效后自动重新登录。")
+        let tip = NSTextField(wrappingLabelWithString: "账号密码保存在服务器，用于服务器定时请求平台账号池接口。本机不再保存到钥匙串。")
         tip.font = .systemFont(ofSize: 12, weight: .medium)
         tip.textColor = .secondaryLabelColor
         tip.maximumNumberOfLines = 2
@@ -3295,7 +3455,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         ])
         alert.accessoryView = container
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
         var email = emailField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if !email.contains("@"), !email.isEmpty {
             email += "@qq.com"
@@ -3303,18 +3463,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let password = passwordField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !email.isEmpty, !password.isEmpty else {
             showError("接口账号和密码不能为空。")
-            return nil
+            return
         }
         let credentials = PoolCredentials(email: email, password: password)
-        if savePoolCredentials(credentials) {
-            poolAccessToken = nil
-            poolRefreshToken = nil
-            savePoolState()
-            showFeedback("接口账号已保存到本机钥匙串。", color: .systemGreen)
-        } else {
-            showFeedback("钥匙串保存失败，请稍后重试。", color: .systemRed)
-        }
-        return credentials
+        savePoolCredentialsToServer(credentials)
     }
 
     private static func apiErrorMessage(from data: Data?) -> String? {
@@ -4614,7 +4766,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if tableView == comparisonTable {
             guard let initial, let latest = history.last else { return container }
             let end = row < latest.amounts.count ? latest.amounts[row] : 0
-            let accounts = initial.accounts ?? latest.accounts ?? []
+            let accounts = latest.accounts ?? initial.accounts ?? []
             let account = row < accounts.count ? accounts[row] : "账号 \(row + 1)"
             switch identifier {
             case "index":
@@ -5121,7 +5273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         availablePoolGroups = state.availableGroups ?? ["PLUS共享号池", "K12共享号池"]
         poolPollingMinutes = normalizedPollingMinutes(state.pollingMinutes ?? defaultPollingMinutes)
         poolPollingField.stringValue = money(poolPollingMinutes)
-        smtpSettings = loadSMTPSettings() ?? SMTPSettings(
+        smtpSettings = SMTPSettings(
             host: SMTPSettings.default.host,
             port: SMTPSettings.default.port,
             username: "",
