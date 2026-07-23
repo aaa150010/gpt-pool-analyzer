@@ -942,6 +942,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         restartPoolPollingTimer()
         restartBalancePollingTimer()
         fetchServerState(manual: false)
+        scheduleStartupUpdateCheck()
+    }
+
+    private func scheduleStartupUpdateCheck() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.updaterController.updater.checkForUpdatesInBackground()
+        }
     }
 
     private func activateExistingInstanceIfNeeded() -> Bool {
