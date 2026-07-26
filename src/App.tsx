@@ -62,7 +62,7 @@ import { Label } from "./components/ui/label";
 import { Textarea } from "./components/ui/textarea";
 
 const defaultStored: StoredState = {
-  cost: 0,
+  cost: 518,
   partnerCost: 0,
   withdrawalAmount: 0,
   useBaseDeduction: false,
@@ -636,7 +636,9 @@ function CostView({
       <Card>
         <CardContent className="grid grid-cols-[repeat(4,minmax(120px,1fr))_auto] items-end gap-3 p-4">
           <Field label="星星出资">
-            <Input value={stored.cost ?? 0} onChange={(event) => updateStoredField({ cost: parseMoney(event.target.value) })} />
+            <div className="flex h-9 items-center rounded-md border border-border bg-muted px-3 text-sm font-black">
+              {formatMoney(totalCost)}
+            </div>
           </Field>
           <Field label="社会哥出资">
             <Input value={stored.partnerCost ?? 0} onChange={(event) => updateStoredField({ partnerCost: parseMoney(event.target.value) })} />
