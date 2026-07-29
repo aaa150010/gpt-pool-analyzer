@@ -1,4 +1,5 @@
 import { AnimatePresence, motion, useMotionValue, useSpring, useTransform } from "framer-motion";
+import * as TooltipPrimitive from "@radix-ui/react-tooltip";
 import {
   Activity,
   AlertTriangle,
@@ -751,7 +752,9 @@ function DeathTimingAnalysis({
   capacityRisk: PoolAnalyticsResponse["risk"]["level"];
 }) {
   const timeline = new Map(analysis.timeline.map((item) => [`${item.date}-${item.hour}`, item]));
-  const maxErrors = Math.max(...analysis.timeline.map((item) => item.newErrors), 1);
+  const maxRemovals = Math.max(...analysis.timeline.map((item) => item.inferredAccountRemovals), 1);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [hoveredKey, setHoveredKey] = useState<string | null>(null);
   const recent = analysis.recentErrorTrend;
   const totals = analysis.daily.reduce(
     (sum, row) => ({
@@ -770,6 +773,23 @@ function DeathTimingAnalysis({
   }[timing.level];
   const decision = replenishmentDecision(recommendation, timing.action, capacityRisk);
   const currentDate = analysis.daily.at(-1)?.date;
+  const heatTargets = analysis.daily.flatMap((day) => Array.from({ length: 24 }, (_, hour) => ({
+    date: day.date,
+    hour,
+    cell: timeline.get(`${day.date}-${hour}`),
+    current: day.date === currentDate && hour === timing.evaluatedHour,
+  })));
+  const currentTarget = heatTargets.find((target) => target.current);
+  const currentHourNewErrors = timing.currentHourNewErrors ?? currentTarget?.cell?.newErrors ?? 0;
+  const currentHourRemovals = timing.currentHourRemovals ?? currentTarget?.cell?.inferredAccountRemovals ?? 0;
+  const currentHourLikelyErrorDeaths = timing.currentHourLikelyErrorDeaths ?? currentTarget?.cell?.likelyErrorDeaths ?? 0;
+  const currentHourSampleCount = timing.currentHourSampleCount ?? currentTarget?.cell?.sampleCount ?? 0;
+  const currentHourObservedMinutes = timing.currentHourObservedMinutes ?? currentTarget?.cell?.observedMinutes ?? 0;
+  const currentHourLastSnapshotAt = timing.currentHourLastSnapshotAt ?? currentTarget?.cell?.lastSnapshotAt ?? analysis.lastSnapshotAt;
+  const activeSelectedKey = selectedKey ?? (currentTarget ? heatCellKey(currentTarget.date, currentTarget.hour) : null);
+  const selected = activeSelectedKey ? heatTargets.find((target) => heatCellKey(target.date, target.hour) === activeSelectedKey) : undefined;
+  const hovered = hoveredKey ? heatTargets.find((target) => heatCellKey(target.date, target.hour) === hoveredKey) : undefined;
+  const detailTarget = hovered ?? selected;
 
   return (
     <div className="grid grid-cols-[minmax(0,1fr)_300px] gap-3">
@@ -780,9 +800,11 @@ function DeathTimingAnalysis({
             <div className="mt-0.5 text-xs font-semibold text-muted-foreground">基于 {analysis.snapshotCount} 条快照的新增错误与账号删除推断</div>
           </div>
           <div className="flex shrink-0 items-center gap-1.5 text-xs font-bold text-muted-foreground">
-            <span className="h-2.5 w-2.5 bg-rose-100" />
-            <span className="h-2.5 w-2.5 bg-rose-300" />
-            <span className="h-2.5 w-2.5 bg-rose-600" />
+            <span className="h-2.5 w-2.5 bg-orange-100" />
+            <span className="h-2.5 w-2.5 bg-orange-300" />
+            <span className="h-2.5 w-2.5 bg-orange-600" />
+            删除热度
+            <span className="ml-1 h-1.5 w-1.5 rounded-full bg-rose-600" />
             新增错误
           </div>
         </div>
@@ -794,13 +816,14 @@ function DeathTimingAnalysis({
           <DeathStat label="连续上升" value={recent.isContinuouslyRising ? "是" : "否"} alert={recent.isContinuouslyRising} />
         </div>
 
-        <div className="overflow-x-auto">
-          <div className="grid min-w-[750px] grid-cols-[54px_repeat(24,minmax(22px,1fr))_44px] gap-1">
+        <TooltipPrimitive.Provider delayDuration={120} skipDelayDuration={60}>
+          <div className="overflow-x-auto">
+            <div className="grid min-w-[750px] grid-cols-[54px_repeat(24,minmax(22px,1fr))_44px] gap-1">
             <div className="self-end pb-1 text-[10px] font-bold text-muted-foreground">日期</div>
             {Array.from({ length: 24 }, (_, hour) => (
               <div key={hour} className="pb-1 text-center text-[9px] font-bold text-muted-foreground">{String(hour).padStart(2, "0")}</div>
             ))}
-            <div className="self-end pb-1 text-right text-[10px] font-bold text-muted-foreground">合计</div>
+            <div className="self-end pb-1 text-right text-[10px] font-bold text-muted-foreground">删除</div>
             {analysis.daily.flatMap((day) => {
               const cells = Array.from({ length: 24 }, (_, hour) => timeline.get(`${day.date}-${hour}`));
               return [
@@ -810,18 +833,30 @@ function DeathTimingAnalysis({
                 ...cells.map((cell, hour) => (
                   <DeathHeatCell
                     key={`${day.date}-${hour}`}
+                    date={day.date}
+                    hour={hour}
                     cell={cell}
-                    maxErrors={maxErrors}
+                    maxRemovals={maxRemovals}
                     current={day.date === currentDate && hour === timing.evaluatedHour}
+                    selected={activeSelectedKey === heatCellKey(day.date, hour)}
+                    onSelect={() => setSelectedKey(heatCellKey(day.date, hour))}
+                    onHover={(active) => setHoveredKey(active ? heatCellKey(day.date, hour) : null)}
                   />
                 )),
-                <div key={`${day.date}-total`} className="flex h-7 items-center justify-end text-[10px] font-black text-rose-700">
-                  {formatMoney(day.newErrors, 0)}
+                <div key={`${day.date}-total`} className="flex h-7 items-center justify-end text-[10px] font-black text-orange-700">
+                  {formatMoney(day.inferredAccountRemovals, 0)}
                 </div>,
               ];
             })}
+            </div>
           </div>
-        </div>
+        </TooltipPrimitive.Provider>
+
+        <DeathHeatDetail
+          target={detailTarget}
+          source={hovered ? "悬停详情" : selectedKey ? "已选时段" : "当前时段"}
+          lastSnapshotAt={analysis.lastSnapshotAt}
+        />
 
         <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 border-t border-border pt-3 text-xs font-semibold text-muted-foreground">
           <span>7 天新增错误 <strong className="text-rose-600">{formatMoney(totals.newErrors, 0)}</strong></span>
@@ -843,8 +878,22 @@ function DeathTimingAnalysis({
         </div>
         <div className="mt-4 border-t border-current/15 pt-3 text-xs font-semibold leading-5">
           <div>当前时段：{timing.hourLabel}</div>
-          <div>同时段新增错误：{formatMoney(timing.newErrors, 0)}</div>
-          <div>同时段账号删除：{formatMoney(timing.inferredAccountRemovals, 0)}</div>
+          <div>实时更新至：{formatDateTime(currentHourLastSnapshotAt)}</div>
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <div className="rounded border border-current/15 bg-white/45 px-2 py-1.5">
+              <div className="text-[10px]">本小时已删除</div>
+              <div className="text-lg font-black text-orange-700">{formatMoney(currentHourRemovals, 0)}</div>
+            </div>
+            <div className="rounded border border-current/15 bg-white/45 px-2 py-1.5">
+              <div className="text-[10px]">本小时新增错误</div>
+              <div className="text-lg font-black text-rose-700">{formatMoney(currentHourNewErrors, 0)}</div>
+            </div>
+          </div>
+          <div className="mt-2">其中疑似错误后死亡：{formatMoney(currentHourLikelyErrorDeaths, 0)}</div>
+          <div>有效采样：{currentHourSampleCount} 条 · 覆盖 {formatMoney(currentHourObservedMinutes, 0)} 分钟</div>
+          <div className="mt-2 border-t border-current/15 pt-2 font-black">近 7 天相同时段累计</div>
+          <div>新增错误：{formatMoney(timing.newErrors, 0)}</div>
+          <div>账号删除：{formatMoney(timing.inferredAccountRemovals, 0)}</div>
           <div>时机置信度：{confidenceLabel(timing.confidence)}</div>
           <div>历史高发：{formatHourList(timing.peakHours)}</div>
           <div>建议时段：{formatHourList(timing.suggestedHours)}</div>
@@ -863,25 +912,149 @@ function DeathStat({ label, value, alert = false }: { label: string; value: stri
   );
 }
 
-function DeathHeatCell({ cell, maxErrors, current }: { cell?: DeathTimelineHour; maxErrors: number; current: boolean }) {
+function heatCellKey(date: string, hour: number) {
+  return `${date}-${hour}`;
+}
+
+function deathHourLabel(hour: number) {
+  return `${String(hour).padStart(2, "0")}:00-${String((hour + 1) % 24).padStart(2, "0")}:00`;
+}
+
+function deathCellAriaLabel(date: string, hour: number, cell: DeathTimelineHour | undefined, current: boolean) {
+  const prefix = `${date} ${cell?.label ?? deathHourLabel(hour)}`;
+  if (!cell?.observed) return `${prefix}，无有效采样，点击查看说明`;
+  return `${prefix}，账号删除 ${formatMoney(cell.inferredAccountRemovals, 0)}，新增错误 ${formatMoney(cell.newErrors, 0)}，时末错误 ${formatMoney(cell.endingErrors, 0)}，采样 ${cell.sampleCount} 条，覆盖 ${formatMoney(cell.coverage * 100, 0)}%${current ? "，当前小时进行中" : ""}，点击固定详情`;
+}
+
+function DeathHeatCell({
+  date,
+  hour,
+  cell,
+  maxRemovals,
+  current,
+  selected,
+  onSelect,
+  onHover,
+}: {
+  date: string;
+  hour: number;
+  cell?: DeathTimelineHour;
+  maxRemovals: number;
+  current: boolean;
+  selected: boolean;
+  onSelect: () => void;
+  onHover: (active: boolean) => void;
+}) {
   const className = !cell?.observed
     ? "bg-slate-100 text-slate-400"
-    : cell.newErrors <= 0
+    : cell.inferredAccountRemovals <= 0
       ? "bg-emerald-50 text-emerald-700"
-      : cell.newErrors / maxErrors >= 0.75
-        ? "bg-rose-600 text-white"
-        : cell.newErrors / maxErrors >= 0.45
-          ? "bg-rose-300 text-rose-950"
-          : "bg-rose-100 text-rose-800";
-  const title = cell
-    ? `${cell.date} ${cell.label}\n新增错误 ${cell.newErrors}\n时末错误 ${formatMoney(cell.endingErrors, 0)}\n账号删除 ${cell.inferredAccountRemovals}\n采样覆盖 ${formatMoney(cell.coverage * 100, 0)}%`
-    : "无数据";
+      : cell.inferredAccountRemovals / maxRemovals >= 0.75
+        ? "bg-orange-600 text-white"
+        : cell.inferredAccountRemovals / maxRemovals >= 0.45
+          ? "bg-orange-300 text-orange-950"
+          : "bg-orange-100 text-orange-800";
   return (
-    <div
-      title={title}
-      className={cn("flex h-7 items-center justify-center text-[10px] font-black", className, current && "ring-2 ring-blue-600 ring-offset-1")}
-    >
-      {!cell?.observed ? "--" : cell.newErrors || ""}
+    <TooltipPrimitive.Root>
+      <TooltipPrimitive.Trigger asChild>
+        <button
+          type="button"
+          aria-label={deathCellAriaLabel(date, hour, cell, current)}
+          aria-pressed={selected}
+          onClick={onSelect}
+          onMouseEnter={() => onHover(true)}
+          onMouseLeave={() => onHover(false)}
+          onFocus={() => onHover(true)}
+          onBlur={() => onHover(false)}
+          className={cn(
+            "relative flex h-7 min-w-0 items-center justify-center text-[10px] font-black outline-none transition-[box-shadow,transform] hover:z-10 hover:scale-110 focus-visible:z-10 focus-visible:ring-2 focus-visible:ring-blue-600 focus-visible:ring-offset-1",
+            className,
+            current && "ring-2 ring-blue-600 ring-offset-1",
+            selected && "z-10 ring-2 ring-slate-950 ring-offset-1",
+          )}
+        >
+          {!cell?.observed ? "--" : cell.inferredAccountRemovals || ""}
+          {cell?.observed && cell.newErrors > 0 && <span aria-label={`新增错误 ${formatMoney(cell.newErrors, 0)}`} className="absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-rose-600 ring-1 ring-white" />}
+        </button>
+      </TooltipPrimitive.Trigger>
+      <TooltipPrimitive.Portal>
+        <TooltipPrimitive.Content
+          side="top"
+          sideOffset={7}
+          collisionPadding={12}
+          className="z-50 max-w-64 rounded-md border border-slate-700 bg-slate-950 px-2.5 py-2 text-[11px] font-semibold leading-4 text-slate-100 shadow-xl"
+        >
+          <div className="font-black text-white">{date} {cell?.label ?? deathHourLabel(hour)}</div>
+          {!cell?.observed ? (
+            <div className="mt-1 text-slate-300">无有效采样</div>
+          ) : (
+            <>
+              <div className="mt-1">账号删除 <strong className="text-orange-300">{formatMoney(cell.inferredAccountRemovals, 0)}</strong> · 新增错误 <strong className="text-rose-300">{formatMoney(cell.newErrors, 0)}</strong></div>
+              <div className="text-slate-300">{cell.sampleCount} 条快照 · 覆盖 {formatMoney(cell.observedMinutes, 0)} 分钟（{formatMoney(cell.coverage * 100, 0)}%）</div>
+              {current && <div className="mt-1 font-bold text-blue-300">当前小时进行中，数字会继续累计</div>}
+            </>
+          )}
+          <TooltipPrimitive.Arrow className="fill-slate-950" />
+        </TooltipPrimitive.Content>
+      </TooltipPrimitive.Portal>
+    </TooltipPrimitive.Root>
+  );
+}
+
+function DeathHeatDetail({
+  target,
+  source,
+  lastSnapshotAt,
+}: {
+  target?: { date: string; hour: number; cell?: DeathTimelineHour; current: boolean };
+  source: string;
+  lastSnapshotAt: string | null;
+}) {
+  if (!target) {
+    return (
+      <div className="mt-3 rounded-md border border-dashed border-border bg-muted/35 px-3 py-2 text-xs font-semibold text-muted-foreground">
+        悬停或点击任意时段格查看新增错误、删除推断、采样和覆盖详情。
+      </div>
+    );
+  }
+  const { cell, date, hour, current } = target;
+  const label = cell?.label ?? deathHourLabel(hour);
+  return (
+    <div className={cn("mt-3 rounded-md border px-3 py-2.5", cell?.observed ? "border-slate-200 bg-slate-50" : "border-slate-200 bg-slate-50/60")}>
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+        <div className="text-xs font-black text-foreground">{source}：{date} {label}</div>
+        {current && <span className="rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[10px] font-black text-blue-700">当前小时进行中</span>}
+      </div>
+      {current && <div className="mt-1 text-[10px] font-semibold text-muted-foreground">本地最后快照更新：{formatDateTime(lastSnapshotAt)}</div>}
+      {!cell?.observed ? (
+        <p className="mt-1.5 text-xs font-semibold leading-5 text-muted-foreground">该时段没有有效快照或覆盖区间，不能据此判断是否存在杀号。</p>
+      ) : (
+        <>
+          <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs sm:grid-cols-3 lg:grid-cols-4">
+            <DeathDetailMetric label="账号删除" value={formatMoney(cell.inferredAccountRemovals, 0)} tone="text-orange-700" />
+            <DeathDetailMetric label="新增错误" value={formatMoney(cell.newErrors, 0)} tone="text-rose-700" />
+            <DeathDetailMetric label="时末错误" value={formatMoney(cell.endingErrors, 0)} tone="text-rose-700" />
+            <DeathDetailMetric label="采样数" value={`${cell.sampleCount} 条`} />
+            <DeathDetailMetric label="覆盖时长" value={`${formatMoney(cell.observedMinutes, 0)} 分钟`} />
+            <DeathDetailMetric label="覆盖率" value={`${formatMoney(cell.coverage * 100, 0)}%`} />
+            <DeathDetailMetric label="错误后死亡推断" value={formatMoney(cell.likelyErrorDeaths, 0)} tone="text-orange-700" />
+            <DeathDetailMetric label="24h 自动删除候选" value={formatMoney(cell.autoDeletionCandidates, 0)} tone="text-violet-700" />
+            <DeathDetailMetric label="人工/未匹配删除" value={formatMoney(cell.manualOrUnmatchedCandidates, 0)} tone="text-blue-700" />
+            <DeathDetailMetric label="其他删除候选" value={formatMoney(cell.otherRemovalCandidates, 0)} />
+            <DeathDetailMetric label="账号增加" value={formatMoney(cell.accountAdditions, 0)} tone="text-emerald-700" />
+          </div>
+          {current && <p className="mt-2 text-xs font-semibold leading-5 text-blue-700">本小时尚未结束，以上是已收到快照的累计值；每次轮询后会继续更新，不会等到整点。</p>}
+        </>
+      )}
+    </div>
+  );
+}
+
+function DeathDetailMetric({ label, value, tone = "text-foreground" }: { label: string; value: string; tone?: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-[10px] font-bold text-muted-foreground">{label}</div>
+      <div className={cn("mt-0.5 truncate text-sm font-black", tone)}>{value}</div>
     </div>
   );
 }

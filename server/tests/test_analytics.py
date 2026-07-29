@@ -156,6 +156,71 @@ class RecommendationTests(unittest.TestCase):
 
 
 class DeathPatternTests(unittest.TestCase):
+    def test_current_hour_error_increase_is_available_before_hour_end(self) -> None:
+        local = analytics.SHANGHAI
+        now = datetime(2026, 7, 29, 10, 30, tzinfo=local)
+        rows = [
+            snapshot(datetime(2026, 7, 28, 10, 0, tzinfo=local), total=100, error=0),
+            snapshot(datetime(2026, 7, 28, 10, 5, tzinfo=local), total=100, error=10),
+            snapshot(datetime(2026, 7, 29, 10, 0, tzinfo=local), total=100, error=0),
+            snapshot(datetime(2026, 7, 29, 10, 5, tzinfo=local), total=100, error=20),
+        ]
+
+        analysis, risk = analytics.analyze_death_patterns(rows, now)
+        current_hour = next(
+            item
+            for item in analysis["timeline"]
+            if item["date"] == "2026-07-29" and item["hour"] == 10
+        )
+        historical_hour = next(
+            item
+            for item in analysis["timeline"]
+            if item["date"] == "2026-07-28" and item["hour"] == 10
+        )
+
+        self.assertTrue(current_hour["isCurrentHour"])
+        self.assertFalse(current_hour["isComplete"])
+        self.assertFalse(historical_hour["isCurrentHour"])
+        self.assertTrue(historical_hour["isComplete"])
+        self.assertEqual(current_hour["lastSnapshotAt"], "2026-07-29T02:05:00Z")
+        self.assertEqual(current_hour["newErrors"], 20)
+        self.assertEqual(current_hour["sampleCount"], 2)
+        self.assertEqual(current_hour["observedMinutes"], 5.0)
+        self.assertEqual(risk["newErrors"], 30)
+        self.assertEqual(risk["currentHourNewErrors"], 20)
+        self.assertEqual(risk["currentHourRemovals"], 0)
+        self.assertEqual(risk["currentHourSampleCount"], 2)
+        self.assertEqual(risk["currentHourObservedMinutes"], 5.0)
+        self.assertEqual(risk["currentHourLastSnapshotAt"], "2026-07-29T02:05:00Z")
+
+    def test_current_hour_removal_is_available_before_hour_end(self) -> None:
+        local = analytics.SHANGHAI
+        now = datetime(2026, 7, 29, 10, 30, tzinfo=local)
+        rows = [
+            snapshot(datetime(2026, 7, 28, 10, 0, tzinfo=local), total=100, error=10),
+            snapshot(datetime(2026, 7, 28, 10, 5, tzinfo=local), total=90, error=0),
+            snapshot(datetime(2026, 7, 29, 10, 0, tzinfo=local), total=100, error=20),
+            snapshot(datetime(2026, 7, 29, 10, 5, tzinfo=local), total=80, error=0),
+            snapshot(datetime(2026, 7, 29, 10, 10, tzinfo=local), total=80, error=0),
+        ]
+
+        analysis, risk = analytics.analyze_death_patterns(rows, now)
+        current_hour = next(
+            item
+            for item in analysis["timeline"]
+            if item["date"] == "2026-07-29" and item["hour"] == 10
+        )
+
+        self.assertEqual(current_hour["inferredAccountRemovals"], 20)
+        self.assertEqual(current_hour["likelyErrorDeaths"], 20)
+        self.assertEqual(risk["inferredAccountRemovals"], 30)
+        self.assertEqual(risk["currentHourNewErrors"], 0)
+        self.assertEqual(risk["currentHourRemovals"], 20)
+        self.assertEqual(risk["currentHourLikelyErrorDeaths"], 20)
+        self.assertEqual(risk["level"], "high")
+        self.assertEqual(risk["action"], "avoid")
+        self.assertTrue(any("本小时截至 10:10 已删除 20 个账号" in reason for reason in risk["reasons"]))
+
     def test_cross_day_auto_deletion_candidate_is_matched_after_24_hours(self) -> None:
         local = analytics.SHANGHAI
         rows = [

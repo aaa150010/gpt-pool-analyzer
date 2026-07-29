@@ -163,6 +163,9 @@ export type DeathTimelineHour = {
   date: string;
   hour: number;
   label: string;
+  isCurrentHour: boolean;
+  isComplete: boolean;
+  lastSnapshotAt: string | null;
   newErrors: number;
   endingErrors: number | null;
   inferredAccountRemovals: number;
@@ -233,6 +236,12 @@ export type ReplenishmentTimingRisk = {
   errorRatePercent: number | null;
   removalRatePercent: number | null;
   autoDeletionCandidates: number;
+  currentHourNewErrors: number;
+  currentHourRemovals: number;
+  currentHourLikelyErrorDeaths: number;
+  currentHourSampleCount: number;
+  currentHourObservedMinutes: number;
+  currentHourLastSnapshotAt: string | null;
   dueNextHour: number;
   recentErrorSignalLevel: PoolRisk["level"];
   reasons: string[];

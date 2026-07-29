@@ -183,6 +183,9 @@ def _empty_death_timeline_hour(local_day: date, hour: int) -> dict[str, Any]:
         "date": local_day.isoformat(),
         "hour": hour,
         "label": f"{hour:02d}:00-{(hour + 1) % 24:02d}:00",
+        "isCurrentHour": False,
+        "isComplete": False,
+        "lastSnapshotAt": None,
         "newErrors": 0,
         "endingErrors": None,
         "inferredAccountRemovals": 0,
@@ -400,6 +403,12 @@ def analyze_death_patterns(
                 rounded_errors = int(round(ending_errors))
                 daily_bucket["endingErrors"] = rounded_errors
                 timeline_bucket["endingErrors"] = rounded_errors
+            timeline_bucket["lastSnapshotAt"] = (
+                timestamp.astimezone(timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
 
     error_events: list[dict[str, Any]] = []
     removal_events: list[dict[str, Any]] = []
@@ -506,10 +515,13 @@ def analyze_death_patterns(
         for hour in range(24):
             hour_start = day_start + timedelta(hours=hour)
             hour_end = min(hour_start + timedelta(hours=1), local_now)
+            timeline_bucket = timeline[(local_day, hour)]
+            timeline_bucket["isCurrentHour"] = local_day == local_now.date() and hour == local_now.hour
+            timeline_bucket["isComplete"] = hour_start + timedelta(hours=1) <= local_now
             if hour_end > hour_start:
                 expected_seconds = (hour_end - hour_start).total_seconds()
                 hourly[hour]["_expectedSeconds"] += expected_seconds
-                timeline[(local_day, hour)]["_expectedSeconds"] = expected_seconds
+                timeline_bucket["_expectedSeconds"] = expected_seconds
 
     total_exposure_account_hours = sum(bucket["_exposureAccountHours"] for bucket in hourly)
     overall_error_rate = (
@@ -577,16 +589,33 @@ def analyze_death_patterns(
     high_cutoff = max(_percentile(scores, 0.8) if scores else 0.0, overall_score * 1.5, 0.01)
 
     current_bucket = hourly[local_now.hour]
+    current_timeline_bucket = timeline[(local_now.date(), local_now.hour)]
     confidence = _timing_confidence(current_bucket["observedDays"])
     current_score = max(float(current_bucket["errorRatePercent"] or 0), float(current_bucket["removalRatePercent"] or 0))
     signal_count = current_bucket["newErrors"] + current_bucket["inferredAccountRemovals"]
+    current_total = max(_number(current.get("total")) or 0.0, 0.0)
+    current_hour_removals = int(current_timeline_bucket["inferredAccountRemovals"])
+    live_removal_baseline = max(current_total + current_hour_removals, 1.0)
+    live_removal_share = current_hour_removals / live_removal_baseline
+    live_removal_high = (
+        current_timeline_bucket["sampleCount"] >= 3
+        and current_timeline_bucket["observedMinutes"] >= 10
+        and current_hour_removals >= max(5, math.ceil(live_removal_baseline * 0.01))
+    )
     historical_high = current_score >= high_cutoff and (signal_count >= 2 or current_score >= 0.5)
     recent_high = recent_error_trend["signalLevel"] == "high"
     recent_rising = recent_error_trend["signalLevel"] == "medium"
     reasons: list[str] = []
-    if historical_high or recent_high:
+    if live_removal_high or historical_high or recent_high:
         timing_level = "high"
         action = "avoid"
+        if live_removal_high:
+            latest_snapshot = current_timeline_bucket["lastSnapshotAt"]
+            latest_label = parse_timestamp(latest_snapshot).strftime("%H:%M") if latest_snapshot else local_now.strftime("%H:%M")
+            reasons.append(
+                f"本小时截至 {latest_label} 已删除 {current_hour_removals} 个账号，"
+                f"约占本小时开始时号池的 {round(live_removal_share * 100, 1)}%"
+            )
         if historical_high:
             reasons.append(f"过去7天 {current_bucket['label']} 是错误或移除高发时段")
         if recent_high:
@@ -667,6 +696,12 @@ def analyze_death_patterns(
         "errorRatePercent": current_bucket["errorRatePercent"],
         "removalRatePercent": current_bucket["removalRatePercent"],
         "autoDeletionCandidates": current_bucket["autoDeletionCandidates"],
+        "currentHourNewErrors": current_timeline_bucket["newErrors"],
+        "currentHourRemovals": current_timeline_bucket["inferredAccountRemovals"],
+        "currentHourLikelyErrorDeaths": current_timeline_bucket["likelyErrorDeaths"],
+        "currentHourSampleCount": current_timeline_bucket["sampleCount"],
+        "currentHourObservedMinutes": current_timeline_bucket["observedMinutes"],
+        "currentHourLastSnapshotAt": current_timeline_bucket["lastSnapshotAt"],
         "dueNextHour": round(due_next_hour, 1),
         "recentErrorSignalLevel": recent_error_trend["signalLevel"],
         "reasons": reasons,
