@@ -11,13 +11,33 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
     from .analytics import build_analytics
+    from .pixel_manager import (
+        MAX_UPLOAD_BYTES,
+        PixelConfigError,
+        PixelExportJobs,
+        PixelImportJobs,
+        PixelManager,
+        PixelManagerError,
+        load_config as load_pixel_manager_config,
+        parse_credential_bundle,
+    )
 except ImportError:
     from analytics import build_analytics
+    from pixel_manager import (
+        MAX_UPLOAD_BYTES,
+        PixelConfigError,
+        PixelExportJobs,
+        PixelImportJobs,
+        PixelManager,
+        PixelManagerError,
+        load_config as load_pixel_manager_config,
+        parse_credential_bundle,
+    )
 
 
 API_PREFIX = "/gpt-api"
@@ -34,6 +54,40 @@ POLL_INTERVAL_SECONDS = 300
 STATE_HISTORY_SECONDS = 86400
 POOL_DASHBOARD_URL = "https://cf.ai-pixel.online/api/v1/accounts/quota-dashboard?timezone=Asia%2FShanghai"
 POOL_LOGIN_URL = "https://cf.ai-pixel.online/api/v1/auth/login"
+PIXEL_MANAGER_CONFIG_PATH = Path(os.getenv("PIXEL_MANAGER_CONFIG_PATH", "/data/pixel_manager.json"))
+pixel_manager: PixelManager | None = None
+pixel_import_jobs: PixelImportJobs | None = None
+pixel_export_jobs: PixelExportJobs | None = None
+
+
+def initialize_pixel_manager() -> None:
+    global pixel_manager, pixel_import_jobs, pixel_export_jobs
+    try:
+        config = load_pixel_manager_config(PIXEL_MANAGER_CONFIG_PATH)
+    except PixelConfigError:
+        pixel_manager = None
+        pixel_import_jobs = None
+        pixel_export_jobs = None
+        return
+    pixel_manager = PixelManager(config)
+    pixel_import_jobs = PixelImportJobs(pixel_manager)
+    pixel_export_jobs = PixelExportJobs(pixel_manager, DATA_DIR / "pixel_exports")
+
+
+def require_pixel_manager(
+    manager_key: str | None = Header(default=None, alias="X-91-Manager-Key"),
+) -> PixelManager:
+    if pixel_manager is None:
+        initialize_pixel_manager()
+    if pixel_manager is None:
+        raise HTTPException(status_code=503, detail="账号池管理配置不可用")
+    if not pixel_manager.authorized(manager_key):
+        raise HTTPException(status_code=401, detail="账号池管理认证失败")
+    return pixel_manager
+
+
+def pixel_http_error(exc: PixelManagerError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=exc.public_message)
 
 
 def utc_now() -> str:
@@ -733,6 +787,7 @@ async def poll_loop() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    initialize_pixel_manager()
     task = asyncio.create_task(poll_loop())
     try:
         yield
@@ -746,6 +801,13 @@ app.add_middleware(
     allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "Content-Disposition",
+        "X-Pixel-Source-Count",
+        "X-Pixel-Deduplicated-Count",
+        "X-Pixel-Duplicate-Count",
+        "X-Pixel-Batch-Count",
+    ],
 )
 
 
@@ -792,6 +854,235 @@ async def get_balance_history_page(
     if not initialized():
         raise HTTPException(status_code=409, detail="Not initialized")
     return balance_history_page(cursor, limit)
+
+
+@app.get(f"{API_PREFIX}/pixel-manager/targets")
+async def get_pixel_targets(
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    return {"targets": manager.targets()}
+
+
+@app.get(f"{API_PREFIX}/pixel-manager/targets/{{target_id}}/accounts")
+async def get_pixel_accounts(
+    target_id: str,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, alias="pageSize", ge=1, le=100),
+    search: str = Query(default="", max_length=120),
+    status: str = Query(default="", max_length=40),
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    try:
+        return await manager.list_accounts(
+            target_id,
+            page,
+            page_size,
+            search=search.strip(),
+            status=status,
+        )
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+
+
+@app.get(f"{API_PREFIX}/pixel-manager/targets/{{target_id}}/accounts/{{account_id}}/usage")
+async def get_pixel_account_usage(
+    target_id: str,
+    account_id: int,
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    try:
+        return await manager.account_usage(target_id, account_id)
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+
+
+@app.post(f"{API_PREFIX}/pixel-manager/targets/{{target_id}}/relogin")
+async def relogin_pixel_target(
+    target_id: str,
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    try:
+        return await manager.relogin(target_id)
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+
+
+@app.post(f"{API_PREFIX}/pixel-manager/targets/{{target_id}}/accounts/bulk-delete")
+async def bulk_delete_pixel_accounts(
+    target_id: str,
+    payload: dict[str, Any],
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    try:
+        return await manager.bulk_delete_accounts(target_id, payload.get("accountIds") or [])
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+
+
+@app.post(f"{API_PREFIX}/pixel-manager/targets/{{target_id}}/accounts/bulk-test")
+async def bulk_test_pixel_accounts(
+    target_id: str,
+    payload: dict[str, Any],
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    try:
+        return await manager.bulk_test_accounts(target_id, payload.get("accountIds") or [])
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+
+
+@app.post(f"{API_PREFIX}/pixel-manager/targets/{{target_id}}/accounts/bulk-update")
+async def bulk_update_pixel_accounts(
+    target_id: str,
+    payload: dict[str, Any],
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    try:
+        return await manager.bulk_update_accounts(
+            target_id,
+            payload.get("accountIds") or [],
+            share_mode=payload.get("shareMode") or ("public" if payload.get("makePublic") else None),
+            concurrency=payload.get("concurrency"),
+        )
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+
+
+@app.post(f"{API_PREFIX}/pixel-manager/import", status_code=202)
+async def create_pixel_import(
+    request: Request,
+    target_ids_json: str = Query(alias="targetIds"),
+    file_name: str | None = Query(default=None, alias="fileName"),
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    try:
+        target_ids = json.loads(target_ids_json)
+        if not isinstance(target_ids, list):
+            raise ValueError
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="上传账号选择无效") from exc
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="JSON 文件不能超过 50 MB")
+    payload_buffer = bytearray()
+    async for chunk in request.stream():
+        if len(payload_buffer) + len(chunk) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="JSON 文件不能超过 50 MB")
+        payload_buffer.extend(chunk)
+    payload = bytes(payload_buffer)
+    try:
+        bundle = parse_credential_bundle(file_name or "accounts.json", payload)
+        jobs = pixel_import_jobs
+        if jobs is None or jobs.manager is not manager:
+            jobs = PixelImportJobs(manager)
+            globals()["pixel_import_jobs"] = jobs
+        return {"job": await jobs.create(bundle, target_ids)}
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+
+
+@app.get(f"{API_PREFIX}/pixel-manager/import-jobs/{{job_id}}")
+async def get_pixel_import_job(
+    job_id: str,
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    jobs = pixel_import_jobs
+    if jobs is None or jobs.manager is not manager:
+        raise HTTPException(status_code=404, detail="导入任务不存在")
+    try:
+        return {"job": jobs.get(job_id)}
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+
+
+@app.post(f"{API_PREFIX}/pixel-manager/targets/{{target_id}}/share")
+async def share_pixel_accounts(
+    target_id: str,
+    payload: dict[str, Any],
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    try:
+        return await manager.share_accounts(target_id, payload.get("accountIds") or [])
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+
+
+@app.get(f"{API_PREFIX}/pixel-manager/export")
+async def export_pixel_accounts(
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> Response:
+    try:
+        export = await manager.export_all()
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=export.content,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="pixel-accounts-{stamp}.json"',
+            "X-Pixel-Source-Count": str(export.source_count),
+            "X-Pixel-Deduplicated-Count": str(export.deduplicated_count),
+            "X-Pixel-Duplicate-Count": str(export.duplicate_count),
+            "X-Pixel-Batch-Count": str(export.batch_count),
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
+
+
+@app.post(f"{API_PREFIX}/pixel-manager/export-jobs", status_code=202)
+async def create_pixel_export_job(
+    payload: dict[str, Any],
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    jobs = pixel_export_jobs
+    if jobs is None or jobs.manager is not manager:
+        jobs = PixelExportJobs(manager, DATA_DIR / "pixel_exports")
+        globals()["pixel_export_jobs"] = jobs
+    if not payload.get("deleteAllAndReimport"):
+        raise HTTPException(status_code=400, detail="汇总整理任务必须确认删除并重新导入")
+    try:
+        return {"job": await jobs.create_rebuild(payload.get("targetIds") or [])}
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+
+
+@app.get(f"{API_PREFIX}/pixel-manager/export-jobs/{{job_id}}")
+async def get_pixel_export_job(
+    job_id: str,
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    jobs = pixel_export_jobs
+    if jobs is None or jobs.manager is not manager:
+        raise HTTPException(status_code=404, detail="汇总整理任务不存在")
+    try:
+        return {"job": jobs.get(job_id)}
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+
+
+@app.get(f"{API_PREFIX}/pixel-manager/export-jobs/{{job_id}}/download")
+async def download_pixel_export_job_backup(
+    job_id: str,
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> Response:
+    jobs = pixel_export_jobs
+    if jobs is None or jobs.manager is not manager:
+        raise HTTPException(status_code=404, detail="汇总整理任务不存在")
+    try:
+        file_name, content = jobs.backup_content(job_id)
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{file_name}"',
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
 
 
 @app.post(f"{API_PREFIX}/bootstrap")

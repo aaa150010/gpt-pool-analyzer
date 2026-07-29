@@ -6,20 +6,29 @@ import {
   Bell,
   Calculator,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   Clock3,
   Database,
+  Download,
+  FileJson,
+  FolderTree,
   History,
   Loader2,
   Mail,
   Plus,
   RefreshCw,
+  RotateCcw,
   Save,
+  Search,
   Server,
   Settings,
   Trash2,
   TrendingUp,
+  Upload,
   Users,
   WalletCards,
+  X,
 } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -50,6 +59,13 @@ import type {
   PoolCredentials,
   PoolMetricKey,
   PoolSnapshot,
+  PixelAccount,
+  PixelAccountPage,
+  PixelAccountUsage,
+  PixelExportJob,
+  PixelImportJob,
+  PixelImportTargetResult,
+  PixelTarget,
   ServerStateResponse,
   SMTPSettings,
   StoredState,
@@ -100,6 +116,7 @@ const hiddenPoolGroups = new Set(["CLAUDE共享号池", "GROK共享号池", "COD
 const navItems = [
   { key: "trends", label: "趋势分析", icon: TrendingUp },
   { key: "pools", label: "账号池分析", icon: Users },
+  { key: "manager", label: "账号池管理", icon: FolderTree },
   { key: "cost", label: "成本计算", icon: Calculator },
   { key: "history", label: "成本历史", icon: History },
 ] as const;
@@ -252,8 +269,8 @@ export function App() {
   };
 
   return (
-    <div className="min-h-screen bg-background text-foreground">
-      <header className="sticky top-0 z-20 border-b border-border bg-card/95 shadow-sm backdrop-blur">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background text-foreground">
+      <header className="z-20 shrink-0 border-b border-border bg-card/95 shadow-sm backdrop-blur">
         <div className="flex h-16 items-center justify-between px-6">
           <div className="flex items-center gap-4">
             <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-sm">
@@ -314,9 +331,9 @@ export function App() {
         </nav>
       </header>
 
-      <main className="min-h-screen">
-        <section className="space-y-4 p-4">
-            {view !== "trends" && (
+      <main className={cn("min-h-0 flex-1", view === "manager" ? "overflow-hidden" : "overflow-y-auto overscroll-contain [scrollbar-gutter:stable]")}>
+        <section className={cn("p-4", view === "manager" ? "h-full min-h-0" : "space-y-4")}>
+            {view !== "trends" && view !== "manager" && (
               loading ? (
                 <OverviewCardsSkeleton />
               ) : (
@@ -332,6 +349,7 @@ export function App() {
           <AnimatePresence mode="wait">
             <motion.div
               key={view}
+              className={cn(view === "manager" && "h-full min-h-0")}
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -6 }}
@@ -357,6 +375,7 @@ export function App() {
                   onOpenDialog={setDialog}
                 />
               )}
+              {!loading && view === "manager" && <PixelManagerView onToast={setToast} />}
               {!loading && view === "cost" && (
                 <CostView
                   stored={stored}
@@ -1379,6 +1398,1399 @@ function PoolsView({
   );
 }
 
+function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [targets, setTargets] = useState<PixelTarget[]>([]);
+  const [activeTargetId, setActiveTargetId] = useState("");
+  const [targetsLoading, setTargetsLoading] = useState(true);
+  const [targetsError, setTargetsError] = useState("");
+  const [accounts, setAccounts] = useState<PixelAccountPage | null>(null);
+  const [accountsLoading, setAccountsLoading] = useState(false);
+  const [accountsError, setAccountsError] = useState("");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
+  const [accountSearchInput, setAccountSearchInput] = useState("");
+  const [accountSearch, setAccountSearch] = useState("");
+  const [accountStatus, setAccountStatus] = useState("");
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [selectedTargetIds, setSelectedTargetIds] = useState<Set<string>>(new Set());
+  const [importing, setImporting] = useState(false);
+  const [results, setResults] = useState<PixelImportTargetResult[]>([]);
+  const [importJob, setImportJob] = useState<PixelImportJob | null>(null);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportDeleteAndReimport, setExportDeleteAndReimport] = useState(false);
+  const [exportSelectedTargetIds, setExportSelectedTargetIds] = useState<Set<string>>(new Set());
+  const [exportJob, setExportJob] = useState<PixelExportJob | null>(null);
+  const [retryingTargetId, setRetryingTargetId] = useState("");
+  const [exporting, setExporting] = useState(false);
+  const exportBackupDownloadedRef = useRef<Set<string>>(new Set());
+  const accountsRequestSequence = useRef(0);
+  const [selectedAccountIds, setSelectedAccountIds] = useState<Set<number>>(new Set());
+  const [bulkAction, setBulkAction] = useState<"test" | "update" | "delete" | "">("");
+  const [bulkEditOpen, setBulkEditOpen] = useState(false);
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [bulkDeleteAccountIds, setBulkDeleteAccountIds] = useState<number[]>([]);
+  const [bulkMakePublic, setBulkMakePublic] = useState(false);
+  const [bulkConcurrency, setBulkConcurrency] = useState("");
+  const [targetCountsRefreshing, setTargetCountsRefreshing] = useState(false);
+  const loadAccountsRef = useRef<() => Promise<void>>(async () => undefined);
+  const refreshAllTargetCountsRef = useRef<(targetList?: PixelTarget[], options?: { silent?: boolean }) => Promise<void>>(async () => undefined);
+
+  const beginAccountsTransition = useCallback(() => {
+    accountsRequestSequence.current += 1;
+    setAccounts(null);
+    setAccountsError("");
+    setAccountsLoading(true);
+    setSelectedAccountIds(new Set());
+  }, []);
+
+  useEffect(() => {
+    const normalizedSearch = accountSearchInput.trim();
+    if (normalizedSearch === accountSearch) return;
+    const timer = window.setTimeout(() => {
+      beginAccountsTransition();
+      setPage(1);
+      setAccountSearch(normalizedSearch);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [accountSearch, accountSearchInput, beginAccountsTransition]);
+
+  const loadTargets = useCallback(async () => {
+    setTargetsLoading(true);
+    setTargetsError("");
+    try {
+      const response = await api.pixelTargets();
+      setTargets(response.targets);
+      setActiveTargetId((current) => (response.targets.some((target) => target.id === current) ? current : response.targets[0]?.id ?? ""));
+      return response.targets;
+    } catch (error) {
+      setTargetsError(error instanceof Error ? error.message : "平台账号读取失败");
+      return [];
+    } finally {
+      setTargetsLoading(false);
+    }
+  }, []);
+
+  const refreshAllTargetCounts = useCallback(async (targetList = targets, options: { silent?: boolean } = {}) => {
+    if (targetCountsRefreshing || !targetList.length) return;
+    setTargetCountsRefreshing(true);
+    try {
+      const results = await Promise.all(targetList.map(async (target) => {
+        try {
+          return { targetId: target.id, response: await api.pixelAccounts(target.id, 1, 1), error: "" };
+        } catch (error) {
+          return { targetId: target.id, response: null, error: error instanceof Error ? error.message : "账号数量刷新失败" };
+        }
+      }));
+      const resultByTarget = new Map(results.map((result) => [result.targetId, result]));
+      const checkedAt = new Date().toISOString();
+      setTargets((current) => current.map((target) => {
+        const result = resultByTarget.get(target.id);
+        if (!result) return target;
+        if (result.response) {
+          return { ...target, connected: true, accountCount: result.response.total, lastCheckedAt: checkedAt, error: null };
+        }
+        return { ...target, connected: false, lastCheckedAt: checkedAt, error: result.error };
+      }));
+      const activeResult = resultByTarget.get(activeTargetId)?.response;
+      if (activeResult && !accountSearch && !accountStatus && accounts) {
+        setAccounts((current) => current ? {
+          ...current,
+          total: activeResult.total,
+          pages: Math.max(Math.ceil(activeResult.total / current.pageSize), 1),
+        } : current);
+      }
+      const succeeded = results.filter((result) => result.response).length;
+      const failed = results.length - succeeded;
+      if (!options.silent) onToast(`七个平台数量刷新完成：成功 ${succeeded} 个${failed ? `，失败 ${failed} 个` : ""}`);
+    } finally {
+      setTargetCountsRefreshing(false);
+    }
+  }, [accountSearch, accountStatus, accounts, activeTargetId, onToast, targetCountsRefreshing, targets]);
+
+  const loadAccounts = useCallback(async () => {
+    if (!activeTargetId) {
+      accountsRequestSequence.current += 1;
+      setAccounts(null);
+      setAccountsLoading(false);
+      setSelectedAccountIds(new Set());
+      return;
+    }
+    const requestSequence = ++accountsRequestSequence.current;
+    setAccountsLoading(true);
+    setAccountsError("");
+    setAccounts(null);
+    setSelectedAccountIds(new Set());
+    try {
+      const response = await api.pixelAccounts(activeTargetId, page, pageSize, accountStatus, accountSearch);
+      if (requestSequence !== accountsRequestSequence.current) return;
+      setAccounts(response);
+      setTargets((current) =>
+        current.map((target) =>
+          target.id === activeTargetId
+            ? {
+                ...target,
+                connected: true,
+                accountCount: accountStatus || accountSearch ? target.accountCount : response.total,
+                lastCheckedAt: new Date().toISOString(),
+                error: null,
+              }
+            : target,
+        ),
+      );
+    } catch (error) {
+      if (requestSequence !== accountsRequestSequence.current) return;
+      const message = error instanceof Error ? error.message : "账号列表读取失败";
+      setAccountsError(message);
+      setAccounts(null);
+      setTargets((current) =>
+        current.map((target) => (target.id === activeTargetId ? { ...target, connected: false, error: message } : target)),
+      );
+    } finally {
+      if (requestSequence === accountsRequestSequence.current) setAccountsLoading(false);
+    }
+  }, [accountSearch, accountStatus, activeTargetId, page, pageSize]);
+
+  useEffect(() => {
+    loadAccountsRef.current = loadAccounts;
+  }, [loadAccounts]);
+
+  useEffect(() => {
+    refreshAllTargetCountsRef.current = refreshAllTargetCounts;
+  }, [refreshAllTargetCounts]);
+
+  useEffect(() => {
+    void loadTargets();
+  }, [loadTargets]);
+
+  useEffect(() => {
+    const jobId = window.localStorage.getItem("pixelImportJobId");
+    if (!jobId) return;
+    void api.pixelImportJob(jobId).then(({ job }) => {
+      setImportJob(job);
+      setResults(job.results);
+      setImporting(job.status === "queued" || job.status === "running");
+      if (job.status === "completed" || job.status === "failed") {
+        window.localStorage.removeItem("pixelImportJobId");
+      }
+      if (job.status === "completed") {
+        void loadTargets().then((targetList) => refreshAllTargetCountsRef.current(targetList, { silent: true }));
+        void loadAccountsRef.current();
+      }
+    }).catch(() => window.localStorage.removeItem("pixelImportJobId"));
+  }, [loadTargets]);
+
+  useEffect(() => {
+    const jobId = window.localStorage.getItem("pixelExportJobId");
+    if (!jobId) return;
+    void api.pixelExportJob(jobId).then(({ job }) => {
+      setExportJob(job);
+      setExporting(job.status === "queued" || job.status === "running");
+      if (job.status === "completed" || job.status === "failed") {
+        window.localStorage.removeItem("pixelExportJobId");
+      }
+      if (job.status === "completed") {
+        void loadTargets().then((targetList) => refreshAllTargetCountsRef.current(targetList, { silent: true }));
+        void loadAccountsRef.current();
+      }
+    }).catch(() => window.localStorage.removeItem("pixelExportJobId"));
+  }, [loadTargets]);
+
+  useEffect(() => {
+    void loadAccounts();
+  }, [loadAccounts]);
+
+  useEffect(() => {
+    if (!importJob || importJob.status === "completed" || importJob.status === "failed") return;
+    let cancelled = false;
+    let timer: number | null = null;
+    const poll = async () => {
+      try {
+        const response = await api.pixelImportJob(importJob.jobId);
+        if (cancelled) return;
+        setImportJob(response.job);
+        setResults(response.job.results);
+        if (response.job.status === "completed") {
+          setImporting(false);
+          window.localStorage.removeItem("pixelImportJobId");
+          const succeeded = response.job.results.filter((item) => item.status === "success").length;
+          const partial = response.job.results.filter((item) => item.status === "partial").length;
+          onToast(`导入完成：成功 ${succeeded} 个平台${partial ? `，部分成功 ${partial} 个` : ""}`);
+          const targetList = await loadTargets();
+          await refreshAllTargetCountsRef.current(targetList, { silent: true });
+          await loadAccountsRef.current();
+          return;
+        }
+        if (response.job.status === "failed") {
+          setImporting(false);
+          window.localStorage.removeItem("pixelImportJobId");
+          onToast(response.job.error || "批量导入失败");
+          return;
+        }
+      } catch (error) {
+        if (!cancelled) onToast(error instanceof Error ? error.message : "导入进度读取失败");
+      }
+      if (!cancelled) timer = window.setTimeout(() => void poll(), 2_000);
+    };
+    timer = window.setTimeout(() => void poll(), 1_000);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [importJob?.jobId]);
+
+  useEffect(() => {
+    if (!exportJob || exportJob.status === "completed" || exportJob.status === "failed") return;
+    let cancelled = false;
+    let timer: number | null = null;
+    const poll = async () => {
+      try {
+        const response = await api.pixelExportJob(exportJob.jobId);
+        if (cancelled) return;
+        setExportJob(response.job);
+        if (response.job.status === "completed") {
+          setExporting(false);
+          window.localStorage.removeItem("pixelExportJobId");
+          if (!exportBackupDownloadedRef.current.has(response.job.jobId)) {
+            exportBackupDownloadedRef.current.add(response.job.jobId);
+            try {
+              downloadPixelFile(await api.pixelExportJobDownload(response.job.jobId));
+            } catch (error) {
+              onToast(error instanceof Error ? error.message : "备份文件自动下载失败");
+            }
+          }
+          const targetList = await loadTargets();
+          await refreshAllTargetCountsRef.current(targetList, { silent: true });
+          await loadAccountsRef.current();
+          const exported = response.job.export?.deduplicatedCount ?? 0;
+          onToast(`汇总整理完成：备份 ${exported} 个账号，已重新导入 ${response.job.results.length} 个平台`);
+          return;
+        }
+        if (response.job.status === "failed") {
+          setExporting(false);
+          window.localStorage.removeItem("pixelExportJobId");
+          onToast(response.job.error || "汇总整理任务失败");
+          return;
+        }
+      } catch (error) {
+        if (!cancelled) onToast(error instanceof Error ? error.message : "汇总整理进度读取失败");
+      }
+      if (!cancelled) timer = window.setTimeout(() => void poll(), 2_000);
+    };
+    timer = window.setTimeout(() => void poll(), 1_000);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [exportJob?.jobId]);
+
+  const openImport = () => {
+    if (!selectedFile || !targets.length) return;
+    setSelectedTargetIds(new Set(targets.map((target) => target.id)));
+    setImportOpen(true);
+  };
+
+  const downloadPixelFile = (download: { blob: Blob; fileName: string }) => {
+    const url = URL.createObjectURL(download.blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = download.fileName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  };
+
+  const openExport = () => {
+    if (!targets.length) return;
+    setExportDeleteAndReimport(false);
+    setExportSelectedTargetIds(new Set(targets.map((target) => target.id)));
+    setExportOpen(true);
+  };
+
+  const exportAllAccounts = async () => {
+    setExporting(true);
+    try {
+      const download = await api.pixelExport();
+      downloadPixelFile(download);
+      const total = download.sourceCount || download.deduplicatedCount + download.duplicateCount;
+      const batchText = download.batchCount ? `，已按 100 个一组生成 ${download.batchCount} 组` : "";
+      onToast(`汇总导出 ${download.deduplicatedCount || total} 个账号${download.duplicateCount ? `，已去重 ${download.duplicateCount} 个` : ""}${batchText}`);
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "账号汇总导出失败");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const runExportAction = async () => {
+    if (!exportDeleteAndReimport) {
+      setExportOpen(false);
+      await exportAllAccounts();
+      return;
+    }
+    if (!exportSelectedTargetIds.size) {
+      onToast("请选择重新导入的平台账号");
+      return;
+    }
+    setExporting(true);
+    try {
+      const response = await api.pixelExportJobCreate([...exportSelectedTargetIds]);
+      setExportJob(response.job);
+      window.localStorage.setItem("pixelExportJobId", response.job.jobId);
+      setExportOpen(false);
+      onToast("汇总整理任务已开始：先导出备份，再删除，再重新导入");
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "汇总整理任务启动失败");
+      setExporting(false);
+    }
+  };
+
+  const toggleExportTarget = (targetId: string) => {
+    setExportSelectedTargetIds((current) => {
+      const next = new Set(current);
+      if (next.has(targetId)) next.delete(targetId);
+      else next.add(targetId);
+      return next;
+    });
+  };
+
+  const toggleImportTarget = (targetId: string) => {
+    setSelectedTargetIds((current) => {
+      const next = new Set(current);
+      if (next.has(targetId)) next.delete(targetId);
+      else next.add(targetId);
+      return next;
+    });
+  };
+
+  const runImport = async () => {
+    if (!selectedFile || !selectedTargetIds.size) return;
+    setImporting(true);
+    try {
+      const response = await api.pixelImport(selectedFile, [...selectedTargetIds]);
+      setImportJob(response.job);
+      window.localStorage.setItem("pixelImportJobId", response.job.jobId);
+      setResults(response.job.results);
+      setImportOpen(false);
+      setSelectedFile(null);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      onToast(`导入任务已开始，将依次处理 ${response.job.totalTargets} 个平台账号`);
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "批量导入失败");
+      setImporting(false);
+    }
+  };
+
+  const retryShare = async (result: PixelImportTargetResult) => {
+    if (!result.failedShareIds.length) return;
+    setRetryingTargetId(result.targetId);
+    try {
+      const response = await api.pixelShare(result.targetId, result.failedShareIds);
+      setResults((current) =>
+        current.map((item) => {
+          if (item.targetId !== result.targetId) return item;
+          const shared = item.shared + response.success;
+          const shareFailed = response.failed;
+          const status = shareFailed === 0 && item.failed === 0 ? "success" : "partial";
+          return {
+            ...item,
+            shared,
+            shareFailed,
+            failedShareIds: response.failedIds,
+            status,
+            message: shareFailed ? `仍有 ${shareFailed} 个账号未开启公共共享` : "公共共享已全部开启",
+          };
+        }),
+      );
+      onToast(response.failed ? `仍有 ${response.failed} 个账号共享失败` : "公共共享重试成功");
+      await loadAccounts();
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "公共共享重试失败");
+    } finally {
+      setRetryingTargetId("");
+    }
+  };
+
+  const toggleSelectedAccount = (accountId: number) => {
+    setSelectedAccountIds((current) => {
+      const next = new Set(current);
+      if (next.has(accountId)) next.delete(accountId);
+      else next.add(accountId);
+      return next;
+    });
+  };
+
+  const toggleCurrentPageAccounts = () => {
+    if (!accounts) return;
+    const pageIds = accounts.items.map((account) => account.id);
+    const allSelected = pageIds.length > 0 && pageIds.every((accountId) => selectedAccountIds.has(accountId));
+    setSelectedAccountIds(allSelected ? new Set() : new Set(pageIds));
+  };
+
+  const runBulkTest = async () => {
+    if (!activeTargetId || !selectedAccountIds.size) return;
+    const accountIds = [...selectedAccountIds];
+    setBulkAction("test");
+    try {
+      const response = await api.pixelBulkTest(activeTargetId, accountIds);
+      onToast(`连接测试完成：成功 ${response.success} 个${response.failed ? `，失败 ${response.failed} 个` : ""}`);
+      await loadAccounts();
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "批量测试连接失败");
+    } finally {
+      setBulkAction("");
+    }
+  };
+
+  const openBulkEdit = () => {
+    if (!selectedAccountIds.size) return;
+    setBulkMakePublic(false);
+    setBulkConcurrency("");
+    setBulkEditOpen(true);
+  };
+
+  const runBulkUpdate = async () => {
+    if (!activeTargetId || !selectedAccountIds.size) return;
+    const concurrency = bulkConcurrency.trim() ? Number(bulkConcurrency) : undefined;
+    if (concurrency !== undefined && (!Number.isInteger(concurrency) || concurrency < 3 || concurrency > 50)) {
+      onToast("并发数必须是 3 到 50 的整数");
+      return;
+    }
+    if (!bulkMakePublic && concurrency === undefined) return;
+    const accountIds = [...selectedAccountIds];
+    setBulkAction("update");
+    try {
+      const response = await api.pixelBulkUpdate(activeTargetId, {
+        accountIds,
+        makePublic: bulkMakePublic,
+        ...(concurrency === undefined ? {} : { concurrency }),
+      });
+      setBulkEditOpen(false);
+      onToast(`批量编辑完成：成功 ${response.success} 个${response.failed ? `，失败 ${response.failed} 个` : ""}`);
+      await loadAccounts();
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "批量编辑失败");
+    } finally {
+      setBulkAction("");
+    }
+  };
+
+  const runBulkDelete = async () => {
+    if (!activeTargetId || !bulkDeleteAccountIds.length) return;
+    const accountIds = [...bulkDeleteAccountIds];
+    setBulkAction("delete");
+    try {
+      const response = await api.pixelBulkDelete(activeTargetId, accountIds);
+      await loadAccounts();
+      setBulkDeleteOpen(false);
+      setBulkDeleteAccountIds([]);
+      onToast(`批量删除完成：成功 ${response.success} 个${response.failed ? `，失败 ${response.failed} 个` : ""}`);
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "批量删除失败");
+    } finally {
+      setBulkAction("");
+    }
+  };
+
+  const openBulkDelete = () => {
+    if (!selectedAccountIds.size) return;
+    setBulkDeleteAccountIds([...selectedAccountIds]);
+    setBulkDeleteOpen(true);
+  };
+
+  const activeTarget = targets.find((target) => target.id === activeTargetId);
+  const bulkConcurrencyValue = bulkConcurrency.trim() ? Number(bulkConcurrency) : undefined;
+  const bulkConcurrencyValid = bulkConcurrencyValue === undefined
+    || (Number.isInteger(bulkConcurrencyValue) && bulkConcurrencyValue >= 3 && bulkConcurrencyValue <= 50);
+  const bulkEditReady = bulkMakePublic || bulkConcurrencyValue !== undefined;
+
+  return (
+    <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
+      <Card className="shrink-0">
+        <CardContent className="flex min-h-20 items-center justify-between gap-4 p-4">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-md bg-blue-50 text-blue-600">
+              <FileJson className="h-5 w-5" />
+            </div>
+            <div className="min-w-0">
+              <div className="text-sm font-black text-foreground">导入账号 JSON</div>
+              <div className={cn("truncate text-xs font-semibold", selectedFile ? "text-emerald-700" : "text-muted-foreground")}>
+                {selectedFile ? `${selectedFile.name} · ${formatFileSize(selectedFile.size)}` : "尚未选择文件"}
+              </div>
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              onChange={(event) => setSelectedFile(event.target.files?.[0] ?? null)}
+            />
+            <Button variant="outline" disabled={importing} onClick={() => fileInputRef.current?.click()}>
+              <FileJson className="h-4 w-4" />
+              选择 JSON
+            </Button>
+            <Button variant="outline" disabled={exporting || importing || targetsLoading || !targets.length} onClick={openExport}>
+              {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+              {exporting ? "正在处理" : "汇总导出"}
+            </Button>
+            <Button disabled={importing || !selectedFile || !targets.length} onClick={openImport}>
+              <Upload className="h-4 w-4" />
+              上传到平台
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <div className="grid min-h-0 flex-1 grid-cols-[220px_minmax(0,1fr)] gap-4">
+        <Card className="flex h-full min-h-0 flex-col overflow-hidden">
+          <CardHeader className="shrink-0 border-b border-border px-4 py-3">
+            <CardTitle className="flex items-center gap-2 text-sm">
+              <FolderTree className="h-4 w-4 text-blue-600" />
+              平台账号
+            </CardTitle>
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs font-black text-muted-foreground">{targets.length || 7} 个</span>
+              <button
+                type="button"
+                title="刷新全部账号数量"
+                aria-label="刷新七个平台账号数量"
+                disabled={targetsLoading || targetCountsRefreshing || !targets.length || Boolean(bulkAction)}
+                className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
+                onClick={() => void refreshAllTargetCounts()}
+              >
+                {targetCountsRefreshing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+              </button>
+            </div>
+          </CardHeader>
+          <CardContent className="min-h-0 flex-1 overflow-y-auto p-2">
+            {targetsLoading && (
+              <div className="space-y-2 p-1">
+                {Array.from({ length: 7 }).map((_, index) => <SkeletonLine key={index} className="h-14 w-full rounded-md" />)}
+              </div>
+            )}
+            {!targetsLoading && targetsError && (
+              <div className="m-1 rounded-md border border-rose-200 bg-rose-50 p-3 text-xs font-bold text-rose-700">{targetsError}</div>
+            )}
+            {!targetsLoading && targets.map((target, index) => {
+              const active = target.id === activeTargetId;
+              return (
+                <button
+                  key={target.id}
+                  disabled={Boolean(bulkAction)}
+                  className={cn(
+                    "mb-1 flex h-14 w-full items-center gap-2 rounded-md border px-2.5 text-left transition last:mb-0 disabled:cursor-wait disabled:opacity-60",
+                    active ? "border-blue-200 bg-blue-50 text-blue-950" : "border-transparent hover:border-border hover:bg-muted",
+                  )}
+                  onClick={() => {
+                    if (target.id === activeTargetId) return;
+                    beginAccountsTransition();
+                    setPage(1);
+                    setActiveTargetId(target.id);
+                  }}
+                >
+                  <span className={cn("flex h-7 w-7 shrink-0 items-center justify-center rounded text-xs font-black", active ? "bg-blue-600 text-white" : "bg-slate-100 text-slate-600")}>
+                    {index + 1}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-xs font-black">{target.email}</span>
+                    <span className="mt-0.5 flex items-center gap-1.5 text-[11px] font-bold text-muted-foreground">
+                      <span className={cn("h-1.5 w-1.5 rounded-full", target.connected ? "bg-emerald-500" : target.error ? "bg-rose-500" : "bg-slate-300")} />
+                      {target.connected ? "已连接" : target.error ? "连接失败" : "待连接"}
+                      {target.accountCount !== null && <span>· {target.accountCount} 个</span>}
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
+          </CardContent>
+        </Card>
+
+        <Card className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
+          <CardHeader className="shrink-0 border-b border-border px-4 py-3">
+            <div className="min-w-0">
+              <CardTitle className="truncate text-base">{activeTarget?.email || "账号列表"}</CardTitle>
+              <div className="mt-0.5 text-xs font-bold text-muted-foreground">
+                {accounts ? `共 ${accounts.total} 个账号` : accountsLoading ? "正在连接平台" : "等待平台数据"}
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="icon" title="刷新账号列表" disabled={!activeTargetId || accountsLoading || Boolean(bulkAction)} onClick={() => void loadAccounts()}>
+                <RefreshCw className={cn("h-4 w-4", accountsLoading && "animate-spin")} />
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent className="flex min-h-0 flex-1 flex-col p-0">
+            <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-3">
+              <div className="relative w-[210px] shrink-0">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  aria-label="搜索账号"
+                  value={accountSearchInput}
+                  placeholder="搜索账号名称"
+                  disabled={!activeTargetId || Boolean(bulkAction)}
+                  onChange={(event) => setAccountSearchInput(event.target.value)}
+                  className="h-8 pl-8 pr-8 text-xs font-bold"
+                />
+                {accountSearchInput && (
+                  <button
+                    type="button"
+                    title="清空搜索"
+                    aria-label="清空搜索"
+                    disabled={Boolean(bulkAction)}
+                    className="absolute right-1.5 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+                    onClick={() => setAccountSearchInput("")}
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </div>
+              <select
+                aria-label="账号状态筛选"
+                value={accountStatus}
+                disabled={!activeTargetId || accountsLoading || Boolean(bulkAction)}
+                onChange={(event) => {
+                  beginAccountsTransition();
+                  setPage(1);
+                  setAccountStatus(event.target.value);
+                }}
+                className="h-8 w-[128px] shrink-0 rounded-md border border-border bg-background px-2 text-xs font-bold outline-none focus:ring-2 focus:ring-ring disabled:opacity-50"
+              >
+                <option value="">全部状态</option>
+                <option value="active">正常</option>
+                <option value="codex_quota_protected">限额保护中</option>
+                <option value="rate_limited">限流中</option>
+                <option value="error">错误</option>
+              </select>
+              <span className={cn("mr-auto whitespace-nowrap text-xs font-black", selectedAccountIds.size ? "text-blue-700" : "text-muted-foreground")}>已选 {selectedAccountIds.size}</span>
+              <div className="flex shrink-0 items-center gap-2">
+                <Button variant="outline" size="sm" disabled={!selectedAccountIds.size || accountsLoading || Boolean(bulkAction)} onClick={() => void runBulkTest()}>
+                  {bulkAction === "test" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Activity className="h-3.5 w-3.5" />}
+                  批量测试连接
+                </Button>
+                <Button variant="outline" size="sm" disabled={!selectedAccountIds.size || accountsLoading || Boolean(bulkAction)} onClick={openBulkEdit}>
+                  {bulkAction === "update" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Settings className="h-3.5 w-3.5" />}
+                  批量编辑
+                </Button>
+                <Button variant="destructive" size="sm" disabled={!selectedAccountIds.size || accountsLoading || Boolean(bulkAction)} onClick={openBulkDelete}>
+                  <Trash2 className="h-3.5 w-3.5" />
+                  批量删除
+                </Button>
+              </div>
+            </div>
+            {accountsLoading && (
+              <div className="min-h-0 flex-1 space-y-2 overflow-hidden p-4">
+                {Array.from({ length: 8 }).map((_, index) => <SkeletonLine key={index} className="h-10 w-full rounded-md" />)}
+              </div>
+            )}
+            {!accountsLoading && accountsError && (
+              <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+                <div className="max-w-md rounded-md border border-rose-200 bg-rose-50 px-4 py-3 text-center text-sm font-bold text-rose-700">
+                  {accountsError}
+                </div>
+              </div>
+            )}
+            {accounts && !accountsLoading && (
+              <PixelAccountsTable
+                key={`${activeTargetId}-${accounts.page}-${accounts.pageSize}`}
+                targetId={activeTargetId}
+                items={accounts.items}
+                selectedIds={selectedAccountIds}
+                onToggle={toggleSelectedAccount}
+                onToggleAll={toggleCurrentPageAccounts}
+              />
+            )}
+            <div className="flex h-12 shrink-0 items-center justify-between gap-3 border-t border-border px-4">
+              <span className="text-xs font-bold text-muted-foreground">
+                {accounts ? `共 ${accounts.total} 个 · 第 ${accounts.page} / ${Math.max(accounts.pages, 1)} 页` : accountsLoading ? "正在加载账号" : "暂无分页数据"}
+              </span>
+              <div className="flex items-center gap-2">
+                <select
+                  aria-label="每页数量"
+                  value={pageSize}
+                  disabled={accountsLoading || Boolean(bulkAction)}
+                  onChange={(event) => {
+                    beginAccountsTransition();
+                    setPage(1);
+                    setPageSize(Number(event.target.value));
+                  }}
+                  className="h-8 rounded-md border border-border bg-background px-2 text-xs font-bold outline-none focus:ring-2 focus:ring-ring disabled:opacity-50"
+                >
+                  {[20, 50, 100].map((size) => <option key={size} value={size}>{size} 条/页</option>)}
+                </select>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  title="上一页"
+                  disabled={!accounts || page <= 1 || accountsLoading || Boolean(bulkAction)}
+                  onClick={() => {
+                    beginAccountsTransition();
+                    setPage((value) => Math.max(value - 1, 1));
+                  }}
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </Button>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  title="下一页"
+                  disabled={!accounts || page >= accounts.pages || accountsLoading || Boolean(bulkAction)}
+                  onClick={() => {
+                    beginAccountsTransition();
+                    setPage((value) => value + 1);
+                  }}
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {importJob && (importJob.status === "queued" || importJob.status === "running") && (
+        <div className="fixed bottom-4 right-4 z-40 w-[min(560px,calc(100vw-32px))] shadow-admin">
+          <PixelImportProgress job={importJob} targets={targets} />
+        </div>
+      )}
+      {exportJob && (exportJob.status === "queued" || exportJob.status === "running") && (
+        <div className="fixed bottom-4 right-4 z-40 w-[min(620px,calc(100vw-32px))] shadow-admin">
+          <PixelExportProgress job={exportJob} targets={targets} />
+        </div>
+      )}
+      {results.length > 0 && importJob?.status === "completed" && (
+        <Dialog open onOpenChange={(open) => !open && setResults([])}>
+          <DialogContent className="max-h-[min(720px,calc(100vh-48px))] max-w-5xl overflow-auto">
+            <DialogHeader>
+              <DialogTitle>最近一次导入结果</DialogTitle>
+              <DialogDescription>已完成 {results.length} 个平台账号的导入与公共共享处理。</DialogDescription>
+            </DialogHeader>
+            <PixelImportResults results={results} retryingTargetId={retryingTargetId} onRetry={retryShare} />
+          </DialogContent>
+        </Dialog>
+      )}
+      {exportJob?.status === "completed" && (
+        <Dialog open onOpenChange={(open) => !open && setExportJob(null)}>
+          <DialogContent className="max-h-[min(760px,calc(100vh-48px))] max-w-5xl overflow-auto">
+            <DialogHeader>
+              <DialogTitle>汇总整理完成</DialogTitle>
+              <DialogDescription>
+                已先保存备份 {exportJob.backupFileName || "JSON"}，再删除七个平台账号，并按选择的平台重新导入。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex justify-end">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={async () => {
+                  try {
+                    downloadPixelFile(await api.pixelExportJobDownload(exportJob.jobId));
+                    onToast("备份文件已下载");
+                  } catch (error) {
+                    onToast(error instanceof Error ? error.message : "备份文件下载失败");
+                  }
+                }}
+              >
+                <Download className="h-3.5 w-3.5" />
+                下载备份
+              </Button>
+            </div>
+            <PixelExportResults job={exportJob} retryingTargetId={retryingTargetId} onRetry={retryShare} />
+          </DialogContent>
+        </Dialog>
+      )}
+
+      <Dialog open={exportOpen} onOpenChange={(open) => !exporting && setExportOpen(open)}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>汇总导出</DialogTitle>
+            <DialogDescription>默认只下载去重后的 JSON，并在文件里按 100 个账号一组生成分组。</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <label className={cn(
+              "flex items-start gap-3 rounded-md border px-3 py-3 text-sm font-bold",
+              exportDeleteAndReimport ? "border-rose-200 bg-rose-50 text-rose-800" : "border-border bg-background",
+            )}>
+              <Checkbox checked={exportDeleteAndReimport} onCheckedChange={(checked) => setExportDeleteAndReimport(checked === true)} />
+              <span>
+                <span className="block font-black">删除七个平台全部账号，并用本次汇总重新导入</span>
+                <span className="mt-1 block text-xs font-bold text-muted-foreground">
+                  服务器会先完整导出、去重、保存 600 权限备份；任一导出或备份失败都会停止，不会删除。
+                </span>
+              </span>
+            </label>
+            {exportDeleteAndReimport && (
+              <div>
+                <div className="mb-2 text-xs font-black text-muted-foreground">选择重新导入到哪些平台账号</div>
+                <div className="grid max-h-[300px] grid-cols-2 gap-2 overflow-auto">
+                  {targets.map((target, index) => (
+                    <label key={target.id} className="flex h-12 items-center gap-2.5 rounded-md border border-border bg-background px-3 text-sm font-bold">
+                      <Checkbox checked={exportSelectedTargetIds.has(target.id)} onCheckedChange={() => toggleExportTarget(target.id)} />
+                      <span className="flex h-6 w-6 items-center justify-center rounded bg-slate-100 text-[11px] font-black text-slate-600">{index + 1}</span>
+                      <span className="truncate">{target.email}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+          <div className="mt-5 flex items-center justify-between">
+            {exportDeleteAndReimport ? (
+              <button
+                className="text-xs font-black text-blue-600 hover:text-blue-700"
+                onClick={() => setExportSelectedTargetIds((current) => current.size === targets.length ? new Set() : new Set(targets.map((target) => target.id)))}
+              >
+                {exportSelectedTargetIds.size === targets.length ? "取消全选" : "全部选择"}
+              </button>
+            ) : <span />}
+            <div className="flex gap-2">
+              <Button variant="outline" disabled={exporting} onClick={() => setExportOpen(false)}>取消</Button>
+              <Button
+                variant={exportDeleteAndReimport ? "destructive" : "default"}
+                disabled={exporting || (exportDeleteAndReimport && !exportSelectedTargetIds.size)}
+                onClick={() => void runExportAction()}
+              >
+                {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : exportDeleteAndReimport ? <Trash2 className="h-4 w-4" /> : <Download className="h-4 w-4" />}
+                {exporting ? "正在处理" : exportDeleteAndReimport ? `确认整理并导入 ${exportSelectedTargetIds.size} 个` : "只导出下载"}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={importOpen} onOpenChange={(open) => !importing && setImportOpen(open)}>
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>选择上传账号</DialogTitle>
+            <DialogDescription>{selectedFile?.name || "JSON 文件"} · 已选 {selectedTargetIds.size} / {targets.length} 个平台账号</DialogDescription>
+          </DialogHeader>
+          <div className="grid max-h-[360px] grid-cols-2 gap-2 overflow-auto">
+            {targets.map((target, index) => (
+              <label key={target.id} className="flex h-12 items-center gap-2.5 rounded-md border border-border bg-background px-3 text-sm font-bold">
+                <Checkbox checked={selectedTargetIds.has(target.id)} onCheckedChange={() => toggleImportTarget(target.id)} />
+                <span className="flex h-6 w-6 items-center justify-center rounded bg-slate-100 text-[11px] font-black text-slate-600">{index + 1}</span>
+                <span className="truncate">{target.email}</span>
+              </label>
+            ))}
+          </div>
+          <div className="mt-5 flex items-center justify-between">
+            <button
+              className="text-xs font-black text-blue-600 hover:text-blue-700"
+              onClick={() => setSelectedTargetIds((current) => current.size === targets.length ? new Set() : new Set(targets.map((target) => target.id)))}
+            >
+              {selectedTargetIds.size === targets.length ? "取消全选" : "全部选择"}
+            </button>
+            <div className="flex gap-2">
+              <Button variant="outline" disabled={importing} onClick={() => setImportOpen(false)}>取消</Button>
+              <Button disabled={importing || !selectedTargetIds.size} onClick={() => void runImport()}>
+                {importing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                {importing ? "正在导入" : `确认上传 ${selectedTargetIds.size} 个`}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={bulkEditOpen} onOpenChange={(open) => !bulkAction && setBulkEditOpen(open)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>批量编辑账号</DialogTitle>
+            <DialogDescription>将设置应用到已选择的 {selectedAccountIds.size} 个账号；未填写的项目保持不变。</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <label className="flex h-12 items-center gap-3 rounded-md border border-border px-3 text-sm font-black">
+              <Checkbox checked={bulkMakePublic} onCheckedChange={(checked) => setBulkMakePublic(checked === true)} />
+              <span>设为公共账号池</span>
+            </label>
+            <div className="space-y-1.5">
+              <Label htmlFor="pixel-bulk-concurrency">并发数</Label>
+              <Input
+                id="pixel-bulk-concurrency"
+                type="number"
+                min={3}
+                max={50}
+                step={1}
+                value={bulkConcurrency}
+                placeholder="留空则不修改（3-50）"
+                onChange={(event) => setBulkConcurrency(event.target.value)}
+              />
+              {!bulkConcurrencyValid && <div className="text-xs font-bold text-rose-600">请输入 3 到 50 的整数</div>}
+            </div>
+          </div>
+          <div className="mt-5 flex justify-end gap-2">
+            <Button variant="outline" disabled={bulkAction === "update"} onClick={() => setBulkEditOpen(false)}>取消</Button>
+            <Button disabled={!bulkEditReady || !bulkConcurrencyValid || bulkAction === "update"} onClick={() => void runBulkUpdate()}>
+              {bulkAction === "update" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+              {bulkAction === "update" ? "正在保存" : "确认修改"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={bulkDeleteOpen}
+        onOpenChange={(open) => {
+          if (bulkAction) return;
+          setBulkDeleteOpen(open);
+          if (!open) setBulkDeleteAccountIds([]);
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>确认批量删除</DialogTitle>
+            <DialogDescription>
+              将从 {activeTarget?.email || "当前平台账号"} 永久删除已选择的 {bulkDeleteAccountIds.length} 个账号，此操作无法撤销。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-3 text-sm font-bold text-rose-700">
+            只会删除当前表格中已勾选的账号，不会影响其他平台账号。
+          </div>
+          <div className="mt-5 flex justify-end gap-2">
+            <Button variant="outline" disabled={bulkAction === "delete"} onClick={() => setBulkDeleteOpen(false)}>取消</Button>
+            <Button
+              variant="destructive"
+              className="min-w-[116px] disabled:opacity-100"
+              aria-busy={bulkAction === "delete"}
+              disabled={!bulkDeleteAccountIds.length || bulkAction === "delete"}
+              onClick={() => void runBulkDelete()}
+            >
+              {bulkAction === "delete" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+              {bulkAction === "delete" ? "正在删除" : `删除 ${bulkDeleteAccountIds.length} 个`}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+type PixelUsageLoadState =
+  | { status: "loading" }
+  | { status: "ready"; usage: PixelAccountUsage }
+  | { status: "error" };
+
+function PixelAccountsTable({
+  targetId,
+  items,
+  selectedIds,
+  onToggle,
+  onToggleAll,
+}: {
+  targetId: string;
+  items: PixelAccount[];
+  selectedIds: Set<number>;
+  onToggle: (accountId: number) => void;
+  onToggleAll: () => void;
+}) {
+  const [usageStates, setUsageStates] = useState<Record<number, PixelUsageLoadState>>({});
+  const usageStatesRef = useRef<Record<number, PixelUsageLoadState>>({});
+  const usageQueueRef = useRef<number[]>([]);
+  const activeUsageRequestsRef = useRef(0);
+  const usageControllersRef = useRef<Map<number, AbortController>>(new Map());
+  const mountedRef = useRef(true);
+  const [usageQueueVersion, setUsageQueueVersion] = useState(0);
+
+  useEffect(() => () => {
+    mountedRef.current = false;
+    usageQueueRef.current = [];
+    usageControllersRef.current.forEach((controller) => controller.abort());
+    usageControllersRef.current.clear();
+  }, []);
+
+  useEffect(() => {
+    while (activeUsageRequestsRef.current < 5 && usageQueueRef.current.length > 0) {
+      const accountId = usageQueueRef.current.shift();
+      if (accountId === undefined) break;
+      const controller = new AbortController();
+      usageControllersRef.current.set(accountId, controller);
+      activeUsageRequestsRef.current += 1;
+      void api.pixelAccountUsage(targetId, accountId, controller.signal)
+        .then((usage) => {
+          if (!mountedRef.current || controller.signal.aborted) return;
+          const next = { ...usageStatesRef.current, [accountId]: { status: "ready", usage } as PixelUsageLoadState };
+          usageStatesRef.current = next;
+          setUsageStates(next);
+        })
+        .catch(() => {
+          if (!mountedRef.current || controller.signal.aborted) return;
+          const next = { ...usageStatesRef.current, [accountId]: { status: "error" } as PixelUsageLoadState };
+          usageStatesRef.current = next;
+          setUsageStates(next);
+        })
+        .finally(() => {
+          usageControllersRef.current.delete(accountId);
+          activeUsageRequestsRef.current = Math.max(activeUsageRequestsRef.current - 1, 0);
+          if (mountedRef.current) setUsageQueueVersion((value) => value + 1);
+        });
+    }
+  }, [targetId, usageQueueVersion]);
+
+  const requestUsage = useCallback((accountId: number) => {
+    if (usageStatesRef.current[accountId]) return;
+    const next = { ...usageStatesRef.current, [accountId]: { status: "loading" } as PixelUsageLoadState };
+    usageStatesRef.current = next;
+    setUsageStates(next);
+    usageQueueRef.current.push(accountId);
+    setUsageQueueVersion((value) => value + 1);
+  }, []);
+
+  if (!items.length) {
+    return <div className="flex min-h-0 flex-1 items-center justify-center text-sm font-bold text-muted-foreground">当前账号没有已导入数据</div>;
+  }
+  const selectedOnPage = items.filter((account) => selectedIds.has(account.id)).length;
+  const allSelected = selectedOnPage === items.length;
+  return (
+    <div className="min-h-0 flex-1 overflow-auto">
+      <table className="w-full min-w-[1158px] table-fixed text-left text-xs">
+        <thead className="sticky top-0 z-10 bg-muted text-[11px] font-black text-muted-foreground">
+          <tr>
+            <th className="w-[48px] px-3 py-2.5 text-center">
+              <Checkbox
+                aria-label="选择当前页全部账号"
+                checked={allSelected ? true : selectedOnPage > 0 ? "indeterminate" : false}
+                onCheckedChange={onToggleAll}
+              />
+            </th>
+            <th className="w-[220px] px-3 py-2.5">账号名称</th>
+            <th className="w-[92px] px-3 py-2.5">等级</th>
+            <th className="w-[92px] px-3 py-2.5">状态</th>
+            <th className="w-[104px] px-3 py-2.5">调度</th>
+            <th className="w-[118px] px-3 py-2.5">公共共享</th>
+            <th className="w-[82px] px-3 py-2.5">5h</th>
+            <th className="w-[82px] px-3 py-2.5">7d</th>
+            <th className="w-[100px] px-3 py-2.5">并发</th>
+            <th className="w-[220px] px-3 py-2.5">错误</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((account) => (
+            <PixelAccountRow
+              key={account.id}
+              account={account}
+              selected={selectedIds.has(account.id)}
+              usageState={usageStates[account.id]}
+              onToggle={onToggle}
+              onVisible={requestUsage}
+            />
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function PixelAccountRow({
+  account,
+  selected,
+  usageState,
+  onToggle,
+  onVisible,
+}: {
+  account: PixelAccount;
+  selected: boolean;
+  usageState?: PixelUsageLoadState;
+  onToggle: (accountId: number) => void;
+  onVisible: (accountId: number) => void;
+}) {
+  const rowRef = useRef<HTMLTableRowElement>(null);
+  const effectiveStatus = pixelEffectiveStatus(account);
+
+  useEffect(() => {
+    const row = rowRef.current;
+    if (!row) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      onVisible(account.id);
+      observer.disconnect();
+    }, { rootMargin: "80px 0px" });
+    observer.observe(row);
+    return () => observer.disconnect();
+  }, [account.id, onVisible]);
+
+  return (
+    <tr ref={rowRef} className={cn("border-t border-border align-middle hover:bg-muted/50", selected && "bg-blue-50/70")}>
+      <td className="px-3 py-2.5 text-center">
+        <Checkbox aria-label={`选择账号 ${account.name || account.id}`} checked={selected} onCheckedChange={() => onToggle(account.id)} />
+      </td>
+      <td className="px-3 py-2.5">
+        <div className="truncate font-black text-foreground" title={account.name}>{account.name || "-"}</div>
+        <div className="mt-0.5 text-[11px] font-bold uppercase text-muted-foreground">{account.platform || "openai"}</div>
+      </td>
+      <td className="px-3 py-2.5"><StatusPill tone="blue">{(account.accountLevel || "plus").toUpperCase()}</StatusPill></td>
+      <td className="px-3 py-2.5">
+        <StatusPill tone={effectiveStatus === "active" ? "green" : effectiveStatus === "error" ? "red" : effectiveStatus === "codex_quota_protected" ? "blue" : effectiveStatus === "rate_limited" ? "amber" : "gray"}>
+          {pixelStatusLabel(effectiveStatus)}
+        </StatusPill>
+      </td>
+      <td className="px-3 py-2.5"><StatusPill tone={account.schedulable ? "green" : "amber"}>{account.schedulable ? "可调度" : "不可调度"}</StatusPill></td>
+      <td className="px-3 py-2.5"><StatusPill tone={account.shareMode === "public" && ["approved", "active", ""].includes(account.shareStatus || "") ? "green" : account.shareMode === "public" ? "amber" : "gray"}>{pixelShareLabel(account)}</StatusPill></td>
+      <td className="px-3 py-2.5"><PixelUsageValue state={usageState} window="5h" /></td>
+      <td className="px-3 py-2.5"><PixelUsageValue state={usageState} window="7d" /></td>
+      <td className="px-3 py-2.5 font-black">{account.currentConcurrency} / {account.concurrency}</td>
+      <td className="px-3 py-2.5"><div className={cn("truncate font-semibold", account.errorMessage ? "text-rose-600" : "text-muted-foreground")} title={account.errorMessage}>{account.errorMessage || "-"}</div></td>
+    </tr>
+  );
+}
+
+function PixelUsageValue({ state, window }: { state?: PixelUsageLoadState; window: "5h" | "7d" }) {
+  if (!state || state.status === "loading") {
+    return <Loader2 className={cn("h-3.5 w-3.5 animate-spin", window === "5h" ? "text-emerald-600" : "text-violet-600")} />;
+  }
+  if (state.status === "error") {
+    return <span className="font-bold text-rose-600" title="额度读取失败">失败</span>;
+  }
+  const value = window === "5h" ? state.usage.codex5hLimitPercent : state.usage.codex7dLimitPercent;
+  return <span className={cn("font-black", window === "5h" ? "text-emerald-700" : "text-violet-700")}>{formatPercent(value)}</span>;
+}
+
+function PixelImportProgress({ job, targets }: { job: PixelImportJob; targets: PixelTarget[] }) {
+  const currentTarget = targets.find((target) => target.id === job.currentTargetId);
+  const completed = Math.min(job.completedTargets, job.totalTargets);
+  const percent = job.totalTargets ? Math.round((completed / job.totalTargets) * 100) : 0;
+  const failed = job.status === "failed";
+  const finished = job.status === "completed";
+  const waiting = job.phase === "waiting";
+  const label = failed
+    ? job.error || "导入任务失败"
+    : finished
+      ? "全部平台账号处理完成"
+      : waiting
+        ? `等待 ${Math.round(job.waitSeconds)} 秒后处理 ${currentTarget?.email || "下一个平台账号"}`
+        : `正在处理 ${currentTarget?.email || "平台账号"}`;
+  return (
+    <Card className={cn(failed ? "border-rose-200" : finished ? "border-emerald-200" : waiting ? "border-amber-200" : "border-blue-200")}>
+      <CardContent className="flex min-h-20 items-center gap-4 p-4">
+        <div className={cn(
+          "flex h-10 w-10 shrink-0 items-center justify-center rounded-md",
+          failed ? "bg-rose-50 text-rose-600" : finished ? "bg-emerald-50 text-emerald-600" : waiting ? "bg-amber-50 text-amber-600" : "bg-blue-50 text-blue-600",
+        )}>
+          {failed ? <AlertTriangle className="h-5 w-5" /> : finished ? <CheckCircle2 className="h-5 w-5" /> : <Loader2 className="h-5 w-5 animate-spin" />}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center justify-between gap-3">
+            <div className="truncate text-sm font-black">{label}</div>
+            <div className="shrink-0 text-xs font-black text-muted-foreground">{completed} / {job.totalTargets}</div>
+          </div>
+          <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-100">
+            <div
+              className={cn("h-full rounded-full transition-all duration-500", failed ? "bg-rose-500" : finished ? "bg-emerald-500" : waiting ? "bg-amber-500" : "bg-blue-500")}
+              style={{ width: `${finished ? 100 : percent}%` }}
+            />
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function PixelExportProgress({ job, targets }: { job: PixelExportJob; targets: PixelTarget[] }) {
+  const currentTarget = targets.find((target) => target.id === job.currentTargetId);
+  const completed = Math.min(job.completedTargets, job.totalTargets);
+  const percent = job.totalTargets ? Math.round((completed / job.totalTargets) * 100) : 0;
+  const phaseLabel = {
+    queued: "准备汇总整理",
+    exporting: "正在导出七个平台账号",
+    backing_up: "正在保存服务器备份",
+    deleting: `正在清空 ${currentTarget?.email || "平台账号"}`,
+    importing: `正在重新导入 ${currentTarget?.email || "平台账号"}`,
+    waiting: `等待 ${Math.round(job.waitSeconds)} 秒后处理 ${currentTarget?.email || "下一个平台账号"}`,
+    completed: "汇总整理完成",
+    failed: job.error || "汇总整理失败",
+  }[job.phase];
+  const exported = job.export?.deduplicatedCount;
+  return (
+    <Card className={cn(job.phase === "failed" ? "border-rose-200" : job.phase === "waiting" ? "border-amber-200" : "border-blue-200")}>
+      <CardContent className="flex min-h-20 items-center gap-4 p-4">
+        <div className={cn(
+          "flex h-10 w-10 shrink-0 items-center justify-center rounded-md",
+          job.phase === "failed" ? "bg-rose-50 text-rose-600" : job.phase === "waiting" ? "bg-amber-50 text-amber-600" : "bg-blue-50 text-blue-600",
+        )}>
+          {job.phase === "failed" ? <AlertTriangle className="h-5 w-5" /> : <Loader2 className="h-5 w-5 animate-spin" />}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center justify-between gap-3">
+            <div className="truncate text-sm font-black">{phaseLabel}</div>
+            <div className="shrink-0 text-xs font-black text-muted-foreground">{completed} / {job.totalTargets}</div>
+          </div>
+          <div className="mt-1 text-xs font-bold text-muted-foreground">
+            {exported ? `已备份 ${exported} 个账号 · ${job.export?.batchCount || 0} 个 100 分组` : "导出成功后才会进入删除阶段"}
+          </div>
+          <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-100">
+            <div className={cn("h-full rounded-full transition-all duration-500", job.phase === "waiting" ? "bg-amber-500" : "bg-blue-500")} style={{ width: `${percent}%` }} />
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function PixelExportResults({
+  job,
+  retryingTargetId,
+  onRetry,
+}: {
+  job: PixelExportJob;
+  retryingTargetId: string;
+  onRetry: (result: PixelImportTargetResult) => Promise<void>;
+}) {
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardContent className="grid gap-3 p-4 sm:grid-cols-4">
+          <div><div className="text-xs font-bold text-muted-foreground">导出账号</div><div className="text-lg font-black text-blue-700">{job.export?.sourceCount ?? 0}</div></div>
+          <div><div className="text-xs font-bold text-muted-foreground">去重后</div><div className="text-lg font-black text-emerald-700">{job.export?.deduplicatedCount ?? 0}</div></div>
+          <div><div className="text-xs font-bold text-muted-foreground">重复剔除</div><div className="text-lg font-black text-amber-700">{job.export?.duplicateCount ?? 0}</div></div>
+          <div><div className="text-xs font-bold text-muted-foreground">100 分组</div><div className="text-lg font-black text-violet-700">{job.export?.batchCount ?? 0}</div></div>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader className="border-b border-border">
+          <CardTitle>删除结果</CardTitle>
+          <span className="text-xs font-black text-muted-foreground">七个平台账号</span>
+        </CardHeader>
+        <CardContent className="p-0">
+          <div className="overflow-auto">
+            <table className="w-full min-w-[760px] text-left text-xs">
+              <thead className="bg-muted text-[11px] font-black text-muted-foreground">
+                <tr><th className="px-3 py-2.5">平台账号</th><th className="px-3 py-2.5">状态</th><th className="px-3 py-2.5">原数量</th><th className="px-3 py-2.5">已删除</th><th className="px-3 py-2.5">失败</th><th className="px-3 py-2.5">说明</th></tr>
+              </thead>
+              <tbody>
+                {job.deleteResults.map((result) => (
+                  <tr key={result.targetId} className="border-t border-border">
+                    <td className="px-3 py-3 font-black">{result.email}</td>
+                    <td className="px-3 py-3"><StatusPill tone={result.status === "success" ? "green" : result.status === "partial" ? "amber" : "red"}>{result.status === "success" ? "已清空" : result.status === "partial" ? "部分失败" : "失败"}</StatusPill></td>
+                    <td className="px-3 py-3 font-black">{result.total}</td>
+                    <td className="px-3 py-3 font-black text-emerald-700">{result.deleted}</td>
+                    <td className={cn("px-3 py-3 font-black", result.failed ? "text-rose-600" : "text-slate-400")}>{result.failed}</td>
+                    <td className="px-3 py-3"><div className="truncate font-bold text-muted-foreground" title={result.message}>{result.message || "-"}</div></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </CardContent>
+      </Card>
+      <PixelImportResults results={job.results} retryingTargetId={retryingTargetId} onRetry={onRetry} />
+    </div>
+  );
+}
+
+function PixelImportResults({
+  results,
+  retryingTargetId,
+  onRetry,
+}: {
+  results: PixelImportTargetResult[];
+  retryingTargetId: string;
+  onRetry: (result: PixelImportTargetResult) => Promise<void>;
+}) {
+  return (
+    <Card>
+      <CardHeader className="border-b border-border">
+        <CardTitle>最近一次导入结果</CardTitle>
+        <span className="text-xs font-black text-muted-foreground">{results.length} 个平台账号</span>
+      </CardHeader>
+      <CardContent className="p-0">
+        <div className="overflow-auto">
+          <table className="w-full min-w-[980px] text-left text-xs">
+            <thead className="bg-muted text-[11px] font-black text-muted-foreground">
+              <tr>
+                <th className="px-3 py-2.5">平台账号</th>
+                <th className="px-3 py-2.5">状态</th>
+                <th className="px-3 py-2.5">生成文件</th>
+                <th className="px-3 py-2.5">创建</th>
+                <th className="px-3 py-2.5">更新</th>
+                <th className="px-3 py-2.5">导入失败</th>
+                <th className="px-3 py-2.5">已公共共享</th>
+                <th className="px-3 py-2.5">共享失败</th>
+                <th className="px-3 py-2.5">结果</th>
+                <th className="w-[110px] px-3 py-2.5">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {results.map((result) => (
+                <tr key={result.targetId} className="border-t border-border">
+                  <td className="px-3 py-3 font-black">{result.email}</td>
+                  <td className="px-3 py-3"><StatusPill tone={result.status === "success" ? "green" : result.status === "partial" ? "amber" : "red"}>{result.status === "success" ? "成功" : result.status === "partial" ? "部分成功" : "失败"}</StatusPill></td>
+                  <td className="px-3 py-3 font-mono text-[11px] font-bold text-slate-500">{result.generatedFileName || "-"}</td>
+                  <td className="px-3 py-3 font-black text-blue-600">{result.created}</td>
+                  <td className="px-3 py-3 font-black text-violet-600">{result.updated}</td>
+                  <td className={cn("px-3 py-3 font-black", result.failed ? "text-rose-600" : "text-slate-400")}>{result.failed}</td>
+                  <td className="px-3 py-3 font-black text-emerald-600">{result.shared}</td>
+                  <td className={cn("px-3 py-3 font-black", result.shareFailed ? "text-rose-600" : "text-slate-400")}>{result.shareFailed}</td>
+                  <td className="max-w-[260px] px-3 py-3"><div className={cn("truncate font-bold", result.status === "failed" ? "text-rose-600" : "text-muted-foreground")} title={result.message}>{result.message || "-"}</div></td>
+                  <td className="px-3 py-3">
+                    <Button variant="outline" size="sm" disabled={!result.failedShareIds.length || retryingTargetId === result.targetId} onClick={() => void onRetry(result)}>
+                      {retryingTargetId === result.targetId ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
+                      重试共享
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function StatusPill({ children, tone }: { children: React.ReactNode; tone: "green" | "red" | "amber" | "blue" | "gray" }) {
+  const styles = {
+    green: "border-emerald-200 bg-emerald-50 text-emerald-700",
+    red: "border-rose-200 bg-rose-50 text-rose-700",
+    amber: "border-amber-200 bg-amber-50 text-amber-700",
+    blue: "border-blue-200 bg-blue-50 text-blue-700",
+    gray: "border-slate-200 bg-slate-50 text-slate-600",
+  };
+  return <span className={cn("inline-flex min-h-6 items-center rounded border px-2 text-[11px] font-black", styles[tone])}>{children}</span>;
+}
+
+function pixelStatusLabel(status: string) {
+  if (status === "active") return "正常";
+  if (status === "codex_quota_protected") return "限额保护中";
+  if (status === "rate_limited") return "限流中";
+  if (status === "temp_unschedulable") return "临时暂停";
+  if (status === "unschedulable") return "不可调度";
+  if (status === "error") return "错误";
+  if (status === "inactive") return "停用";
+  if (status === "disabled") return "禁用";
+  if (status === "paused") return "暂停";
+  return status || "未知";
+}
+
+function pixelEffectiveStatus(account: PixelAccount) {
+  if (account.status === "error") return "error";
+  const now = Date.now();
+  const rateLimitResetAt = account.rateLimitResetAt ? Date.parse(account.rateLimitResetAt) : Number.NaN;
+  if (Number.isFinite(rateLimitResetAt) && rateLimitResetAt > now) return "rate_limited";
+  const quotaResetAt = account.codexQuotaProtectionResetAt ? Date.parse(account.codexQuotaProtectionResetAt) : Number.NaN;
+  if (account.codexQuotaProtectionReason && (!Number.isFinite(quotaResetAt) || quotaResetAt > now)) {
+    return "codex_quota_protected";
+  }
+  return account.status;
+}
+
+function pixelShareLabel(account: PixelAccount) {
+  if (account.shareMode !== "public") return "私有";
+  if (account.shareStatus === "pending") return "公共 · 审核中";
+  if (account.shareStatus === "suspended") return "公共 · 暂停";
+  return "公共 · 已开启";
+}
+
+function formatPercent(value: number | null) {
+  return value === null || !Number.isFinite(value) ? "-" : `${Math.round(value)}%`;
+}
+
+function formatFileSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function CostView({
   stored,
   latestBalance,
@@ -2180,6 +3592,18 @@ function OverviewCardsSkeleton() {
 }
 
 function ViewSkeleton({ view }: { view: ViewKey }) {
+  if (view === "manager") {
+    return (
+      <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
+        <Card className="shrink-0"><CardContent className="flex h-20 items-center justify-between p-4"><SkeletonLine className="h-11 w-56" /><div className="flex gap-2"><SkeletonLine className="h-9 w-24 rounded-md" /><SkeletonLine className="h-9 w-28 rounded-md" /></div></CardContent></Card>
+        <div className="grid min-h-0 flex-1 grid-cols-[220px_minmax(0,1fr)] gap-4">
+          <Card className="flex min-h-0 flex-col overflow-hidden"><CardHeader className="shrink-0"><SkeletonLine className="h-5 w-24" /></CardHeader><CardContent className="min-h-0 flex-1 space-y-2 overflow-hidden">{Array.from({ length: 7 }).map((_, index) => <SkeletonLine key={index} className="h-14 w-full rounded-md" />)}</CardContent></Card>
+          <SkeletonTable rows={9} />
+        </div>
+      </div>
+    );
+  }
+
   if (view === "pools") {
     return (
       <div className="space-y-4">

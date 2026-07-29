@@ -306,6 +306,162 @@ export type ServerRefreshResponse = {
   state?: ServerStateResponse;
 };
 
+export type PixelTarget = {
+  id: string;
+  email: string;
+  connected: boolean;
+  accountCount: number | null;
+  lastCheckedAt: string | null;
+  error: string | null;
+};
+
+export type PixelAccount = {
+  id: number;
+  name: string;
+  platform: string;
+  accountLevel: string;
+  type: string;
+  shareMode: string;
+  shareStatus: string;
+  concurrency: number;
+  currentConcurrency: number;
+  priority: number;
+  status: string;
+  schedulable: boolean;
+  credentialsStatus: string;
+  errorMessage: string;
+  errorSince: string | null;
+  expiresAt: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  codex5hLimitPercent: number | null;
+  codex7dLimitPercent: number | null;
+  rateLimitedAt: string | null;
+  rateLimitResetAt: string | null;
+  codexQuotaProtectionReason: string | null;
+  codexQuotaProtectionResetAt: string | null;
+  groups: Array<{ id: number; name: string }>;
+};
+
+export type PixelAccountPage = {
+  items: PixelAccount[];
+  total: number;
+  page: number;
+  pageSize: number;
+  pages: number;
+  target: PixelTarget;
+};
+
+export type PixelAccountUsage = {
+  accountId: number;
+  codex5hLimitPercent: number | null;
+  codex7dLimitPercent: number | null;
+};
+
+export type PixelBulkOperationResponse = {
+  ok: boolean;
+  success: number;
+  failed: number;
+  successIds?: number[];
+  failedIds?: number[];
+  message?: string | null;
+};
+
+export type PixelBulkUpdateRequest = {
+  accountIds: number[];
+  makePublic: boolean;
+  concurrency?: number;
+};
+
+export type PixelImportTargetResult = {
+  targetId: string;
+  email: string;
+  generatedFileName: string;
+  sourceCount: number;
+  created: number;
+  updated: number;
+  failed: number;
+  shared: number;
+  shareFailed: number;
+  failedShareIds: number[];
+  status: "success" | "partial" | "failed";
+  message: string;
+};
+
+export type PixelImportResponse = {
+  ok: boolean;
+  sourceFileName: string;
+  sourceCount: number;
+  results: PixelImportTargetResult[];
+};
+
+export type PixelImportJob = {
+  jobId: string;
+  status: "queued" | "running" | "completed" | "failed";
+  phase: "queued" | "processing" | "waiting" | "completed" | "failed";
+  createdAt: string;
+  updatedAt: string;
+  sourceFileName: string;
+  sourceCount: number;
+  currentTargetId: string | null;
+  completedTargets: number;
+  totalTargets: number;
+  waitSeconds: number;
+  results: PixelImportTargetResult[];
+  error: string | null;
+};
+
+export type PixelDeleteTargetResult = {
+  targetId: string;
+  email: string;
+  total: number;
+  deleted: number;
+  failed: number;
+  failedIds: number[];
+  status: "success" | "partial" | "failed";
+  message: string;
+};
+
+export type PixelExportJob = {
+  jobId: string;
+  status: "queued" | "running" | "completed" | "failed";
+  phase: "queued" | "exporting" | "backing_up" | "deleting" | "importing" | "waiting" | "completed" | "failed";
+  createdAt: string;
+  updatedAt: string;
+  mode: "export_delete_reimport";
+  currentTargetId: string | null;
+  completedTargets: number;
+  totalTargets: number;
+  waitSeconds: number;
+  backupFileName: string | null;
+  export: {
+    sourceCount: number;
+    deduplicatedCount: number;
+    duplicateCount: number;
+    batchCount: number;
+  } | null;
+  deleteResults: PixelDeleteTargetResult[];
+  results: PixelImportTargetResult[];
+  error: string | null;
+};
+
+export type PixelShareResponse = {
+  ok: boolean;
+  success: number;
+  failed: number;
+  successIds: number[];
+  failedIds: number[];
+};
+
+export type PixelExportDownload = {
+  blob: Blob;
+  fileName: string;
+  sourceCount: number;
+  deduplicatedCount: number;
+  duplicateCount: number;
+  batchCount: number;
+};
+
 export type PoolMetricKey =
   | "remaining5h"
   | "remaining7d"

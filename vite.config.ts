@@ -9,7 +9,7 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       "/gpt-api": {
-        target: "https://lynote.xyz",
+        target: process.env.VITE_API_PROXY_TARGET || "https://lynote.xyz",
         changeOrigin: true,
       },
     },
