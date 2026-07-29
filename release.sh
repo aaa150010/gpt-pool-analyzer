@@ -5,8 +5,6 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VERSION="${1:-}"
 TAG="v$VERSION"
 REPOSITORY="aaa150010/gpt-pool-analyzer"
-SPARKLE_ACCOUNT="gpt-pool-analyzer"
-SPARKLE_VERSION="2.9.4"
 
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "Usage: ./release.sh <version>, for example: ./release.sh 1.0.1" >&2
@@ -15,8 +13,8 @@ fi
 
 cd "$PROJECT_DIR"
 
-if [[ -n "$(git status --porcelain -- . ':(exclude)RELEASE_NOTES.md')" ]]; then
-    echo "Commit existing changes before creating a release. RELEASE_NOTES.md may remain uncommitted." >&2
+if [[ -n "$(git status --porcelain)" ]]; then
+    echo "Commit existing changes before creating a release." >&2
     exit 1
 fi
 
@@ -25,8 +23,9 @@ if git rev-parse "$TAG" >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! gh auth status >/dev/null; then
-    echo "Warning: gh auth status failed; continuing and letting git/gh release commands report any real auth errors." >&2
+if ! gh auth status >/dev/null 2>&1; then
+    echo "GitHub CLI authentication is required before release. Run: gh auth login -h github.com" >&2
+    exit 1
 fi
 
 CURRENT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)"
@@ -59,17 +58,13 @@ perl -0pi -e "s/(name = \"gpt-analyzer\"\\nversion = \")[^\"]+\"/\${1}$VERSION\"
 ./build.sh
 
 RELEASE_DIR="$PROJECT_DIR/build/release"
-UPDATE_DIR="$RELEASE_DIR/updates"
-SPARKLE_DIR="$PROJECT_DIR/.cache/sparkle/Sparkle-$SPARKLE_VERSION"
 rm -rf "$RELEASE_DIR"
-mkdir -p "$UPDATE_DIR"
+mkdir -p "$RELEASE_DIR"
 
-cp "dist/91.zip" "$UPDATE_DIR/91-$VERSION.zip"
-cp RELEASE_NOTES.md "$UPDATE_DIR/91-$VERSION.md"
+cp "dist/91.zip" "$RELEASE_DIR/91-$VERSION.zip"
 
 RELEASE_ASSETS=(
     "$RELEASE_DIR/91-$VERSION.zip"
-    "$RELEASE_DIR/appcast.xml"
     "$RELEASE_DIR/SHA256SUMS.txt"
 )
 
@@ -78,16 +73,6 @@ if [[ -f "dist/91.dmg" ]]; then
     RELEASE_ASSETS=("$RELEASE_DIR/91-$VERSION.dmg" "${RELEASE_ASSETS[@]}")
 fi
 
-"$SPARKLE_DIR/bin/generate_appcast" \
-    --account "$SPARKLE_ACCOUNT" \
-    --download-url-prefix "https://github.com/$REPOSITORY/releases/download/$TAG/" \
-    --link "https://github.com/$REPOSITORY" \
-    --embed-release-notes \
-    --maximum-versions 1 \
-    -o "$RELEASE_DIR/appcast.xml" \
-    "$UPDATE_DIR"
-
-mv "$UPDATE_DIR/91-$VERSION.zip" "$RELEASE_DIR/91-$VERSION.zip"
 shasum -a 256 "$RELEASE_DIR/91-$VERSION.zip" > "$RELEASE_DIR/SHA256SUMS.txt"
 if [[ -f "$RELEASE_DIR/91-$VERSION.dmg" ]]; then
     shasum -a 256 "$RELEASE_DIR/91-$VERSION.dmg" >> "$RELEASE_DIR/SHA256SUMS.txt"
@@ -98,15 +83,18 @@ if [[ -n "$(git status --porcelain -- Info.plist RELEASE_NOTES.md package.json p
     git commit -m "Release $TAG"
 fi
 
-git tag -a "$TAG" -m "91 $VERSION"
 git push origin main
-git push origin "$TAG"
 
 gh release create "$TAG" \
     "${RELEASE_ASSETS[@]}" \
     --repo "$REPOSITORY" \
+    --target "$(git rev-parse HEAD)" \
+    --draft \
     --title "91 $VERSION" \
     --notes-file RELEASE_NOTES.md
+
+gh release edit "$TAG" --repo "$REPOSITORY" --draft=false
+git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
 
 rm -rf "$PROJECT_DIR/build/91.app" "$PROJECT_DIR/build/dmg-stage"
 

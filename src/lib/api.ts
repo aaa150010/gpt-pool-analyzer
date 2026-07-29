@@ -1,15 +1,19 @@
 import type {
   BalanceAccount,
   CostAddition,
+  CursorPage,
+  PoolAnalyticsResponse,
   PoolAnalyzerState,
   PoolCredentials,
+  PoolSnapshot,
   ServerRefreshResponse,
   ServerStateResponse,
+  Snapshot,
   SMTPSettings,
   StoredState,
 } from "./types";
 
-const API_BASE = "https://lynote.xyz/gpt-api";
+const API_BASE = import.meta.env.DEV ? "/gpt-api" : "https://lynote.xyz/gpt-api";
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -39,6 +43,18 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ poolState }),
     }),
+  poolAnalytics: (groupName: string, days: number) =>
+    requestJson<PoolAnalyticsResponse>(`/pool-analytics?groupName=${encodeURIComponent(groupName)}&days=${days}`),
+  poolHistory: (groupName: string, cursor?: number | null, limit = 200) => {
+    const params = new URLSearchParams({ groupName, limit: String(limit) });
+    if (cursor !== null && cursor !== undefined) params.set("cursor", String(cursor));
+    return requestJson<CursorPage<PoolSnapshot>>(`/pool-history?${params.toString()}`);
+  },
+  balanceHistory: (cursor?: number | null, limit = 200) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (cursor !== null && cursor !== undefined) params.set("cursor", String(cursor));
+    return requestJson<CursorPage<Snapshot>>(`/balance-history?${params.toString()}`);
+  },
   addCost: (addition: CostAddition) =>
     requestJson<ServerRefreshResponse>("/cost-additions", {
       method: "POST",

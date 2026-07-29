@@ -1,9 +1,11 @@
 import { AnimatePresence, motion, useMotionValue, useSpring, useTransform } from "framer-motion";
 import {
   Activity,
+  AlertTriangle,
   Bell,
   Calculator,
   CheckCircle2,
+  Clock3,
   Database,
   History,
   Loader2,
@@ -23,7 +25,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Area,
   AreaChart,
+  Bar,
   CartesianGrid,
+  ComposedChart,
   Legend,
   Line,
   LineChart,
@@ -36,7 +40,12 @@ import { api } from "./lib/api";
 import type {
   BalanceAccount,
   CostAddition,
+  DailyPoolUsage,
+  DeathAnalysisDay,
+  DeathTimelineHour,
+  PoolAnalyticsResponse,
   PoolAnalyzerState,
+  PoolForecast,
   PoolCredentials,
   PoolMetricKey,
   PoolSnapshot,
@@ -306,15 +315,17 @@ export function App() {
 
       <main className="min-h-screen">
         <section className="space-y-4 p-4">
-            {loading ? (
-              <OverviewCardsSkeleton />
-            ) : (
-              <OverviewCards
-                latestTotal={latestBalance?.total}
-                cost={totalCost}
-                costSummary={costSummary}
-                net={latestBalance ? latestBalance.total - totalCost : undefined}
-              />
+            {view !== "trends" && (
+              loading ? (
+                <OverviewCardsSkeleton />
+              ) : (
+                <OverviewCards
+                  latestTotal={latestBalance?.total}
+                  cost={totalCost}
+                  costSummary={costSummary}
+                  net={latestBalance ? latestBalance.total - totalCost : undefined}
+                />
+              )
             )}
 
           <AnimatePresence mode="wait">
@@ -327,7 +338,13 @@ export function App() {
             >
               {loading && <ViewSkeleton view={view} />}
               {!loading && view === "trends" && (
-                <TrendsView stored={stored} pool={pool} selectedGroups={activeSelectedGroups} />
+                <TrendsView
+                  stored={stored}
+                  pool={pool}
+                  selectedGroups={activeSelectedGroups}
+                  availableGroups={availableGroups}
+                  onPoolChange={(next) => void savePoolState(next)}
+                />
               )}
               {!loading && view === "pools" && (
                 <PoolsView
@@ -440,10 +457,14 @@ function TrendsView({
   stored,
   pool,
   selectedGroups,
+  availableGroups,
+  onPoolChange,
 }: {
   stored: StoredState;
   pool: PoolAnalyzerState;
   selectedGroups: string[];
+  availableGroups: string[];
+  onPoolChange: (pool: PoolAnalyzerState) => void;
 }) {
   const balanceRows = stored.history.map((item) => ({
     time: formatDateTime(item.date),
@@ -452,6 +473,12 @@ function TrendsView({
   }));
   return (
     <div className="space-y-4">
+      <PoolOperationsDashboard
+        pool={pool}
+        availableGroups={availableGroups}
+        preferredGroup={selectedGroups[0]}
+        onPoolChange={onPoolChange}
+      />
       <Card>
         <CardHeader>
           <CardTitle>账号池趋势</CardTitle>
@@ -467,7 +494,7 @@ function TrendsView({
       <Card>
         <CardHeader>
           <CardTitle>余额走势</CardTitle>
-          <span className="text-xs font-bold text-muted-foreground">最多保留 24 小时</span>
+          <span className="text-xs font-bold text-muted-foreground">趋势窗口：最近 24 小时</span>
         </CardHeader>
         <CardContent>
           <div className="h-[360px]">
@@ -493,6 +520,585 @@ function TrendsView({
       </Card>
     </div>
   );
+}
+
+function PoolOperationsDashboard({
+  pool,
+  availableGroups,
+  preferredGroup,
+  onPoolChange,
+}: {
+  pool: PoolAnalyzerState;
+  availableGroups: string[];
+  preferredGroup?: string;
+  onPoolChange: (pool: PoolAnalyzerState) => void;
+}) {
+  const fallbackGroup = preferredGroup && availableGroups.includes(preferredGroup) ? preferredGroup : availableGroups[0] ?? "PLUS共享号池";
+  const analyticsGroup = availableGroups.includes(pool.analyticsGroup ?? "") ? pool.analyticsGroup! : fallbackGroup;
+  const [days, setDays] = useState<7 | 30 | 90>(7);
+  const [analytics, setAnalytics] = useState<PoolAnalyticsResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const latestSnapshotDate = useMemo(
+    () => pool.history.filter((row) => row.groupName === analyticsGroup).at(-1)?.date,
+    [analyticsGroup, pool.history],
+  );
+
+  useEffect(() => {
+    if (!analyticsGroup) return;
+    let cancelled = false;
+    setLoading(true);
+    setError("");
+    void api
+      .poolAnalytics(analyticsGroup, days)
+      .then((response) => {
+        if (!cancelled) setAnalytics(response);
+      })
+      .catch((reason) => {
+        if (!cancelled) {
+          setAnalytics(null);
+          setError(reason instanceof Error ? reason.message : "运营分析加载失败");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [analyticsGroup, days, latestSnapshotDate]);
+
+  const setAnalyticsGroup = (group: string) => {
+    if (!group || group === analyticsGroup) return;
+    onPoolChange({ ...pool, analyticsGroup: group });
+  };
+
+  return (
+    <Card>
+      <CardHeader className="border-b border-border">
+        <div>
+          <CardTitle>账号池每日运营看板</CardTitle>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <select
+            aria-label="分析账号池"
+            value={analyticsGroup}
+            onChange={(event) => setAnalyticsGroup(event.target.value)}
+            className="h-9 rounded-md border border-border bg-background px-2.5 text-sm font-bold text-foreground outline-none focus:ring-2 focus:ring-ring"
+          >
+            {availableGroups.map((group) => (
+              <option key={group} value={group}>
+                {group}
+              </option>
+            ))}
+          </select>
+          <div className="flex h-9 overflow-hidden rounded-md border border-border bg-background" aria-label="统计范围">
+            {([7, 30, 90] as const).map((range) => (
+              <button
+                key={range}
+                onClick={() => setDays(range)}
+                className={cn(
+                  "min-w-11 border-l border-border px-2 text-xs font-black first:border-l-0",
+                  days === range ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground",
+                )}
+              >
+                {range}天
+              </button>
+            ))}
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="pt-4">
+        {loading && !analytics && <DashboardLoading />}
+        {!loading && error && (
+          <div className="flex min-h-32 items-center gap-3 rounded-md border border-rose-200 bg-rose-50 px-4 text-sm font-bold text-rose-700">
+            <AlertTriangle className="h-5 w-5 shrink-0" />
+            {error}
+          </div>
+        )}
+        {analytics && <PoolOperationsContent analytics={analytics} loading={loading} />}
+      </CardContent>
+    </Card>
+  );
+}
+
+function DashboardLoading() {
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-4 gap-3">
+        {Array.from({ length: 4 }).map((_, index) => (
+          <SkeletonLine key={index} className="h-20 rounded-md" />
+        ))}
+      </div>
+      <SkeletonLine className="h-[270px] rounded-md" />
+    </div>
+  );
+}
+
+function PoolOperationsContent({ analytics, loading }: { analytics: PoolAnalyticsResponse; loading: boolean }) {
+  const latestDaily = analytics.daily.at(-1);
+  const coverage = analytics.dataCoverage;
+  const nextThreeDays = analytics.forecasts.nextThreeDays?.length === 3
+    ? analytics.forecasts.nextThreeDays
+    : [analytics.forecasts.tomorrow, analytics.forecasts.nextWorkday, analytics.forecasts.nextNonWorkday];
+  const riskStyle = {
+    low: "border-emerald-200 bg-emerald-50 text-emerald-700",
+    medium: "border-amber-200 bg-amber-50 text-amber-700",
+    high: "border-rose-200 bg-rose-50 text-rose-700",
+    insufficient: "border-slate-200 bg-slate-50 text-slate-600",
+  }[analytics.risk.level];
+  return (
+    <div className={cn("space-y-4", loading && "opacity-60")}>
+      <div className="grid grid-cols-4 gap-3">
+        <MetricTile title="当前总账号" value={analytics.current?.total} accent="text-blue-600" size="normal" sub={analytics.groupName} />
+        <MetricTile title="今日估算 5h 消耗" value={latestDaily?.estimated5h} accent="text-emerald-600" digits={1} size="normal" />
+        <MetricTile title="今日估算 7d 消耗" value={latestDaily?.estimated7d} accent="text-violet-600" digits={1} size="normal" />
+        <MetricTile
+          title={`建议补号（未来 ${analytics.recommendation.horizonHours}h）`}
+          value={analytics.recommendation.replenish}
+          accent="text-blue-700"
+          size="normal"
+          suffix=" 个"
+          sub={(
+            <span className="inline-flex items-center gap-1.5">
+              <span>建议置信度</span>
+              <span className={cn("rounded border px-1.5 py-0.5 text-[10px] font-black leading-none", confidenceBadgeClass(analytics.forecasts.rolling24h.confidence))}>
+                {confidenceLabel(analytics.forecasts.rolling24h.confidence)}
+              </span>
+            </span>
+          )}
+        />
+      </div>
+
+      <div className="grid grid-cols-[minmax(0,1fr)_300px] gap-3">
+        <div className="min-w-0 rounded-md border border-border bg-background p-3">
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <div className="text-[13px] font-bold text-foreground">每日消耗与掉号趋势</div>
+            <span className="text-xs font-semibold text-muted-foreground">
+              完整 {coverage.completeDays}/{coverage.daysRequested} 天，合格样本 {coverage.eligibleDays} 天
+            </span>
+          </div>
+          <div className="h-[270px]">
+            <ResponsiveContainer width="100%" height="100%">
+              <ComposedChart data={buildOperationsChartRows(analytics.daily, analytics.forecasts)}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                <XAxis dataKey="date" minTickGap={28} tick={smallChartTick} axisLine={chartAxisLine} tickLine={chartTickLine} />
+                <YAxis yAxisId="usage" width={42} tick={smallChartTick} axisLine={chartAxisLine} tickLine={chartTickLine} />
+                <YAxis yAxisId="accounts" orientation="right" width={42} tick={smallChartTick} axisLine={chartAxisLine} tickLine={chartTickLine} />
+                <Tooltip contentStyle={tooltipStyle} labelStyle={tooltipLabelStyle} itemStyle={tooltipItemStyle} />
+                <Legend wrapperStyle={legendStyle} iconSize={7} />
+                <Bar yAxisId="accounts" dataKey="accountDecrease" name="账号减少" fill="#f97316" barSize={12} radius={[2, 2, 0, 0]} />
+                <Line yAxisId="usage" type="monotone" dataKey="estimated5h" name="5h 估算消耗" stroke="#059669" strokeWidth={2} dot={false} connectNulls />
+                <Line yAxisId="usage" type="monotone" dataKey="estimated7d" name="7d 估算消耗" stroke="#7c3aed" strokeWidth={2} dot={false} connectNulls />
+                <Line yAxisId="usage" type="monotone" dataKey="forecast5h" name="5h 预测" stroke="#059669" strokeWidth={1.8} strokeDasharray="5 4" dot={{ r: 3 }} connectNulls />
+                <Line yAxisId="usage" type="monotone" dataKey="forecast7d" name="7d 预测" stroke="#7c3aed" strokeWidth={1.8} strokeDasharray="5 4" dot={{ r: 3 }} connectNulls />
+                <Line yAxisId="accounts" type="monotone" dataKey="forecastDecrease" name="掉号预测" stroke="#f97316" strokeWidth={1.8} strokeDasharray="5 4" dot={{ r: 3 }} connectNulls />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+
+        <div className={cn("rounded-md border p-3", riskStyle)}>
+          <div className="flex items-center gap-2 text-sm font-black">
+            <AlertTriangle className="h-4 w-4" />
+            当前不补号风险：{riskLabel(analytics.risk.level)}
+          </div>
+          <div className="mt-2 space-y-1.5 text-xs font-semibold leading-5">
+            {analytics.risk.reasons.length ? analytics.risk.reasons.map((reason, index) => <p key={index}>{reason}</p>) : <p>暂未发现明显风险。</p>}
+          </div>
+          <div className="mt-4 border-t border-current/15 pt-3 text-xs font-semibold leading-5">
+            <div>5h 额度缺口：{formatMoney(analytics.recommendation.gap5h, 1)}</div>
+            <div>7d 额度缺口：{formatMoney(analytics.recommendation.gap7d, 1)}</div>
+            <div>预计 24h 账号减少：{formatMoney(analytics.forecasts.rolling24h.accountDecrease, 0)}</div>
+          </div>
+        </div>
+      </div>
+
+      {analytics.deathAnalysis && analytics.replenishmentTimingRisk && (
+        <DeathTimingAnalysis
+          analysis={analytics.deathAnalysis}
+          timing={analytics.replenishmentTimingRisk}
+          recommendation={analytics.recommendation.replenish}
+          capacityRisk={analytics.risk.level}
+        />
+      )}
+
+      <div className="grid grid-cols-3 gap-3">
+        {nextThreeDays.map((forecast, index) => (
+          <ForecastSummary key={`${forecast.date}-${index}`} title={["明天", "后天", "大后天"][index]} forecast={forecast} />
+        ))}
+      </div>
+
+      <DailyUsageTable
+        rows={analytics.daily}
+        deathDays={analytics.deathAnalysis?.daily}
+        timezone={analytics.timezone}
+        calendarFallback={analytics.calendarFallback}
+      />
+    </div>
+  );
+}
+
+function DeathTimingAnalysis({
+  analysis,
+  timing,
+  recommendation,
+  capacityRisk,
+}: {
+  analysis: NonNullable<PoolAnalyticsResponse["deathAnalysis"]>;
+  timing: NonNullable<PoolAnalyticsResponse["replenishmentTimingRisk"]>;
+  recommendation: number | null;
+  capacityRisk: PoolAnalyticsResponse["risk"]["level"];
+}) {
+  const timeline = new Map(analysis.timeline.map((item) => [`${item.date}-${item.hour}`, item]));
+  const maxErrors = Math.max(...analysis.timeline.map((item) => item.newErrors), 1);
+  const recent = analysis.recentErrorTrend;
+  const totals = analysis.daily.reduce(
+    (sum, row) => ({
+      newErrors: sum.newErrors + row.newErrors,
+      removals: sum.removals + row.inferredAccountRemovals,
+      automatic: sum.automatic + row.autoDeletionCandidates,
+      manual: sum.manual + row.manualOrUnmatchedCandidates,
+    }),
+    { newErrors: 0, removals: 0, automatic: 0, manual: 0 },
+  );
+  const timingStyle = {
+    low: "border-emerald-200 bg-emerald-50 text-emerald-700",
+    medium: "border-amber-200 bg-amber-50 text-amber-700",
+    high: "border-rose-200 bg-rose-50 text-rose-700",
+    insufficient: "border-slate-200 bg-slate-50 text-slate-600",
+  }[timing.level];
+  const decision = replenishmentDecision(recommendation, timing.action, capacityRisk);
+  const currentDate = analysis.daily.at(-1)?.date;
+
+  return (
+    <div className="grid grid-cols-[minmax(0,1fr)_300px] gap-3">
+      <div className="min-w-0 rounded-md border border-border bg-background p-3">
+        <div className="mb-3 flex items-start justify-between gap-3">
+          <div>
+            <div className="text-[13px] font-bold text-foreground">近 7 天杀号时段</div>
+            <div className="mt-0.5 text-xs font-semibold text-muted-foreground">基于 {analysis.snapshotCount} 条快照的新增错误与账号删除推断</div>
+          </div>
+          <div className="flex shrink-0 items-center gap-1.5 text-xs font-bold text-muted-foreground">
+            <span className="h-2.5 w-2.5 bg-rose-100" />
+            <span className="h-2.5 w-2.5 bg-rose-300" />
+            <span className="h-2.5 w-2.5 bg-rose-600" />
+            新增错误
+          </div>
+        </div>
+
+        <div className="mb-3 grid grid-cols-4 gap-3 border-b border-border pb-3 text-xs font-semibold text-muted-foreground">
+          <DeathStat label="当前错误" value={formatMoney(recent.currentErrors, 0)} />
+          <DeathStat label="近 30 分钟" value={formatSignedCount(recent.window30m.netIncrease)} alert={recent.window30m.netIncrease > 0} />
+          <DeathStat label="近 60 分钟" value={formatSignedCount(recent.window60m.netIncrease)} alert={recent.window60m.netIncrease > 0} />
+          <DeathStat label="连续上升" value={recent.isContinuouslyRising ? "是" : "否"} alert={recent.isContinuouslyRising} />
+        </div>
+
+        <div className="overflow-x-auto">
+          <div className="grid min-w-[750px] grid-cols-[54px_repeat(24,minmax(22px,1fr))_44px] gap-1">
+            <div className="self-end pb-1 text-[10px] font-bold text-muted-foreground">日期</div>
+            {Array.from({ length: 24 }, (_, hour) => (
+              <div key={hour} className="pb-1 text-center text-[9px] font-bold text-muted-foreground">{String(hour).padStart(2, "0")}</div>
+            ))}
+            <div className="self-end pb-1 text-right text-[10px] font-bold text-muted-foreground">合计</div>
+            {analysis.daily.flatMap((day) => {
+              const cells = Array.from({ length: 24 }, (_, hour) => timeline.get(`${day.date}-${hour}`));
+              return [
+                <div key={`${day.date}-date`} className="flex h-7 items-center text-[10px] font-black text-muted-foreground">
+                  {formatDailyDate(day.date)}
+                </div>,
+                ...cells.map((cell, hour) => (
+                  <DeathHeatCell
+                    key={`${day.date}-${hour}`}
+                    cell={cell}
+                    maxErrors={maxErrors}
+                    current={day.date === currentDate && hour === timing.evaluatedHour}
+                  />
+                )),
+                <div key={`${day.date}-total`} className="flex h-7 items-center justify-end text-[10px] font-black text-rose-700">
+                  {formatMoney(day.newErrors, 0)}
+                </div>,
+              ];
+            })}
+          </div>
+        </div>
+
+        <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 border-t border-border pt-3 text-xs font-semibold text-muted-foreground">
+          <span>7 天新增错误 <strong className="text-rose-600">{formatMoney(totals.newErrors, 0)}</strong></span>
+          <span>账号净删除下界 <strong className="text-orange-600">{formatMoney(totals.removals, 0)}</strong></span>
+          <span>24h 自动删除候选 <strong className="text-violet-600">{formatMoney(totals.automatic, 0)}</strong></span>
+          <span>人工/未匹配删除 <strong className="text-blue-600">{formatMoney(totals.manual, 0)}</strong></span>
+        </div>
+      </div>
+
+      <div className={cn("rounded-md border p-3", timingStyle)}>
+        <div className="flex items-center gap-2 text-sm font-black">
+          <Clock3 className="h-4 w-4" />
+          现在补号风险：{riskLabel(timing.level)}
+        </div>
+        <div className="mt-3 text-base font-black leading-6">{decision.title}</div>
+        <div className="mt-1 text-xs font-semibold leading-5">{decision.detail}</div>
+        <div className="mt-3 space-y-1.5 text-xs font-semibold leading-5">
+          {timing.reasons.map((reason, index) => <p key={index}>{reason}</p>)}
+        </div>
+        <div className="mt-4 border-t border-current/15 pt-3 text-xs font-semibold leading-5">
+          <div>当前时段：{timing.hourLabel}</div>
+          <div>同时段新增错误：{formatMoney(timing.newErrors, 0)}</div>
+          <div>同时段账号删除：{formatMoney(timing.inferredAccountRemovals, 0)}</div>
+          <div>时机置信度：{confidenceLabel(timing.confidence)}</div>
+          <div>历史高发：{formatHourList(timing.peakHours)}</div>
+          <div>建议时段：{formatHourList(timing.suggestedHours)}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DeathStat({ label, value, alert = false }: { label: string; value: string; alert?: boolean }) {
+  return (
+    <div>
+      <div>{label}</div>
+      <div className={cn("mt-1 text-base font-black", alert ? "text-rose-600" : "text-foreground")}>{value}</div>
+    </div>
+  );
+}
+
+function DeathHeatCell({ cell, maxErrors, current }: { cell?: DeathTimelineHour; maxErrors: number; current: boolean }) {
+  const className = !cell?.observed
+    ? "bg-slate-100 text-slate-400"
+    : cell.newErrors <= 0
+      ? "bg-emerald-50 text-emerald-700"
+      : cell.newErrors / maxErrors >= 0.75
+        ? "bg-rose-600 text-white"
+        : cell.newErrors / maxErrors >= 0.45
+          ? "bg-rose-300 text-rose-950"
+          : "bg-rose-100 text-rose-800";
+  const title = cell
+    ? `${cell.date} ${cell.label}\n新增错误 ${cell.newErrors}\n时末错误 ${formatMoney(cell.endingErrors, 0)}\n账号删除 ${cell.inferredAccountRemovals}\n采样覆盖 ${formatMoney(cell.coverage * 100, 0)}%`
+    : "无数据";
+  return (
+    <div
+      title={title}
+      className={cn("flex h-7 items-center justify-center text-[10px] font-black", className, current && "ring-2 ring-blue-600 ring-offset-1")}
+    >
+      {!cell?.observed ? "--" : cell.newErrors || ""}
+    </div>
+  );
+}
+
+function ForecastSummary({ title, forecast }: { title: string; forecast: PoolForecast }) {
+  return (
+    <div className="rounded-md border border-border bg-background px-3 py-2.5 shadow-sm">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-sm font-black text-foreground">{title}</span>
+        <span className="inline-flex items-center gap-1.5 text-xs font-bold text-muted-foreground">
+          <span>{formatDailyDate(forecast.date)}</span>
+          <span className={cn("rounded border px-1.5 py-0.5 text-[10px] font-black leading-none", dayTypeBadgeClass(forecast.dayType))}>
+            {forecast.dayType === "workday" ? "工作日" : "非工作日"}
+          </span>
+        </span>
+      </div>
+      <div className="mt-2 grid grid-cols-3 divide-x divide-border">
+        <ForecastMetric label="5h" value={formatMoney(forecast.estimated5h, 1)} className="text-emerald-700" />
+        <ForecastMetric label="7d" value={formatMoney(forecast.estimated7d, 1)} className="text-violet-700" />
+        <ForecastMetric label="掉号" value={formatMoney(forecast.accountDecrease, 0)} className="text-orange-700" />
+      </div>
+      <div className="mt-2 flex items-center gap-1.5 text-xs font-semibold text-muted-foreground">
+        <span>预测置信度</span>
+        <span className={cn("rounded border px-1.5 py-0.5 text-[10px] font-black leading-none", confidenceBadgeClass(forecast.confidence))}>
+          {confidenceLabel(forecast.confidence)}
+        </span>
+        <span>· {forecast.sampleCount} 个样本日</span>
+      </div>
+    </div>
+  );
+}
+
+function ForecastMetric({ label, value, className }: { label: string; value: string; className: string }) {
+  return (
+    <div className="min-w-0 px-2 first:pl-0 last:pr-0">
+      <div className={cn("text-[11px] font-black", className)}>{label}</div>
+      <div className={cn("mt-0.5 truncate text-base font-black leading-none", className)}>{value}</div>
+    </div>
+  );
+}
+
+function DailyUsageTable({
+  rows,
+  deathDays,
+  timezone,
+  calendarFallback,
+}: {
+  rows: DailyPoolUsage[];
+  deathDays?: DeathAnalysisDay[];
+  timezone: string;
+  calendarFallback: boolean;
+}) {
+  const errorsByDate = new Map((deathDays ?? []).map((row) => [row.date, row.newErrors]));
+  const tableRows = rows.map((row, index) => {
+    const previous = index ? rows[index - 1] : undefined;
+    const currentErrors = errorsByDate.get(row.date);
+    const previousErrors = previous ? errorsByDate.get(previous.date) : undefined;
+    return [
+      formatDailyDate(row.date),
+      <span className={cn("inline-flex rounded border px-1.5 py-0.5 text-[10px] font-black leading-none", dayTypeBadgeClass(row.dayType))}>
+        {row.dayType === "workday" ? "工作日" : "非工作日"}
+      </span>,
+      <UsageTrendCell value={row.estimated5h} previous={previous?.estimated5h} digits={1} tone="emerald" />,
+      <UsageTrendCell value={row.estimated7d} previous={previous?.estimated7d} digits={1} tone="violet" />,
+      <UsageTrendCell value={currentErrors} previous={previousErrors} tone="rose" />,
+      <UsageTrendCell value={row.accountDecrease} previous={previous?.accountDecrease} tone="orange" />,
+      <UsageTrendCell value={row.accountIncrease} previous={previous?.accountIncrease} tone="blue" />,
+      <UsageTrendCell value={row.netAccountChange} previous={previous?.netAccountChange} signed tone={row.netAccountChange < 0 ? "rose" : "emerald"} />,
+      `${formatMoney(row.coverage * 100, 0)}% (${row.sampleCount})`,
+      row.isComplete ? <span className="text-emerald-600">完整</span> : <span className="text-amber-600">未完整</span>,
+    ];
+  });
+  return (
+    <DataTable
+      title="每日对比"
+      columns={["日期", "类型", "5h 消耗", "7d 消耗", "新增错误", "账号减少", "账号增加", "净变动", "覆盖率", "状态"]}
+      rows={tableRows}
+      subtitle={`${timezone}${calendarFallback ? " · 节假日按周末规则估算" : ""}`}
+    />
+  );
+}
+
+function UsageTrendCell({
+  value,
+  previous,
+  digits = 0,
+  signed = false,
+  tone = "default",
+}: {
+  value?: number | null;
+  previous?: number | null;
+  digits?: number;
+  signed?: boolean;
+  tone?: "default" | "emerald" | "violet" | "rose" | "orange" | "blue";
+}) {
+  if (value === null || value === undefined) return <span className="font-black text-muted-foreground">--</span>;
+  const delta = previous === null || previous === undefined ? null : value - previous;
+  const toneClass = {
+    default: "text-foreground",
+    emerald: "text-emerald-700",
+    violet: "text-violet-700",
+    rose: "text-rose-700",
+    orange: "text-orange-700",
+    blue: "text-blue-700",
+  }[tone];
+  return (
+    <span className="inline-flex items-center gap-1 font-black">
+      <span className={toneClass}>{signed ? `${value >= 0 ? "+" : "-"}${formatMoney(Math.abs(value), digits)}` : formatMoney(value, digits)}</span>
+      {delta !== null && delta !== 0 && <span className={cn("text-xs", delta > 0 ? "text-rose-600" : "text-emerald-600")}>{delta > 0 ? `↑${formatMoney(delta, digits)}` : `↓${formatMoney(Math.abs(delta), digits)}`}</span>}
+    </span>
+  );
+}
+
+function buildOperationsChartRows(daily: DailyPoolUsage[], forecasts: PoolAnalyticsResponse["forecasts"]) {
+  const rows: Array<{
+    date: string;
+    estimated5h?: number | null;
+    estimated7d?: number | null;
+    accountDecrease?: number | null;
+    forecast5h?: number | null;
+    forecast7d?: number | null;
+    forecastDecrease?: number | null;
+  }> = daily.map((item) => ({
+    date: formatDailyDate(item.date),
+    estimated5h: item.estimated5h,
+    estimated7d: item.estimated7d,
+    accountDecrease: item.accountDecrease,
+  }));
+  const last = rows.at(-1);
+  if (last) {
+    last.forecast5h = last.estimated5h;
+    last.forecast7d = last.estimated7d;
+    last.forecastDecrease = last.accountDecrease;
+  }
+  const uniqueForecasts = new Map<string, PoolForecast>();
+  const forecastRows = forecasts.nextThreeDays?.length
+    ? forecasts.nextThreeDays
+    : [forecasts.tomorrow, forecasts.nextWorkday, forecasts.nextNonWorkday];
+  for (const forecast of forecastRows) {
+    uniqueForecasts.set(forecast.date, forecast);
+  }
+  for (const forecast of uniqueForecasts.values()) {
+    rows.push({
+      date: formatDailyDate(forecast.date),
+      forecast5h: forecast.estimated5h,
+      forecast7d: forecast.estimated7d,
+      forecastDecrease: forecast.accountDecrease,
+    });
+  }
+  return rows;
+}
+
+function formatDailyDate(value: string) {
+  return value.length >= 10 ? value.slice(5, 10) : value;
+}
+
+function riskLabel(level: PoolAnalyticsResponse["risk"]["level"]) {
+  return { low: "低", medium: "中", high: "高", insufficient: "数据不足" }[level];
+}
+
+function replenishmentDecision(
+  amount: number | null,
+  action: NonNullable<PoolAnalyticsResponse["replenishmentTimingRisk"]>["action"],
+  capacityRisk: PoolAnalyticsResponse["risk"]["level"],
+) {
+  if (amount === null) return { title: "建议补号：数据不足", detail: "先继续积累快照，不做大批量补号。" };
+  const title = `建议补 ${formatMoney(amount, 0)} 个号`;
+  if (amount <= 0) return { title, detail: "当前容量无缺口，现在无需补号。" };
+  if (action === "avoid") {
+    return {
+      title,
+      detail: capacityRisk === "high"
+        ? "当前缺口也是高风险；先小批应急，在建议时段补足。"
+        : "当前处于高杀号时段，不建议现在批量补。",
+    };
+  }
+  if (action === "caution") return { title, detail: "建议分批补入，每批后等待两次刷新再继续。" };
+  if (action === "suitable") return { title, detail: "当前时段可按建议数量补入。" };
+  return { title, detail: "补号时机样本不足，建议先小批补入并观察错误变化。" };
+}
+
+function formatSignedCount(value: number) {
+  if (value === 0) return "0";
+  return `${value > 0 ? "+" : "-"}${formatMoney(Math.abs(value), 0)}`;
+}
+
+function formatHourList(hours: number[]) {
+  if (!hours.length) return "--";
+  const ordered = [...new Set(hours)].sort((left, right) => left - right);
+  const ranges: Array<[number, number]> = [];
+  for (const hour of ordered) {
+    const current = ranges.at(-1);
+    if (current && hour === current[1] + 1) current[1] = hour;
+    else ranges.push([hour, hour]);
+  }
+  return ranges
+    .map(([start, end]) => `${String(start).padStart(2, "0")}:00-${String((end + 1) % 24).padStart(2, "0")}:00`)
+    .join("、");
+}
+
+function confidenceLabel(level: PoolForecast["confidence"]) {
+  return { high: "高", medium: "中", low: "低", insufficient: "不足" }[level];
+}
+
+function confidenceBadgeClass(level: PoolForecast["confidence"]) {
+  return {
+    high: "border-emerald-200 bg-emerald-50 text-emerald-700",
+    medium: "border-blue-200 bg-blue-50 text-blue-700",
+    low: "border-amber-200 bg-amber-50 text-amber-700",
+    insufficient: "border-slate-200 bg-slate-50 text-slate-600",
+  }[level];
+}
+
+function dayTypeBadgeClass(dayType: PoolForecast["dayType"]) {
+  return dayType === "workday"
+    ? "border-blue-200 bg-blue-50 text-blue-700"
+    : "border-amber-200 bg-amber-50 text-amber-700";
 }
 
 function PoolMetricChart({
@@ -594,7 +1200,7 @@ function PoolsView({
       </div>
 
       {selectedGroups.map((group) => (
-        <PoolTable key={group} title={`${group} 历史`} rows={grouped[group] ?? []} />
+        <PagedPoolTable key={group} group={group} stateRows={grouped[group] ?? []} />
       ))}
     </div>
   );
@@ -707,19 +1313,9 @@ function CostView({
 }
 
 function HistoryView({ stored }: { stored: StoredState }) {
-  const accountColumns = historyAccountColumns(stored.history);
   return (
     <div className="space-y-4">
-      <DataTable
-        title="余额历史"
-        columns={["时间", "余额合计", "账号数", ...accountColumns]}
-        rows={stored.history.map((item) => [
-          formatDateTime(item.date),
-          formatMoney(item.total),
-          String(item.amounts.length),
-          ...accountColumns.map((name, index) => formatMoney(balanceAmountForColumn(item, name, index))),
-        ])}
-      />
+      <PagedBalanceHistory stateRows={stored.history} />
       <DataTable
         title="累加成本历史"
         columns={["日期", "金额", "备注", "创建时间"]}
@@ -876,7 +1472,7 @@ function AccountsDialog({ open, onOpenChange, onSaved }: { open: boolean; onOpen
     <ConfigDialog
       open={open}
       title="余额账号配置"
-      description="每行一个账号：账号名 | BaseURL | API Key"
+      description="每行一个账号：账号名 | BaseURL | API Key；已有账号的 API Key 留空表示不修改。"
       saving={saving}
       onOpenChange={onOpenChange}
       onSave={async () => {
@@ -911,7 +1507,7 @@ function PoolCredentialsDialog({
     <ConfigDialog
       open={open}
       title="平台接口账号"
-      description="账号密码保存到服务器，Mac 本机不再进钥匙串。"
+      description="密码保存在服务器且不会回显；留空表示不修改。"
       saving={saving}
       onOpenChange={onOpenChange}
       onSave={async () => {
@@ -923,10 +1519,19 @@ function PoolCredentialsDialog({
       }}
     >
       <Field label="邮箱">
-        <Input value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} />
+        <Input
+          value={form.email}
+          placeholder="已保存，留空不修改"
+          onChange={(event) => setForm({ ...form, email: event.target.value })}
+        />
       </Field>
       <Field label="密码">
-        <Input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} />
+        <Input
+          type="password"
+          value={form.password}
+          placeholder="已保存，留空不修改"
+          onChange={(event) => setForm({ ...form, password: event.target.value })}
+        />
       </Field>
     </ConfigDialog>
   );
@@ -943,7 +1548,7 @@ function SmtpDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open
     <ConfigDialog
       open={open}
       title="预警邮箱设置"
-      description="SMTP 授权码保存到服务器，用于掉号预警。"
+      description="SMTP 授权码保存在服务器且不会回显；留空表示不修改。"
       saving={saving}
       onOpenChange={onOpenChange}
       onSave={async () => {
@@ -962,13 +1567,26 @@ function SmtpDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open
         </Field>
       </div>
       <Field label="发件邮箱">
-        <Input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} />
+        <Input
+          value={form.username}
+          placeholder="已保存，留空不修改"
+          onChange={(event) => setForm({ ...form, username: event.target.value })}
+        />
       </Field>
       <Field label="SMTP 授权码">
-        <Input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} />
+        <Input
+          type="password"
+          value={form.password}
+          placeholder="已保存，留空不修改"
+          onChange={(event) => setForm({ ...form, password: event.target.value })}
+        />
       </Field>
       <Field label="预警收件邮箱">
-        <Input value={form.recipient} onChange={(event) => setForm({ ...form, recipient: event.target.value })} />
+        <Input
+          value={form.recipient}
+          placeholder="已保存，留空不修改"
+          onChange={(event) => setForm({ ...form, recipient: event.target.value })}
+        />
       </Field>
     </ConfigDialog>
   );
@@ -1029,7 +1647,157 @@ function PoolSummaryCard({ group, latest }: { group: string; latest?: PoolSnapsh
   );
 }
 
-function PoolTable({ title, rows }: { title: string; rows: PoolSnapshot[] }) {
+function PagedPoolTable({ group, stateRows }: { group: string; stateRows: PoolSnapshot[] }) {
+  const [loadedRows, setLoadedRows] = useState<PoolSnapshot[]>([]);
+  const [nextCursor, setNextCursor] = useState<number | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoadedRows([]);
+    setNextCursor(null);
+    setHasMore(false);
+    setError("");
+    setLoading(true);
+    void api
+      .poolHistory(group)
+      .then((page) => {
+        if (cancelled) return;
+        setLoadedRows(page.items);
+        setNextCursor(page.nextCursor);
+        setHasMore(page.hasMore);
+      })
+      .catch((reason) => {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : "账号池历史加载失败");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [group]);
+
+  const loadOlder = () => {
+    if (loading || !hasMore || nextCursor === null) return;
+    setLoading(true);
+    setError("");
+    void api
+      .poolHistory(group, nextCursor)
+      .then((page) => {
+        setLoadedRows((current) => mergeHistoryRows(page.items, current));
+        setNextCursor(page.nextCursor);
+        setHasMore(page.hasMore);
+      })
+      .catch((reason) => setError(reason instanceof Error ? reason.message : "更早历史加载失败"))
+      .finally(() => setLoading(false));
+  };
+
+  const rows = useMemo(() => mergeHistoryRows(loadedRows, stateRows), [loadedRows, stateRows]);
+  return <PoolTable title={`${group} 历史`} rows={rows} footer={<HistoryPagination loading={loading} hasMore={hasMore} error={error} onLoadOlder={loadOlder} />} />;
+}
+
+function PagedBalanceHistory({ stateRows }: { stateRows: StoredState["history"] }) {
+  const [loadedRows, setLoadedRows] = useState<StoredState["history"]>([]);
+  const [nextCursor, setNextCursor] = useState<number | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoadedRows([]);
+    setNextCursor(null);
+    setHasMore(false);
+    setError("");
+    setLoading(true);
+    void api
+      .balanceHistory()
+      .then((page) => {
+        if (cancelled) return;
+        setLoadedRows(page.items);
+        setNextCursor(page.nextCursor);
+        setHasMore(page.hasMore);
+      })
+      .catch((reason) => {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : "余额历史加载失败");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const loadOlder = () => {
+    if (loading || !hasMore || nextCursor === null) return;
+    setLoading(true);
+    setError("");
+    void api
+      .balanceHistory(nextCursor)
+      .then((page) => {
+        setLoadedRows((current) => mergeHistoryRows(page.items, current));
+        setNextCursor(page.nextCursor);
+        setHasMore(page.hasMore);
+      })
+      .catch((reason) => setError(reason instanceof Error ? reason.message : "更早历史加载失败"))
+      .finally(() => setLoading(false));
+  };
+
+  const rows = useMemo(() => mergeHistoryRows(loadedRows, stateRows), [loadedRows, stateRows]);
+  const accountColumns = historyAccountColumns(rows);
+  return (
+    <DataTable
+      title="余额历史"
+      columns={["时间", "余额合计", "账号数", ...accountColumns]}
+      rows={rows.map((item) => [
+        formatDateTime(item.date),
+        formatMoney(item.total),
+        String(item.amounts.length),
+        ...accountColumns.map((name, index) => formatMoney(balanceAmountForColumn(item, name, index))),
+      ])}
+      footer={<HistoryPagination loading={loading} hasMore={hasMore} error={error} onLoadOlder={loadOlder} />}
+    />
+  );
+}
+
+function HistoryPagination({
+  loading,
+  hasMore,
+  error,
+  onLoadOlder,
+}: {
+  loading: boolean;
+  hasMore: boolean;
+  error: string;
+  onLoadOlder: () => void;
+}) {
+  return (
+    <div className="flex min-h-9 items-center justify-between gap-3 pt-3">
+      <span className={cn("text-xs font-bold", error ? "text-rose-600" : "text-muted-foreground")}>
+        {error || (hasMore ? "当前展示最新一页" : "已加载全部历史")}
+      </span>
+      {hasMore && (
+        <Button variant="outline" size="sm" disabled={loading} onClick={onLoadOlder}>
+          {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <History className="h-3.5 w-3.5" />}
+          加载更早
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function mergeHistoryRows<T extends { date: string }>(primary: T[], secondary: T[]) {
+  const byDate = new Map<string, T>();
+  for (const row of primary) byDate.set(row.date, row);
+  for (const row of secondary) byDate.set(row.date, row);
+  return Array.from(byDate.values()).sort((left, right) => new Date(left.date).getTime() - new Date(right.date).getTime());
+}
+
+function PoolTable({ title, rows, footer }: { title: string; rows: PoolSnapshot[]; footer?: React.ReactNode }) {
   const tableRows = rows.map((row, index) => {
     const previous = index > 0 ? rows[index - 1] : undefined;
     return [
@@ -1037,6 +1805,7 @@ function PoolTable({ title, rows }: { title: string; rows: PoolSnapshot[] }) {
       <TrendCell value={row.total} previous={previous?.total} />,
       <TrendCell value={row.remaining5h} previous={previous?.remaining5h} suffix={usageSuffix(row.utilization5h)} />,
       <TrendCell value={row.remaining7d} previous={previous?.remaining7d} suffix={usageSuffix(row.utilization7d)} />,
+      <TrendCell value={row.concurrentAvailable} previous={previous?.concurrentAvailable} />,
       <TrendCell value={row.limited} previous={previous?.limited} inverse />,
       <TrendCell value={row.quotaProtected} previous={previous?.quotaProtected} inverse />,
       <TrendCell value={row.error} previous={previous?.error} inverse />,
@@ -1047,8 +1816,9 @@ function PoolTable({ title, rows }: { title: string; rows: PoolSnapshot[] }) {
   return (
     <DataTable
       title={title}
-      columns={["时间", "总账号", "5h剩余", "7d剩余", "限流", "额度保护", "错误", "禁用", "状态"]}
+      columns={["时间", "总账号", "5h剩余", "7d剩余", "并发可用", "限流", "额度保护", "错误", "禁用", "状态"]}
       rows={tableRows}
+      footer={footer}
     />
   );
 }
@@ -1085,7 +1855,19 @@ function usageSuffix(value?: number | null) {
   return value === null || value === undefined ? undefined : `${formatMoney(value, 1)}%`;
 }
 
-function DataTable({ title, columns, rows }: { title: string; columns: string[]; rows: TableCell[][] }) {
+function DataTable({
+  title,
+  columns,
+  rows,
+  subtitle,
+  footer,
+}: {
+  title: string;
+  columns: string[];
+  rows: TableCell[][];
+  subtitle?: string;
+  footer?: React.ReactNode;
+}) {
   const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const node = scrollRef.current;
@@ -1096,7 +1878,7 @@ function DataTable({ title, columns, rows }: { title: string; columns: string[];
     <Card>
       <CardHeader>
         <CardTitle>{title}</CardTitle>
-        <span className="text-xs font-bold text-muted-foreground">{rows.length} 条</span>
+        <span className="text-xs font-bold text-muted-foreground">{subtitle ?? `${rows.length} 条`}</span>
       </CardHeader>
       <CardContent>
         <div ref={scrollRef} className="max-h-[360px] overflow-auto rounded-md border border-border will-change-scroll">
@@ -1130,6 +1912,7 @@ function DataTable({ title, columns, rows }: { title: string; columns: string[];
             </tbody>
           </table>
         </div>
+        {footer}
       </CardContent>
     </Card>
   );
@@ -1177,7 +1960,7 @@ function MetricTile({
   value?: number | null;
   accent?: string;
   signed?: boolean;
-  sub?: string;
+  sub?: React.ReactNode;
   digits?: number;
   suffix?: string;
   size?: "compact" | "normal" | "large";
@@ -1434,5 +2217,5 @@ function parseAccounts(text: string): BalanceAccount[] {
       const parts = line.split("|").map((part) => part.trim());
       return { name: parts[0] ?? "", baseURL: parts[1] ?? "", apiKey: parts[2] ?? "" };
     })
-    .filter((item) => item.name && item.baseURL && item.apiKey);
+    .filter((item) => item.name && item.baseURL);
 }

@@ -18,9 +18,16 @@ fi
 rm -rf "$OUTPUT_DIR" "$STAGE_DIR"
 mkdir -p "$OUTPUT_DIR" "$STAGE_DIR"
 
-swift "$PROJECT_DIR/tools/generate_icon.swift" "$PROJECT_DIR/build/AppIcon.iconset"
-python3 "$PROJECT_DIR/tools/pngs_to_icns.py" "$PROJECT_DIR/build/AppIcon.iconset" "$PROJECT_DIR/src-tauri/icons/icon.icns"
-cp "$PROJECT_DIR/build/AppIcon.iconset/icon_512x512.png" "$PROJECT_DIR/src-tauri/icons/icon.png"
+if swift "$PROJECT_DIR/tools/generate_icon.swift" "$PROJECT_DIR/build/AppIcon.iconset"; then
+    python3 "$PROJECT_DIR/tools/pngs_to_icns.py" "$PROJECT_DIR/build/AppIcon.iconset" "$PROJECT_DIR/src-tauri/icons/icon.icns"
+    cp "$PROJECT_DIR/build/AppIcon.iconset/icon_512x512.png" "$PROJECT_DIR/src-tauri/icons/icon.png"
+else
+    echo "Warning: Swift icon generation failed; reusing the checked-in 91 icons." >&2
+    if [[ ! -f "$PROJECT_DIR/src-tauri/icons/icon.icns" || ! -f "$PROJECT_DIR/src-tauri/icons/icon.png" ]]; then
+        echo "Checked-in icons are missing." >&2
+        exit 1
+    fi
+fi
 
 npm run tauri build -- --bundles app
 

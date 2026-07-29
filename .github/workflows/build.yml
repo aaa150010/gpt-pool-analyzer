@@ -17,13 +17,15 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Build universal app
+      - name: Build app
         shell: bash
         run: ./build.sh
 
-      - name: Verify bundle
+      - name: Verify release package
         shell: bash
         run: |
-          lipo -archs "build/GPT分析器.app/Contents/MacOS/GPT分析器" | grep -q arm64
-          lipo -archs "build/GPT分析器.app/Contents/MacOS/GPT分析器" | grep -q x86_64
-          codesign --verify --deep --strict "build/GPT分析器.app"
+          mkdir -p build/verify
+          ditto -x -k dist/91.zip build/verify
+          test -d build/verify/91.app
+          lipo -archs build/verify/91.app/Contents/MacOS/gpt-analyzer | grep -Eq '^(arm64|x86_64)$'
+          codesign --verify --deep --strict build/verify/91.app

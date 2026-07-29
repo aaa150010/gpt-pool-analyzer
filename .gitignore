@@ -5,4 +5,7 @@ dist-web/
 src-tauri/target/
 build/
 dist/
+server/data/
+__pycache__/
+*.pyc
 .DS_Store

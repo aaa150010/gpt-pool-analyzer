@@ -3,22 +3,35 @@ import json
 import os
 import smtplib
 import sqlite3
-from contextlib import asynccontextmanager
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+try:
+    from .analytics import build_analytics
+except ImportError:
+    from analytics import build_analytics
 
 
 API_PREFIX = "/gpt-api"
+ALLOWED_ORIGINS = [
+    "tauri://localhost",
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+    "http://127.0.0.1:1420",
+    "http://localhost:1420",
+]
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DB_PATH = DATA_DIR / "app.db"
 POLL_INTERVAL_SECONDS = 300
-DATA_RETENTION_SECONDS = max(int(os.getenv("DATA_RETENTION_SECONDS", "86400")), 3600)
+STATE_HISTORY_SECONDS = 86400
 POOL_DASHBOARD_URL = "https://cf.ai-pixel.online/api/v1/accounts/quota-dashboard?timezone=Asia%2FShanghai"
 POOL_LOGIN_URL = "https://cf.ai-pixel.online/api/v1/auth/login"
 
@@ -49,11 +62,16 @@ def loads(value: str | None, default: Any) -> Any:
         return default
 
 
-def connect() -> sqlite3.Connection:
+@contextmanager
+def connect() -> Iterator[sqlite3.Connection]:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
@@ -103,6 +121,18 @@ def init_db() -> None:
             );
             """
         )
+        pool_columns = {row["name"] for row in conn.execute("PRAGMA table_info(pool_history)").fetchall()}
+        migrations = {
+            "capacity_5h": "ALTER TABLE pool_history ADD COLUMN capacity_5h INTEGER",
+            "capacity_7d": "ALTER TABLE pool_history ADD COLUMN capacity_7d INTEGER",
+            "remaining_capacity_5h": "ALTER TABLE pool_history ADD COLUMN remaining_capacity_5h REAL",
+            "remaining_capacity_7d": "ALTER TABLE pool_history ADD COLUMN remaining_capacity_7d REAL",
+        }
+        for column, statement in migrations.items():
+            if column not in pool_columns:
+                conn.execute(statement)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pool_history_group_date_id ON pool_history(group_name, date, id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_balance_history_date_id ON balance_history(date, id)")
         conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('initialized', 'false')")
 
 
@@ -165,7 +195,16 @@ def compact_stored_state(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def compact_pool_state(raw: dict[str, Any]) -> dict[str, Any]:
-    state = dict(raw)
+    secret_keys = {"accessToken", "refreshToken", "access_token", "refresh_token"}
+
+    def strip_tokens(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: strip_tokens(item) for key, item in value.items() if key not in secret_keys}
+        if isinstance(value, list):
+            return [strip_tokens(item) for item in value]
+        return value
+
+    state = strip_tokens(dict(raw))
     state.pop("history", None)
     return state
 
@@ -187,6 +226,49 @@ def normalize_smtp_settings(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def public_balance_accounts(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    accounts: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        api_key = str(item.get("apiKey") or item.get("api_key") or "").strip()
+        accounts.append(
+            {
+                "name": str(item.get("name") or "").strip(),
+                "baseURL": str(item.get("baseURL") or item.get("base_url") or "").strip(),
+                "apiKey": "",
+                "hasApiKey": bool(api_key),
+            }
+        )
+    return accounts
+
+
+def public_pool_credentials(raw: Any) -> dict[str, Any]:
+    credentials = normalize_pool_credentials(raw if isinstance(raw, dict) else {})
+    return {
+        "email": "",
+        "password": "",
+        "hasEmail": bool(credentials["email"]),
+        "hasPassword": bool(credentials["password"]),
+    }
+
+
+def public_smtp_settings(raw: Any) -> dict[str, Any]:
+    settings = normalize_smtp_settings(raw if isinstance(raw, dict) else {})
+    return {
+        "host": settings["host"],
+        "port": settings["port"],
+        "username": "",
+        "password": "",
+        "recipient": "",
+        "hasUsername": bool(settings["username"]),
+        "hasPassword": bool(settings["password"]),
+        "hasRecipient": bool(settings["recipient"]),
+    }
+
+
 def insert_balance_snapshot(snapshot: dict[str, Any]) -> None:
     with connect() as conn:
         conn.execute(
@@ -200,15 +282,6 @@ def insert_balance_snapshot(snapshot: dict[str, Any]) -> None:
         )
 
 
-def cleanup_old_data() -> None:
-    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=DATA_RETENTION_SECONDS)).replace(microsecond=0)
-    cutoff_text = cutoff.isoformat().replace("+00:00", "Z")
-    with connect() as conn:
-        conn.execute("DELETE FROM balance_history WHERE date < ?", (cutoff_text,))
-        conn.execute("DELETE FROM pool_history WHERE date < ?", (cutoff_text,))
-        conn.execute("DELETE FROM cost_additions WHERE created_at < ?", (cutoff_text,))
-
-
 def insert_pool_snapshot(snapshot: dict[str, Any]) -> None:
     group_name = snapshot.get("groupName") or snapshot.get("group_name") or ""
     snapshot_date = snapshot.get("date") or utc_now()
@@ -219,6 +292,10 @@ def insert_pool_snapshot(snapshot: dict[str, Any]) -> None:
         flexible_int(snapshot.get("schedulable")),
         snapshot.get("remaining5h"),
         snapshot.get("remaining7d"),
+        snapshot.get("capacity5h"),
+        snapshot.get("capacity7d"),
+        snapshot.get("remainingCapacity5h"),
+        snapshot.get("remainingCapacity7d"),
         snapshot.get("utilization5h"),
         snapshot.get("utilization7d"),
         flexible_int(snapshot.get("concurrentAvailable")),
@@ -243,6 +320,10 @@ def insert_pool_snapshot(snapshot: dict[str, Any]) -> None:
                 latest["schedulable"],
                 latest["remaining5h"],
                 latest["remaining7d"],
+                latest["capacity_5h"],
+                latest["capacity_7d"],
+                latest["remaining_capacity_5h"],
+                latest["remaining_capacity_7d"],
                 latest["utilization5h"],
                 latest["utilization7d"],
                 latest["concurrent_available"],
@@ -258,9 +339,10 @@ def insert_pool_snapshot(snapshot: dict[str, Any]) -> None:
             """
             INSERT INTO pool_history(
                 date, group_name, status, total, active, schedulable, remaining5h, remaining7d,
+                capacity_5h, capacity_7d, remaining_capacity_5h, remaining_capacity_7d,
                 utilization5h, utilization7d, concurrent_available, concurrent_total, limited,
                 quota_protected, error, disabled
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot_date,
@@ -352,44 +434,105 @@ def clear_cost_additions() -> float:
     return total
 
 
-def balance_history() -> list[dict[str, Any]]:
-    with connect() as conn:
-        rows = conn.execute("SELECT * FROM balance_history ORDER BY date ASC, id ASC").fetchall()
-    return [
-        {
-            "date": row["date"],
-            "total": row["total"],
-            "amounts": loads(row["amounts"], []),
-            "accounts": loads(row["accounts"], []),
-        }
-        for row in rows
-    ]
+def balance_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "date": row["date"],
+        "total": row["total"],
+        "amounts": loads(row["amounts"], []),
+        "accounts": loads(row["accounts"], []),
+    }
 
 
-def pool_history() -> list[dict[str, Any]]:
+def pool_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "date": row["date"],
+        "groupName": row["group_name"],
+        "status": row["status"],
+        "total": row["total"],
+        "active": row["active"],
+        "schedulable": row["schedulable"],
+        "remaining5h": row["remaining5h"],
+        "remaining7d": row["remaining7d"],
+        "capacity5h": row["capacity_5h"],
+        "capacity7d": row["capacity_7d"],
+        "remainingCapacity5h": row["remaining_capacity_5h"],
+        "remainingCapacity7d": row["remaining_capacity_7d"],
+        "utilization5h": row["utilization5h"],
+        "utilization7d": row["utilization7d"],
+        "concurrentAvailable": row["concurrent_available"],
+        "concurrentTotal": row["concurrent_total"],
+        "limited": row["limited"],
+        "quotaProtected": row["quota_protected"],
+        "error": row["error"],
+        "disabled": row["disabled"],
+    }
+
+
+def recent_cutoff() -> str:
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=STATE_HISTORY_SECONDS)).replace(microsecond=0)
+    return cutoff.isoformat().replace("+00:00", "Z")
+
+
+def balance_history(since: str | None = None) -> list[dict[str, Any]]:
+    query = "SELECT * FROM balance_history"
+    parameters: tuple[Any, ...] = ()
+    if since:
+        query += " WHERE date >= ?"
+        parameters = (since,)
+    query += " ORDER BY date ASC, id ASC"
     with connect() as conn:
-        rows = conn.execute("SELECT * FROM pool_history ORDER BY date ASC, id ASC").fetchall()
-    return [
-        {
-            "date": row["date"],
-            "groupName": row["group_name"],
-            "status": row["status"],
-            "total": row["total"],
-            "active": row["active"],
-            "schedulable": row["schedulable"],
-            "remaining5h": row["remaining5h"],
-            "remaining7d": row["remaining7d"],
-            "utilization5h": row["utilization5h"],
-            "utilization7d": row["utilization7d"],
-            "concurrentAvailable": row["concurrent_available"],
-            "concurrentTotal": row["concurrent_total"],
-            "limited": row["limited"],
-            "quotaProtected": row["quota_protected"],
-            "error": row["error"],
-            "disabled": row["disabled"],
-        }
-        for row in rows
-    ]
+        rows = conn.execute(query, parameters).fetchall()
+    return [balance_row(row) for row in rows]
+
+
+def pool_history(group_name: str | None = None, since: str | None = None) -> list[dict[str, Any]]:
+    conditions: list[str] = []
+    parameters: list[Any] = []
+    if group_name:
+        conditions.append("group_name = ?")
+        parameters.append(group_name)
+    if since:
+        conditions.append("date >= ?")
+        parameters.append(since)
+    query = "SELECT * FROM pool_history"
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY date ASC, id ASC"
+    with connect() as conn:
+        rows = conn.execute(query, tuple(parameters)).fetchall()
+    return [pool_row(row) for row in rows]
+
+
+def balance_history_page(cursor: int | None, limit: int) -> dict[str, Any]:
+    query = "SELECT * FROM balance_history"
+    parameters: list[Any] = []
+    if cursor is not None:
+        query += " WHERE id < ?"
+        parameters.append(cursor)
+    query += " ORDER BY id DESC LIMIT ?"
+    parameters.append(limit + 1)
+    with connect() as conn:
+        rows = conn.execute(query, tuple(parameters)).fetchall()
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    items = [balance_row(row) for row in reversed(page_rows)]
+    return {"items": items, "nextCursor": page_rows[-1]["id"] if has_more and page_rows else None, "hasMore": has_more}
+
+
+def pool_history_page(group_name: str, cursor: int | None, limit: int) -> dict[str, Any]:
+    query = "SELECT * FROM pool_history WHERE group_name = ?"
+    parameters: list[Any] = [group_name]
+    if cursor is not None:
+        query += " AND id < ?"
+        parameters.append(cursor)
+    query += " ORDER BY id DESC LIMIT ?"
+    parameters.append(limit + 1)
+    with connect() as conn:
+        rows = conn.execute(query, tuple(parameters)).fetchall()
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    items = [pool_row(row) for row in reversed(page_rows)]
+    return {"items": items, "nextCursor": page_rows[-1]["id"] if has_more and page_rows else None, "hasMore": has_more}
 
 
 def cost_additions() -> list[dict[str, Any]]:
@@ -409,12 +552,14 @@ def cost_additions() -> list[dict[str, Any]]:
 
 def current_state() -> dict[str, Any]:
     stored = get_setting("stored_state", None)
-    pool = get_setting("pool_state", None)
+    raw_pool = get_setting("pool_state", None)
+    pool = compact_pool_state(raw_pool) if isinstance(raw_pool, dict) else None
+    cutoff = recent_cutoff()
     if stored is not None:
-        stored["history"] = balance_history()
+        stored["history"] = balance_history(cutoff)
         stored["costAdditions"] = cost_additions()
     if pool is not None:
-        pool["history"] = pool_history()
+        pool["history"] = pool_history(since=cutoff)
     return {
         "initialized": initialized(),
         "storedState": stored,
@@ -494,10 +639,22 @@ def usage_window(summary: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 def remaining_capacity(window: dict[str, Any]) -> int | None:
+    remaining = raw_remaining_capacity(window)
+    if remaining is None:
+        return None
+    return int(round(remaining))
+
+
+def raw_remaining_capacity(window: dict[str, Any]) -> float | None:
     percent = window.get("remaining_capacity_percent")
     if percent is None:
         return None
-    return int(round(flexible_number(percent) / 100))
+    return flexible_number(percent) / 100
+
+
+def window_account_count(window: dict[str, Any]) -> int | None:
+    value = window.get("account_count")
+    return None if value is None else flexible_int(value)
 
 
 def pool_snapshot_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
@@ -517,6 +674,10 @@ def pool_snapshot_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "schedulable": schedulable,
         "remaining5h": remaining_capacity(window5h),
         "remaining7d": remaining_capacity(window7d),
+        "capacity5h": window_account_count(window5h),
+        "capacity7d": window_account_count(window7d),
+        "remainingCapacity5h": raw_remaining_capacity(window5h),
+        "remainingCapacity7d": raw_remaining_capacity(window7d),
         "utilization5h": window5h.get("average_utilization"),
         "utilization7d": window7d.get("average_utilization"),
         "concurrentAvailable": max(schedulable - limited - quota_protected - error - disabled, 0),
@@ -542,7 +703,7 @@ async def poll_pools(client: httpx.AsyncClient) -> None:
         response = await client.get(POOL_DASHBOARD_URL, headers={"Authorization": f"Bearer {token}"}, timeout=20)
     response.raise_for_status()
     summaries = (((response.json().get("data") or {}).get("platform") or {}).get("group_summaries") or [])
-    pool_state = get_setting("pool_state", {})
+    pool_state = compact_pool_state(get_setting("pool_state", {}))
     pool_state["availableGroups"] = [item.get("group_name") for item in summaries if item.get("group_name")]
     set_setting("pool_state", pool_state)
     for summary in summaries:
@@ -554,7 +715,6 @@ async def poll_pools(client: httpx.AsyncClient) -> None:
 async def poll_once() -> None:
     if not initialized():
         return
-    cleanup_old_data()
     async with httpx.AsyncClient() as client:
         for task in [poll_balances, poll_pools]:
             try:
@@ -562,7 +722,6 @@ async def poll_once() -> None:
             except Exception as exc:
                 set_setting("last_poll_error", {"time": utc_now(), "message": str(exc)})
         set_setting("last_poll_at", utc_now())
-    cleanup_old_data()
 
 
 async def poll_loop() -> None:
@@ -574,7 +733,6 @@ async def poll_loop() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
-    cleanup_old_data()
     task = asyncio.create_task(poll_loop())
     try:
         yield
@@ -585,7 +743,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="GPT Analyzer Server", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -599,6 +757,41 @@ async def health() -> dict[str, Any]:
 @app.get(f"{API_PREFIX}/state")
 async def get_state() -> dict[str, Any]:
     return current_state()
+
+
+@app.get(f"{API_PREFIX}/pool-analytics")
+async def get_pool_analytics(
+    group_name: str = Query(alias="groupName", min_length=1),
+    days: int = Query(default=7, ge=7, le=90),
+) -> dict[str, Any]:
+    if not initialized():
+        raise HTTPException(status_code=409, detail="Not initialized")
+    lookback = (datetime.now(timezone.utc) - timedelta(days=max(days, 90) + 2)).replace(microsecond=0)
+    rows = pool_history(group_name=group_name, since=lookback.isoformat().replace("+00:00", "Z"))
+    if not rows:
+        raise HTTPException(status_code=404, detail="group history not found")
+    return build_analytics(group_name, rows, days)
+
+
+@app.get(f"{API_PREFIX}/pool-history")
+async def get_pool_history_page(
+    group_name: str = Query(alias="groupName", min_length=1),
+    cursor: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=200, ge=1, le=500),
+) -> dict[str, Any]:
+    if not initialized():
+        raise HTTPException(status_code=409, detail="Not initialized")
+    return pool_history_page(group_name, cursor, limit)
+
+
+@app.get(f"{API_PREFIX}/balance-history")
+async def get_balance_history_page(
+    cursor: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=200, ge=1, le=500),
+) -> dict[str, Any]:
+    if not initialized():
+        raise HTTPException(status_code=409, detail="Not initialized")
+    return balance_history_page(cursor, limit)
 
 
 @app.post(f"{API_PREFIX}/bootstrap")
@@ -639,7 +832,7 @@ async def refresh() -> dict[str, Any]:
 async def get_balance_accounts() -> dict[str, Any]:
     if not initialized():
         raise HTTPException(status_code=409, detail="Not initialized")
-    return {"accounts": get_setting("balance_accounts", [])}
+    return {"accounts": public_balance_accounts(get_setting("balance_accounts", []))}
 
 
 @app.put(f"{API_PREFIX}/balance-accounts")
@@ -649,6 +842,8 @@ async def update_balance_accounts(payload: dict[str, Any]) -> dict[str, Any]:
     accounts = payload.get("accounts") or payload.get("balanceAccounts") or []
     if not isinstance(accounts, list) or not accounts:
         raise HTTPException(status_code=400, detail="accounts required")
+    existing_accounts = get_setting("balance_accounts", [])
+    existing_accounts = existing_accounts if isinstance(existing_accounts, list) else []
     normalized = []
     for item in accounts:
         if not isinstance(item, dict):
@@ -656,6 +851,19 @@ async def update_balance_accounts(payload: dict[str, Any]) -> dict[str, Any]:
         name = str(item.get("name") or "").strip()
         base_url = str(item.get("baseURL") or item.get("base_url") or "").strip().rstrip("/")
         api_key = str(item.get("apiKey") or item.get("api_key") or "").strip()
+        if not api_key:
+            exact_match = next(
+                (
+                    existing
+                    for existing in existing_accounts
+                    if isinstance(existing, dict)
+                    and str(existing.get("name") or "").strip() == name
+                    and str(existing.get("baseURL") or existing.get("base_url") or "").strip().rstrip("/") == base_url
+                ),
+                None,
+            )
+            if exact_match is not None:
+                api_key = str(exact_match.get("apiKey") or exact_match.get("api_key") or "").strip()
         if name and base_url and api_key:
             normalized.append({"name": name, "baseURL": base_url, "apiKey": api_key})
     if not normalized:
@@ -668,7 +876,7 @@ async def update_balance_accounts(payload: dict[str, Any]) -> dict[str, Any]:
 async def get_pool_credentials() -> dict[str, Any]:
     if not initialized():
         raise HTTPException(status_code=409, detail="Not initialized")
-    return {"credentials": normalize_pool_credentials(get_setting("pool_credentials", {}))}
+    return {"credentials": public_pool_credentials(get_setting("pool_credentials", {}))}
 
 
 @app.put(f"{API_PREFIX}/pool-credentials")
@@ -676,6 +884,9 @@ async def update_pool_credentials(payload: dict[str, Any]) -> dict[str, Any]:
     if not initialized():
         raise HTTPException(status_code=409, detail="Not initialized")
     credentials = normalize_pool_credentials(payload.get("credentials") or payload)
+    existing = normalize_pool_credentials(get_setting("pool_credentials", {}))
+    credentials["email"] = credentials["email"] or existing["email"]
+    credentials["password"] = credentials["password"] or existing["password"]
     if not credentials["email"] or not credentials["password"]:
         raise HTTPException(status_code=400, detail="credentials required")
     set_setting("pool_credentials", credentials)
@@ -687,7 +898,7 @@ async def update_pool_credentials(payload: dict[str, Any]) -> dict[str, Any]:
 async def get_smtp_settings() -> dict[str, Any]:
     if not initialized():
         raise HTTPException(status_code=409, detail="Not initialized")
-    return {"settings": normalize_smtp_settings(get_setting("smtp_settings", {}))}
+    return {"settings": public_smtp_settings(get_setting("smtp_settings", {}))}
 
 
 @app.put(f"{API_PREFIX}/smtp-settings")
@@ -695,10 +906,14 @@ async def update_smtp_settings(payload: dict[str, Any]) -> dict[str, Any]:
     if not initialized():
         raise HTTPException(status_code=409, detail="Not initialized")
     settings = normalize_smtp_settings(payload.get("settings") or payload)
+    existing = normalize_smtp_settings(get_setting("smtp_settings", {}))
+    settings["username"] = settings["username"] or existing["username"]
+    settings["password"] = settings["password"] or existing["password"]
+    settings["recipient"] = settings["recipient"] or existing["recipient"]
     if not settings["recipient"]:
         raise HTTPException(status_code=400, detail="recipient required")
     set_setting("smtp_settings", settings)
-    pool_state = get_setting("pool_state", {})
+    pool_state = compact_pool_state(get_setting("pool_state", {}))
     pool_state["warningEmail"] = settings["recipient"]
     set_setting("pool_state", pool_state)
     return {"ok": True}
@@ -719,7 +934,7 @@ async def update_pool_state(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="Not initialized")
     incoming = compact_pool_state(payload.get("poolState") or payload)
     incoming["pollingMinutes"] = 5
-    existing = get_setting("pool_state", {})
+    existing = compact_pool_state(get_setting("pool_state", {}))
     existing.update(incoming)
     set_setting("pool_state", existing)
     return {"ok": True, "state": current_state()}

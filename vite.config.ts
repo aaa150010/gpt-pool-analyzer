@@ -7,6 +7,12 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
+    proxy: {
+      "/gpt-api": {
+        target: "https://lynote.xyz",
+        changeOrigin: true,
+      },
+    },
   },
   build: {
     outDir: "dist-web",
