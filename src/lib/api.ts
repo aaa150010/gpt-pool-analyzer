@@ -34,7 +34,8 @@ async function pixelManagerKey(): Promise<string> {
       .then(({ invoke }) => invoke<string>("pixel_manager_api_key"))
       .catch((error) => {
         pixelManagerKeyPromise = null;
-        throw error;
+        if (import.meta.env.DEV) throw error;
+        return "";
       });
   }
   return pixelManagerKeyPromise;
@@ -47,7 +48,7 @@ async function requestPixelJson<T>(path: string, init?: RequestInit): Promise<T>
     ...init,
     headers: {
       Accept: "application/json",
-      "X-91-Manager-Key": key,
+      ...(key ? { "X-91-Manager-Key": key } : {}),
       ...(isFormData ? {} : { "Content-Type": "application/json" }),
       ...(init?.headers ?? {}),
     },
@@ -63,7 +64,7 @@ async function requestPixelJson<T>(path: string, init?: RequestInit): Promise<T>
 async function downloadPixelExport(): Promise<PixelExportDownload> {
   const key = await pixelManagerKey();
   const response = await fetch(`${API_BASE}/pixel-manager/export`, {
-    headers: { Accept: "application/json", "X-91-Manager-Key": key },
+    headers: { Accept: "application/json", ...(key ? { "X-91-Manager-Key": key } : {}) },
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
@@ -86,7 +87,7 @@ async function downloadPixelExport(): Promise<PixelExportDownload> {
 async function downloadPixelExportJob(jobId: string): Promise<PixelExportDownload> {
   const key = await pixelManagerKey();
   const response = await fetch(`${API_BASE}/pixel-manager/export-jobs/${encodeURIComponent(jobId)}/download`, {
-    headers: { Accept: "application/json", "X-91-Manager-Key": key },
+    headers: { Accept: "application/json", ...(key ? { "X-91-Manager-Key": key } : {}) },
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => null);

@@ -90,6 +90,7 @@ class PixelTarget:
 class PixelManagerConfig:
     manager_key: str = field(repr=False)
     targets: dict[str, PixelTarget]
+    allow_open_access: bool = True
 
 
 @dataclass
@@ -276,7 +277,11 @@ def load_config(path: str | Path) -> PixelManagerConfig:
                 _first(item, "importDefaults", "import_defaults", default={})
             ),
         )
-    return PixelManagerConfig(manager_key=manager_key, targets=targets)
+    return PixelManagerConfig(
+        manager_key=manager_key,
+        targets=targets,
+        allow_open_access=bool(_first(raw, "allowOpenAccess", "allow_open_access", default=True)),
+    )
 
 
 def parse_credential_bundle(file_name: str, payload: bytes) -> CredentialBundle:
@@ -672,6 +677,8 @@ class PixelManager:
         }
 
     def authorized(self, provided_key: str | None) -> bool:
+        if self.config.allow_open_access:
+            return True
         candidate = str(provided_key or "")
         return bool(candidate) and secrets.compare_digest(candidate, self.config.manager_key)
 

@@ -111,8 +111,33 @@ class PixelConfigAndTransformTests(unittest.TestCase):
 
         self.assertEqual(config.targets["first"].email, "first@example.com")
         self.assertEqual(config.targets["first"].password, "fake-secret")
+        self.assertTrue(config.allow_open_access)
         self.assertNotIn("fake-secret", repr(config.targets["first"]))
         self.assertNotIn(MANAGER_KEY, repr(config))
+
+    def test_config_can_disable_open_access(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pixel-secret.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "managerKey": MANAGER_KEY,
+                        "allowOpenAccess": False,
+                        "targets": [
+                            {
+                                "id": "first",
+                                "email": "first@example.com",
+                                "password": "fake-secret",
+                                "baseUrl": "https://first.example",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = load_config(path)
+
+        self.assertFalse(config.allow_open_access)
 
     def test_json_array_is_parsed_without_mutating_source(self) -> None:
         bundle = parse_credential_bundle(
@@ -939,7 +964,17 @@ class PixelManagerEndpointTests(unittest.TestCase):
     def _headers(key: str = MANAGER_KEY) -> dict[str, str]:
         return {"X-91-Manager-Key": key}
 
-    def test_manager_endpoints_reject_missing_and_wrong_keys(self) -> None:
+    def test_manager_endpoints_allow_missing_key_by_default(self) -> None:
+        response = self.client.get("/gpt-api/pixel-manager/targets")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["targets"]), 1)
+
+    def test_manager_endpoints_reject_missing_and_wrong_keys_when_open_access_disabled(self) -> None:
+        self.manager.config = PixelManagerConfig(
+            manager_key=MANAGER_KEY,
+            targets=self.manager.config.targets,
+            allow_open_access=False,
+        )
         paths = [
             "/gpt-api/pixel-manager/targets",
             "/gpt-api/pixel-manager/targets/pixel-1/accounts",
@@ -956,7 +991,7 @@ class PixelManagerEndpointTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 401)
                 self.assertEqual(response.json(), {"detail": "账号池管理认证失败"})
 
-    def test_bulk_endpoints_require_auth_and_forward_validated_options(self) -> None:
+    def test_bulk_endpoints_forward_validated_options_without_key_by_default(self) -> None:
         operations = [
             ("bulk-delete", {"accountIds": [41, 41, 42]}),
             ("bulk-test", {"accountIds": [41, 41, 42]}),
@@ -965,18 +1000,6 @@ class PixelManagerEndpointTests(unittest.TestCase):
                 {"accountIds": [41, 41, 42], "shareMode": "public", "concurrency": 6},
             ),
         ]
-        for operation, body in operations:
-            path = f"/gpt-api/pixel-manager/targets/pixel-1/accounts/{operation}"
-            with self.subTest(operation=operation, key="missing"):
-                self.assertEqual(self.client.post(path, json=body).status_code, 401)
-            with self.subTest(operation=operation, key="wrong"):
-                response = self.client.post(
-                    path,
-                    headers=self._headers("wrong-manager-key"),
-                    json=body,
-                )
-                self.assertEqual(response.status_code, 401)
-
         self.manager.bulk_delete_accounts = AsyncMock(
             return_value={
                 "ok": True,
@@ -1009,17 +1032,14 @@ class PixelManagerEndpointTests(unittest.TestCase):
 
         delete_response = self.client.post(
             "/gpt-api/pixel-manager/targets/pixel-1/accounts/bulk-delete",
-            headers=self._headers(),
             json=operations[0][1],
         )
         test_response = self.client.post(
             "/gpt-api/pixel-manager/targets/pixel-1/accounts/bulk-test",
-            headers=self._headers(),
             json=operations[1][1],
         )
         update_response = self.client.post(
             "/gpt-api/pixel-manager/targets/pixel-1/accounts/bulk-update",
-            headers=self._headers(),
             json=operations[2][1],
         )
 
@@ -1225,7 +1245,7 @@ class PixelManagerEndpointTests(unittest.TestCase):
         self.assertNotIn("uploaded-secret", polled.text)
         jobs.get.assert_called_once_with("job-123")
 
-    def test_export_requires_auth_and_returns_download_metadata(self) -> None:
+    def test_export_returns_download_metadata_without_key_by_default(self) -> None:
         self.manager.export_all = AsyncMock(
             return_value=ExportBundle(
                 content=b'{"accounts":[]}',
@@ -1235,19 +1255,7 @@ class PixelManagerEndpointTests(unittest.TestCase):
                 batch_count=1,
             )
         )
-        missing = self.client.get("/gpt-api/pixel-manager/export")
-        wrong = self.client.get(
-            "/gpt-api/pixel-manager/export",
-            headers=self._headers("wrong-manager-key"),
-        )
-        self.assertEqual(missing.status_code, 401)
-        self.assertEqual(wrong.status_code, 401)
-        self.manager.export_all.assert_not_awaited()
-
-        response = self.client.get(
-            "/gpt-api/pixel-manager/export",
-            headers=self._headers(),
-        )
+        response = self.client.get("/gpt-api/pixel-manager/export")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"accounts": []})
         self.assertEqual(response.headers["content-type"], "application/json")
