@@ -597,6 +597,100 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(PixelValidationError):
             await manager.bulk_delete_accounts("pixel-1", range(1, 102))
 
+    async def test_delete_import_record_matches_only_recorded_names(self) -> None:
+        delete_payloads: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v1/auth/login":
+                return login_response()
+            if request.url.path == "/api/v1/accounts" and request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "items": [
+                                {"id": 101, "name": "acct-one@example.com"},
+                                {"id": 102, "name": "acct-two@example.com"},
+                                {"id": 103, "name": "unrelated@example.com"},
+                            ],
+                            "page": 1,
+                            "page_size": 100,
+                            "pages": 1,
+                            "total": 3,
+                        }
+                    },
+                )
+            if request.url.path == "/api/v1/accounts/bulk-delete":
+                payload = json.loads(request.content)
+                delete_payloads.append(payload)
+                return httpx.Response(
+                    200,
+                    json={"data": {"success_ids": payload["account_ids"], "failed_ids": []}},
+                )
+            raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+        manager = manager_with_transport(handler)
+        result = await manager.delete_import_record(
+            {
+                "recordId": "record-1",
+                "deleteStatus": "active",
+                "targets": [
+                    {
+                        "targetId": "pixel-1",
+                        "generatedNames": [
+                            "acct-one@example.com",
+                            "acct-missing@example.com",
+                        ],
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(delete_payloads, [{"account_ids": [101]}])
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["deleted"], 1)
+        self.assertEqual(result["results"][0]["missingNames"], ["acct-missing@example.com"])
+
+    async def test_delete_import_record_skips_duplicate_names(self) -> None:
+        delete_called = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal delete_called
+            if request.url.path == "/api/v1/auth/login":
+                return login_response()
+            if request.url.path == "/api/v1/accounts" and request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "items": [
+                                {"id": 101, "name": "acct-duplicate@example.com"},
+                                {"id": 102, "name": "acct-duplicate@example.com"},
+                            ],
+                            "page": 1,
+                            "page_size": 100,
+                            "pages": 1,
+                            "total": 2,
+                        }
+                    },
+                )
+            if request.url.path == "/api/v1/accounts/bulk-delete":
+                delete_called = True
+            raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+        manager = manager_with_transport(handler)
+        result = await manager.delete_import_record(
+            {
+                "recordId": "record-duplicate",
+                "deleteStatus": "active",
+                "targets": [{"targetId": "pixel-1", "generatedNames": ["acct-duplicate@example.com"]}],
+            }
+        )
+
+        self.assertFalse(delete_called)
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["results"][0]["ambiguousNames"], ["acct-duplicate@example.com"])
+
     async def test_bulk_test_calls_each_requested_id_once_and_sanitizes_results(self) -> None:
         tested_paths: list[str] = []
 

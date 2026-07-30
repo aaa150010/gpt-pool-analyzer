@@ -84,6 +84,32 @@ class DatabaseTests(unittest.TestCase):
         self.assertTrue({"capacity_5h", "capacity_7d", "remaining_capacity_5h", "remaining_capacity_7d"} <= columns)
         self.assertIn("idx_pool_history_group_date_id", indexes)
 
+    def test_import_records_are_persistent_and_secret_free(self) -> None:
+        app.init_db()
+        app.save_pixel_import_record(
+            {
+                "recordId": "import-1",
+                "createdAt": "2026-07-30T08:00:00Z",
+                "sourceFileName": "accounts.json",
+                "sourceCount": 2,
+                "targets": [
+                    {
+                        "targetId": "pixel-1",
+                        "email": "pool@example.com",
+                        "sourceCount": 2,
+                        "created": 2,
+                        "generatedNames": ["acct-one@example.com", "acct-two@example.com"],
+                        "message": "access_token=should-not-be-stored",
+                    }
+                ],
+            }
+        )
+
+        records = app.pixel_import_records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["targets"][0]["generatedNames"], ["acct-one@example.com", "acct-two@example.com"])
+        self.assertNotIn("should-not-be-stored", json.dumps(records))
+
     def test_raw_capacity_is_persisted_and_returned(self) -> None:
         app.init_db()
         app.insert_pool_snapshot(pool_snapshot("2026-07-28T08:00:00Z", 100))

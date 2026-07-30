@@ -9,6 +9,7 @@ import type {
   PixelExportDownload,
   PixelExportJob,
   PixelImportJob,
+  PixelImportRecord,
   PixelShareResponse,
   PixelTarget,
   PoolAnalyticsResponse,
@@ -172,7 +173,7 @@ export const api = {
       body: JSON.stringify({ settings }),
     }),
   pixelTargets: () => requestPixelJson<{ targets: PixelTarget[] }>("/pixel-manager/targets"),
-  pixelAccounts: (targetId: string, page = 1, pageSize = 20, status = "", search = "") => {
+  pixelAccounts: (targetId: string, page = 1, pageSize = 50, status = "", search = "") => {
     const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
     if (status) params.set("status", status);
     if (search.trim()) params.set("search", search.trim());
@@ -207,6 +208,12 @@ export const api = {
     });
   },
   pixelImportJob: (jobId: string) => requestPixelJson<{ job: PixelImportJob }>(`/pixel-manager/import-jobs/${encodeURIComponent(jobId)}`),
+  pixelImportRecords: () => requestPixelJson<{ records: PixelImportRecord[] }>("/pixel-manager/import-records"),
+  pixelDeleteImportRecord: (recordId: string) =>
+    requestPixelJson<{ record: PixelImportRecord; result: unknown }>(
+      `/pixel-manager/import-records/${encodeURIComponent(recordId)}/delete`,
+      { method: "POST" },
+    ),
   pixelShare: (targetId: string, accountIds: number[]) =>
     requestPixelJson<PixelShareResponse>(`/pixel-manager/targets/${encodeURIComponent(targetId)}/share`, {
       method: "POST",

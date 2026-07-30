@@ -384,6 +384,7 @@ export type PixelImportTargetResult = {
   shared: number;
   shareFailed: number;
   failedShareIds: number[];
+  generatedNames: string[];
   status: "success" | "partial" | "failed";
   message: string;
 };
@@ -420,6 +421,47 @@ export type PixelDeleteTargetResult = {
   failedIds: number[];
   status: "success" | "partial" | "failed";
   message: string;
+};
+
+export type PixelImportRecordTarget = {
+  targetId: string;
+  email: string;
+  sourceCount: number;
+  created: number;
+  updated: number;
+  failed: number;
+  shared: number;
+  shareFailed: number;
+  status: "success" | "partial" | "failed";
+  message: string;
+  generatedNames: string[];
+};
+
+export type PixelImportRecordDeleteResult = {
+  targetId: string;
+  email: string;
+  requested: number;
+  matched: number;
+  deleted: number;
+  failed: number;
+  deletedNames: string[];
+  missingNames: string[];
+  ambiguousNames: string[];
+  failedIds: number[];
+  status: "success" | "partial" | "failed";
+  message: string;
+};
+
+export type PixelImportRecord = {
+  recordId: string;
+  createdAt: string;
+  sourceFileName: string;
+  sourceCount: number;
+  targetCount: number;
+  targets: PixelImportRecordTarget[];
+  deleteStatus: "active" | "partial" | "deleted";
+  deletedAt: string | null;
+  lastDeleteResults: PixelImportRecordDeleteResult[];
 };
 
 export type PixelExportJob = {

@@ -23,6 +23,7 @@ try:
         PixelImportJobs,
         PixelManager,
         PixelManagerError,
+        _safe_text,
         load_config as load_pixel_manager_config,
         parse_credential_bundle,
     )
@@ -35,6 +36,7 @@ except ImportError:
         PixelImportJobs,
         PixelManager,
         PixelManagerError,
+        _safe_text,
         load_config as load_pixel_manager_config,
         parse_credential_bundle,
     )
@@ -70,7 +72,7 @@ def initialize_pixel_manager() -> None:
         pixel_export_jobs = None
         return
     pixel_manager = PixelManager(config)
-    pixel_import_jobs = PixelImportJobs(pixel_manager)
+    pixel_import_jobs = PixelImportJobs(pixel_manager, record_callback=save_pixel_import_record)
     pixel_export_jobs = PixelExportJobs(pixel_manager, DATA_DIR / "pixel_exports")
 
 
@@ -173,6 +175,16 @@ def init_db() -> None:
                 amount REAL NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS pixel_import_records (
+                record_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                source_file_name TEXT NOT NULL,
+                source_count INTEGER NOT NULL,
+                targets TEXT NOT NULL,
+                delete_status TEXT NOT NULL DEFAULT 'active',
+                deleted_at TEXT,
+                last_delete_results TEXT NOT NULL DEFAULT '[]'
+            );
             """
         )
         pool_columns = {row["name"] for row in conn.execute("PRAGMA table_info(pool_history)").fetchall()}
@@ -187,7 +199,105 @@ def init_db() -> None:
                 conn.execute(statement)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pool_history_group_date_id ON pool_history(group_name, date, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_balance_history_date_id ON balance_history(date, id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pixel_import_records_created_at ON pixel_import_records(created_at, record_id)")
         conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('initialized', 'false')")
+
+
+def _public_import_target(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "targetId": str(result.get("targetId") or ""),
+        "email": str(result.get("email") or ""),
+        "sourceCount": flexible_int(result.get("sourceCount")),
+        "created": flexible_int(result.get("created")),
+        "updated": flexible_int(result.get("updated")),
+        "failed": flexible_int(result.get("failed")),
+        "shared": flexible_int(result.get("shared")),
+        "shareFailed": flexible_int(result.get("shareFailed")),
+        "status": str(result.get("status") or "failed"),
+        "message": _safe_text(result.get("message") or ""),
+        "generatedNames": [
+            str(value).strip().lower()
+            for value in result.get("generatedNames") or []
+            if str(value).strip()
+        ],
+    }
+
+
+def save_pixel_import_record(record: dict[str, Any]) -> None:
+    targets = [
+        _public_import_target(item)
+        for item in record.get("targets") or []
+        if isinstance(item, dict)
+    ]
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO pixel_import_records(
+                record_id, created_at, source_file_name, source_count, targets,
+                delete_status, deleted_at, last_delete_results
+            ) VALUES(?, ?, ?, ?, ?, 'active', NULL, '[]')
+            ON CONFLICT(record_id) DO UPDATE SET
+                source_file_name = excluded.source_file_name,
+                source_count = excluded.source_count,
+                targets = excluded.targets
+            """,
+            (
+                str(record.get("recordId") or ""),
+                str(record.get("createdAt") or utc_now()),
+                str(record.get("sourceFileName") or "accounts.json"),
+                flexible_int(record.get("sourceCount")),
+                dumps(targets),
+            ),
+        )
+
+
+def pixel_import_record_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "recordId": row["record_id"],
+        "createdAt": row["created_at"],
+        "sourceFileName": row["source_file_name"],
+        "sourceCount": row["source_count"],
+        "targetCount": len(loads(row["targets"], [])),
+        "targets": loads(row["targets"], []),
+        "deleteStatus": row["delete_status"],
+        "deletedAt": row["deleted_at"],
+        "lastDeleteResults": loads(row["last_delete_results"], []),
+    }
+
+
+def pixel_import_records() -> list[dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM pixel_import_records ORDER BY created_at DESC, record_id DESC"
+        ).fetchall()
+    return [pixel_import_record_row(row) for row in rows]
+
+
+def pixel_import_record(record_id: str) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM pixel_import_records WHERE record_id = ?",
+            (str(record_id or ""),),
+        ).fetchone()
+    return pixel_import_record_row(row) if row else None
+
+
+def update_pixel_import_record_delete(record_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    delete_status = "deleted" if result.get("status") == "success" else "partial"
+    deleted_at = utc_now() if delete_status == "deleted" else None
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE pixel_import_records
+            SET delete_status = ?, deleted_at = ?, last_delete_results = ?
+            WHERE record_id = ?
+            """,
+            (delete_status, deleted_at, dumps(result.get("results") or []), str(record_id or "")),
+        )
+    updated = pixel_import_record(record_id)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="导入记录不存在")
+    return updated
 
 
 def get_meta(key: str, default: str = "") -> str:
@@ -867,7 +977,7 @@ async def get_pixel_targets(
 async def get_pixel_accounts(
     target_id: str,
     page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, alias="pageSize", ge=1, le=100),
+    page_size: int = Query(default=50, alias="pageSize", ge=1, le=100),
     search: str = Query(default="", max_length=120),
     status: str = Query(default="", max_length=40),
     manager: PixelManager = Depends(require_pixel_manager),
@@ -882,6 +992,39 @@ async def get_pixel_accounts(
         )
     except PixelManagerError as exc:
         raise pixel_http_error(exc) from exc
+
+
+@app.get(f"{API_PREFIX}/pixel-manager/import-records")
+async def get_pixel_import_records(
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    return {"records": pixel_import_records()}
+
+
+@app.get(f"{API_PREFIX}/pixel-manager/import-records/{{record_id}}")
+async def get_pixel_import_record(
+    record_id: str,
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    record = pixel_import_record(record_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="导入记录不存在")
+    return {"record": record}
+
+
+@app.post(f"{API_PREFIX}/pixel-manager/import-records/{{record_id}}/delete")
+async def delete_pixel_import_record(
+    record_id: str,
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    record = pixel_import_record(record_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="导入记录不存在")
+    try:
+        result = await manager.delete_import_record(record)
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+    return {"record": update_pixel_import_record_delete(record_id, result), "result": result}
 
 
 @app.get(f"{API_PREFIX}/pixel-manager/targets/{{target_id}}/accounts/{{account_id}}/usage")
@@ -974,7 +1117,7 @@ async def create_pixel_import(
         bundle = parse_credential_bundle(file_name or "accounts.json", payload)
         jobs = pixel_import_jobs
         if jobs is None or jobs.manager is not manager:
-            jobs = PixelImportJobs(manager)
+            jobs = PixelImportJobs(manager, record_callback=save_pixel_import_record)
             globals()["pixel_import_jobs"] = jobs
         return {"job": await jobs.create(bundle, target_ids)}
     except PixelManagerError as exc:

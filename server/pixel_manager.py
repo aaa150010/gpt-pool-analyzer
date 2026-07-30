@@ -113,7 +113,7 @@ class TargetCredentialBundle:
     source_count: int
     contents: tuple[str, ...] = field(repr=False)
     chunk_sizes: tuple[int, ...]
-    generated_names: frozenset[str] = field(repr=False)
+    generated_names: tuple[str, ...] = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -433,13 +433,13 @@ def build_target_credential_bundle(
     _remove_chatgpt_field_source(payload)
     _set_plan_type_plus(payload)
     _ensure_openai_oauth_plan_type(payload)
-    generated_names: set[str] = set()
+    generated_names: list[str] = []
     accounts = payload["accounts"]
     for account in accounts:
         replacement = _random_email(_account_email_domain(account), used_emails)
         account["name"] = replacement
         _replace_email_fields(account, replacement)
-        generated_names.add(replacement)
+        generated_names.append(replacement)
 
     common = {key: copy.deepcopy(value) for key, value in payload.items() if key != "accounts"}
     contents: list[str] = []
@@ -454,7 +454,7 @@ def build_target_credential_bundle(
         source_count=bundle.source_count,
         contents=tuple(contents),
         chunk_sizes=tuple(chunk_sizes),
-        generated_names=frozenset(generated_names),
+        generated_names=tuple(generated_names),
     )
 
 
@@ -987,20 +987,168 @@ class PixelManager:
         target = self._target(target_id)
         ids = _account_ids(account_ids)
         async with self._operation_locks[target.id]:
-            payload = await self._request(
-                target,
-                "POST",
-                "/api/v1/accounts/bulk-delete",
-                json_body={"account_ids": ids},
-                timeout=LONG_OPERATION_TIMEOUT_SECONDS,
-            )
-        result = _bulk_operation_result(payload, ids)
+            result = await self._bulk_delete_ids_unlocked(target, ids)
         current_count = self._target_status[target.id].get("accountCount")
         if isinstance(current_count, int):
             self._target_status[target.id]["accountCount"] = max(
                 current_count - result["success"], 0
             )
         return result
+
+    async def _bulk_delete_ids_unlocked(
+        self, target: PixelTarget, ids: list[int]
+    ) -> dict[str, Any]:
+        success_ids: list[int] = []
+        failed_ids: list[int] = []
+        for start in range(0, len(ids), MAX_BULK_ACCOUNTS):
+            chunk = ids[start : start + MAX_BULK_ACCOUNTS]
+            try:
+                payload = await self._request(
+                    target,
+                    "POST",
+                    "/api/v1/accounts/bulk-delete",
+                    json_body={"account_ids": chunk},
+                    timeout=LONG_OPERATION_TIMEOUT_SECONDS,
+                )
+                result = _bulk_operation_result(payload, chunk)
+                success_ids.extend(result["successIds"])
+                failed_ids.extend(result["failedIds"])
+            except PixelManagerError:
+                failed_ids.extend(chunk)
+        return {
+            "ok": not failed_ids,
+            "success": len(success_ids),
+            "failed": len(failed_ids),
+            "successIds": success_ids,
+            "failedIds": failed_ids,
+        }
+
+    async def delete_import_record(
+        self, record: dict[str, Any]
+    ) -> dict[str, Any]:
+        target_records = record.get("targets")
+        if not isinstance(target_records, list) or not target_records:
+            raise PixelValidationError("导入记录没有可删除的平台账号")
+
+        results: list[dict[str, Any]] = []
+        for target_record in target_records:
+            if not isinstance(target_record, dict):
+                continue
+            target_id = str(target_record.get("targetId") or "").strip()
+            target = self._target(target_id)
+            source_names = {
+                str(value or "").strip().lower()
+                for value in target_record.get("generatedNames") or []
+                if str(value or "").strip()
+            }
+            base = {
+                "targetId": target.id,
+                "email": target.email,
+                "requested": len(source_names),
+                "matched": 0,
+                "deleted": 0,
+                "failed": 0,
+                "deletedNames": [],
+                "missingNames": [],
+                "ambiguousNames": [],
+                "failedIds": [],
+                "status": "success",
+                "message": "",
+            }
+            if not source_names:
+                base["message"] = "该平台没有实际新增账号"
+                results.append(base)
+                continue
+
+            async with self._operation_locks[target.id]:
+                try:
+                    accounts = await self._all_accounts_by_id(target)
+                    ids_by_name: dict[str, list[int]] = {}
+                    for account_id, name in accounts.items():
+                        ids_by_name.setdefault(name, []).append(account_id)
+                    missing = sorted(source_names - set(ids_by_name))
+                    ambiguous = sorted(
+                        name for name in source_names if len(ids_by_name.get(name, [])) > 1
+                    )
+                    matched_ids = sorted(
+                        account_id
+                        for name in source_names
+                        if name not in ambiguous
+                        for account_id in ids_by_name.get(name, [])
+                    )
+                    delete_result = await self._bulk_delete_ids_unlocked(target, matched_ids) if matched_ids else {
+                        "success": 0,
+                        "failed": 0,
+                        "successIds": [],
+                        "failedIds": [],
+                    }
+                    names_by_id = {
+                        account_id: name
+                        for name in source_names
+                        if name not in ambiguous
+                        for account_id in ids_by_name.get(name, [])
+                    }
+                    previous_result = next(
+                        (
+                            item
+                            for item in record.get("lastDeleteResults") or []
+                            if isinstance(item, dict) and item.get("targetId") == target.id
+                        ),
+                        {},
+                    )
+                    previous_deleted_names = {
+                        str(value or "").strip().lower()
+                        for value in previous_result.get("deletedNames") or []
+                        if str(value or "").strip()
+                    }
+                    deleted_names = previous_deleted_names | {
+                        names_by_id[account_id]
+                        for account_id in delete_result["successIds"]
+                        if account_id in names_by_id
+                    }
+                    missing = [name for name in missing if name not in previous_deleted_names]
+                    base.update(
+                        {
+                            "matched": len(matched_ids),
+                            "deleted": delete_result["success"],
+                            "failed": delete_result["failed"],
+                            "deletedNames": sorted(deleted_names),
+                            "missingNames": missing,
+                            "ambiguousNames": ambiguous,
+                            "failedIds": delete_result["failedIds"],
+                        }
+                    )
+                    if base["failed"] or ambiguous or missing:
+                        base["status"] = "partial"
+                        problems = []
+                        if base["failed"]:
+                            problems.append(f"删除失败 {base['failed']} 个")
+                        if ambiguous:
+                            problems.append(f"重复名称 {len(ambiguous)} 个")
+                        if missing:
+                            problems.append(f"未找到 {len(missing)} 个")
+                        base["message"] = "；".join(problems)
+                    else:
+                        base["message"] = f"已删除 {base['deleted']} 个账号"
+                except PixelManagerError as exc:
+                    base.update({"status": "failed", "message": exc.public_message})
+            results.append(base)
+        deleted = sum(_positive_int(item.get("deleted")) for item in results)
+        failed = sum(_positive_int(item.get("failed")) for item in results)
+        has_issues = any(
+            item.get("status") != "success"
+            or item.get("missingNames")
+            or item.get("ambiguousNames")
+            for item in results
+        )
+        return {
+            "recordId": str(record.get("recordId") or ""),
+            "status": "partial" if has_issues else "success",
+            "deleted": deleted,
+            "failed": failed,
+            "results": results,
+            "message": "删除完成，但存在未处理账号" if has_issues else f"已删除 {deleted} 个账号",
+        }
 
     async def _delete_all_accounts_unlocked(self, target: PixelTarget) -> dict[str, Any]:
         try:
@@ -1279,6 +1427,7 @@ class PixelManager:
             "shared": 0,
             "shareFailed": 0,
             "failedShareIds": [],
+            "generatedNames": [],
         }
         async with self._operation_locks[target.id]:
             try:
@@ -1329,6 +1478,7 @@ class PixelManager:
                 for account_id, name in after_accounts.items()
                 if account_id not in before_ids and name in generated_names
             )
+            generated_names = [after_accounts[account_id] for account_id in imported_ids]
             created = max(created, len(imported_ids))
             share_result = {"success": 0, "failed": 0, "failedIds": []}
             if imported_ids:
@@ -1352,6 +1502,7 @@ class PixelManager:
                     "shared": _positive_int(share_result.get("success")),
                     "shareFailed": share_failed,
                     "failedShareIds": list(share_result.get("failedIds") or []),
+                    "generatedNames": generated_names,
                 }
             )
             if created + updated == 0 and (failed > 0 or request_error):
@@ -1457,8 +1608,13 @@ class PixelManager:
 
 
 class PixelImportJobs:
-    def __init__(self, manager: PixelManager) -> None:
+    def __init__(
+        self,
+        manager: PixelManager,
+        record_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self.manager = manager
+        self.record_callback = record_callback
         self._jobs: dict[str, dict[str, Any]] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
@@ -1524,6 +1680,20 @@ class PixelImportJobs:
 
         try:
             result = await self.manager.import_bundle(bundle, target_ids, progress)
+            if self.record_callback:
+                try:
+                    self.record_callback(
+                        {
+                            "recordId": job_id,
+                            "createdAt": job["createdAt"],
+                            "sourceFileName": bundle.source_file_name,
+                            "sourceCount": bundle.source_count,
+                            "targets": result["results"],
+                        }
+                    )
+                except Exception:
+                    # Import success must not be changed by audit persistence errors.
+                    pass
             job.update(
                 {
                     "status": "completed",

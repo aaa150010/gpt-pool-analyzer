@@ -31,7 +31,7 @@ import {
   X,
 } from "lucide-react";
 import type React from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Area,
   AreaChart,
@@ -64,6 +64,7 @@ import type {
   PixelAccountUsage,
   PixelExportJob,
   PixelImportJob,
+  PixelImportRecord,
   PixelImportTargetResult,
   PixelTarget,
   ServerStateResponse,
@@ -1408,7 +1409,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   const [accountsLoading, setAccountsLoading] = useState(false);
   const [accountsError, setAccountsError] = useState("");
   const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(20);
+  const [pageSize, setPageSize] = useState(50);
   const [accountSearchInput, setAccountSearchInput] = useState("");
   const [accountSearch, setAccountSearch] = useState("");
   const [accountStatus, setAccountStatus] = useState("");
@@ -1424,6 +1425,11 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   const [exportJob, setExportJob] = useState<PixelExportJob | null>(null);
   const [retryingTargetId, setRetryingTargetId] = useState("");
   const [exporting, setExporting] = useState(false);
+  const [importRecords, setImportRecords] = useState<PixelImportRecord[]>([]);
+  const [importRecordsOpen, setImportRecordsOpen] = useState(false);
+  const [importRecordsLoading, setImportRecordsLoading] = useState(false);
+  const [deletingRecordId, setDeletingRecordId] = useState("");
+  const [deleteRecord, setDeleteRecord] = useState<PixelImportRecord | null>(null);
   const exportBackupDownloadedRef = useRef<Set<string>>(new Set());
   const accountsRequestSequence = useRef(0);
   const [selectedAccountIds, setSelectedAccountIds] = useState<Set<number>>(new Set());
@@ -1709,6 +1715,37 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
     setExportOpen(true);
   };
 
+  const openImportRecords = async () => {
+    setImportRecordsOpen(true);
+    setImportRecordsLoading(true);
+    try {
+      const response = await api.pixelImportRecords();
+      setImportRecords(response.records);
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "导入记录读取失败");
+    } finally {
+      setImportRecordsLoading(false);
+    }
+  };
+
+  const runDeleteImportRecord = async () => {
+    if (!deleteRecord) return;
+    setDeletingRecordId(deleteRecord.recordId);
+    try {
+      const response = await api.pixelDeleteImportRecord(deleteRecord.recordId);
+      setImportRecords((current) => current.map((item) => item.recordId === response.record.recordId ? response.record : item));
+      setDeleteRecord(null);
+      const targetList = await loadTargets();
+      await refreshAllTargetCountsRef.current(targetList, { silent: true });
+      await loadAccountsRef.current();
+      onToast(response.record.deleteStatus === "deleted" ? "导入记录账号已全部删除" : "导入记录删除完成，但存在未处理账号");
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "导入记录删除失败");
+    } finally {
+      setDeletingRecordId("");
+    }
+  };
+
   const exportAllAccounts = async () => {
     setExporting(true);
     try {
@@ -1933,13 +1970,17 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               <FileJson className="h-4 w-4" />
               选择 JSON
             </Button>
-            <Button variant="outline" disabled={exporting || importing || targetsLoading || !targets.length} onClick={openExport}>
-              {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-              {exporting ? "正在处理" : "汇总导出"}
-            </Button>
             <Button disabled={importing || !selectedFile || !targets.length} onClick={openImport}>
               <Upload className="h-4 w-4" />
               上传到平台
+            </Button>
+            <Button variant="outline" disabled={importing || targetsLoading} onClick={() => void openImportRecords()}>
+              <History className="h-4 w-4" />
+              导入记录
+            </Button>
+            <Button variant="outline" disabled={exporting || importing || targetsLoading || !targets.length} onClick={openExport}>
+              {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+              {exporting ? "正在处理" : "汇总导出"}
             </Button>
           </div>
         </CardContent>
@@ -2202,6 +2243,36 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
           </DialogContent>
         </Dialog>
       )}
+
+      <PixelImportRecordsDialog
+        open={importRecordsOpen}
+        records={importRecords}
+        loading={importRecordsLoading}
+        deletingRecordId={deletingRecordId}
+        onOpenChange={setImportRecordsOpen}
+        onDelete={setDeleteRecord}
+      />
+
+      <Dialog open={Boolean(deleteRecord)} onOpenChange={(open) => !open && !deletingRecordId && setDeleteRecord(null)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>确认删除导入账号</DialogTitle>
+            <DialogDescription>
+              将删除“{deleteRecord?.sourceFileName || "JSON 文件"}”在 {deleteRecord?.targetCount || 0} 个平台中记录的随机邮箱账号，只匹配本次导入名称。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-3 text-sm font-bold text-rose-700">
+            改名、找不到或重复名称的账号会跳过并报告，不会删除其他账号。
+          </div>
+          <div className="mt-5 flex justify-end gap-2">
+            <Button variant="outline" disabled={Boolean(deletingRecordId)} onClick={() => setDeleteRecord(null)}>取消</Button>
+            <Button variant="destructive" disabled={Boolean(deletingRecordId)} onClick={() => void runDeleteImportRecord()}>
+              {deletingRecordId ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+              {deletingRecordId ? "正在删除" : "确认删除"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={exportOpen} onOpenChange={(open) => !exporting && setExportOpen(open)}>
         <DialogContent className="max-w-2xl">
@@ -2583,6 +2654,128 @@ function PixelImportProgress({ job, targets }: { job: PixelImportJob; targets: P
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+function PixelImportRecordsDialog({
+  open,
+  records,
+  loading,
+  deletingRecordId,
+  onOpenChange,
+  onDelete,
+}: {
+  open: boolean;
+  records: PixelImportRecord[];
+  loading: boolean;
+  deletingRecordId: string;
+  onOpenChange: (open: boolean) => void;
+  onDelete: (record: PixelImportRecord) => void;
+}) {
+  const [expandedRecordId, setExpandedRecordId] = useState("");
+  const statusLabel = (status: PixelImportRecord["deleteStatus"]) => {
+    if (status === "deleted") return "已删除";
+    if (status === "partial") return "部分处理";
+    return "未删除";
+  };
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[min(760px,calc(100vh-48px))] w-[min(calc(100vw-48px),1260px)] overflow-auto">
+        <DialogHeader>
+          <DialogTitle>导入记录</DialogTitle>
+          <DialogDescription>每条记录只对应当次选择的平台和生成的随机邮箱，记录会永久保留。</DialogDescription>
+        </DialogHeader>
+        {loading ? (
+          <div className="flex min-h-32 items-center justify-center text-sm font-bold text-muted-foreground">
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />正在读取记录
+          </div>
+        ) : records.length === 0 ? (
+          <div className="flex min-h-32 items-center justify-center text-sm font-bold text-muted-foreground">暂无导入记录</div>
+        ) : (
+          <div className="overflow-auto rounded-md border border-border">
+            <table className="w-full min-w-[900px] text-left text-xs">
+              <thead className="bg-muted text-[11px] font-black text-muted-foreground">
+                <tr>
+                  <th className="w-8 px-3 py-2.5" />
+                  <th className="px-3 py-2.5">导入时间</th>
+                  <th className="px-3 py-2.5">JSON 文件</th>
+                  <th className="px-3 py-2.5">平台</th>
+                  <th className="px-3 py-2.5">账号数</th>
+                  <th className="px-3 py-2.5">删除状态</th>
+                  <th className="w-[130px] px-3 py-2.5">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {records.map((record) => {
+                  const expanded = expandedRecordId === record.recordId;
+                  return (
+                    <Fragment key={record.recordId}>
+                    <tr className="border-t border-border align-top">
+                    <td className="px-3 py-3">
+                      <button
+                        type="button"
+                        title="查看随机邮箱"
+                        aria-label="查看随机邮箱"
+                        className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground"
+                        onClick={() => setExpandedRecordId(expanded ? "" : record.recordId)}
+                      >
+                        <ChevronRight className={cn("h-4 w-4 transition-transform", expanded && "rotate-90")} />
+                      </button>
+                    </td>
+                    <td className="px-3 py-3 font-bold whitespace-nowrap">{formatDateTime(record.createdAt)}</td>
+                    <td className="max-w-[260px] px-3 py-3 font-black"><div className="truncate" title={record.sourceFileName}>{record.sourceFileName}</div></td>
+                    <td className="px-3 py-3 font-black">{record.targetCount}</td>
+                    <td className="px-3 py-3 font-black">{record.targets.reduce((total, target) => total + target.generatedNames.length, 0)}</td>
+                    <td className="px-3 py-3">
+                      <StatusPill tone={record.deleteStatus === "deleted" ? "green" : record.deleteStatus === "partial" ? "amber" : "gray"}>
+                        {statusLabel(record.deleteStatus)}
+                      </StatusPill>
+                    </td>
+                    <td className="px-3 py-3">
+                      <Button
+                        variant="destructive"
+                        size="sm"
+                        disabled={record.deleteStatus === "deleted" || Boolean(deletingRecordId)}
+                        onClick={() => onDelete(record)}
+                      >
+                        {deletingRecordId === record.recordId ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                        {record.deleteStatus === "partial" ? "重试删除" : "删除账号"}
+                      </Button>
+                    </td>
+                    </tr>
+                    {expanded && (
+                      <tr className="border-t border-border bg-muted/30">
+                        <td colSpan={7} className="px-4 py-3">
+                          <div className="grid gap-3 md:grid-cols-2">
+                            {record.targets.map((target) => (
+                              <div key={target.targetId} className="rounded-md border border-border bg-background p-3">
+                                <div className="flex items-center justify-between gap-3 text-xs font-black">
+                                  <span className="truncate">{target.email}</span>
+                                  <span className="shrink-0 text-muted-foreground">{target.generatedNames.length} 个随机邮箱</span>
+                                </div>
+                                <div className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[11px] text-muted-foreground">
+                                  {target.generatedNames.length ? target.generatedNames.join("\n") : "没有实际新增账号"}
+                                </div>
+                                {record.lastDeleteResults.find((item) => item.targetId === target.targetId)?.message && (
+                                  <div className="mt-2 text-[11px] font-bold text-amber-700">
+                                    {record.lastDeleteResults.find((item) => item.targetId === target.targetId)?.message}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }
 
