@@ -22,6 +22,7 @@ from server.pixel_manager import (
     _safe_text,
     build_target_credential_bundle,
     load_config,
+    merge_credential_bundles,
     merge_export_payloads,
     parse_credential_bundle,
 )
@@ -192,6 +193,23 @@ class PixelConfigAndTransformTests(unittest.TestCase):
         self.assertEqual(prepared.chunk_sizes, (100, 100, 5))
         self.assertEqual([len(json.loads(item)["accounts"]) for item in prepared.contents], [100, 100, 5])
 
+    def test_multiple_json_bundles_merge_and_retain_source_file_names(self) -> None:
+        first = parse_credential_bundle(
+            "one.json",
+            json.dumps({"accounts": [{"credentials": {"access_token": "one"}}]}).encode(),
+        )
+        second = parse_credential_bundle(
+            "two.json",
+            json.dumps({"accounts": [{"credentials": {"access_token": "two"}}]}).encode(),
+        )
+
+        merged = merge_credential_bundles([first, second])
+
+        self.assertEqual(merged.source_count, 2)
+        self.assertEqual(merged.source_file_names, ("one.json", "two.json"))
+        self.assertEqual(len(merged.source_payload["accounts"]), 2)
+        self.assertEqual(merged.source_file_name, "批量导入（2个JSON文件）")
+
     def test_target_bundle_removes_chatgpt_field_source_recursively(self) -> None:
         bundle = parse_credential_bundle(
             "batch.json",
@@ -233,6 +251,52 @@ class PixelConfigAndTransformTests(unittest.TestCase):
         self.assertEqual(account["credentials"]["nested"]["kept"], "yes")
         self.assertEqual(account["extra"]["values"][0]["kept"], 1)
         self.assertEqual(bundle.source_payload, source_before)
+
+    def test_target_bundle_removes_pixel_blocked_fields_but_keeps_agent_identity_auth(self) -> None:
+        bundle = parse_credential_bundle(
+            "batch.json",
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "name": "oauth@example.com",
+                            "credentials": {
+                                "access_token": "oauth-token",
+                                "auth_mode": "oauth",
+                                "base_url": "https://invalid.example",
+                                "authorization": "Bearer invalid",
+                            },
+                            "extra": {"cookie": "invalid", "keep": "yes"},
+                        },
+                        {
+                            "name": "agent@example.com",
+                            "type": "oauth",
+                            "platform": "openai",
+                            "credentials": {
+                                "auth_mode": "agentIdentity",
+                                "agent_identity": {
+                                    "agent_runtime_id": "runtime-1",
+                                    "agent_private_key": "private-key",
+                                },
+                            },
+                        },
+                    ]
+                }
+            ).encode(),
+        )
+
+        prepared = build_target_credential_bundle(bundle, set())
+        payload = json.loads(prepared.contents[0])
+        oauth = payload["accounts"][0]
+        agent = payload["accounts"][1]
+
+        self.assertNotIn("auth_mode", oauth["credentials"])
+        self.assertNotIn("base_url", oauth["credentials"])
+        self.assertNotIn("authorization", oauth["credentials"])
+        self.assertNotIn("cookie", oauth["extra"])
+        self.assertEqual(oauth["extra"]["keep"], "yes")
+        self.assertEqual(agent["credentials"]["auth_mode"], "agentIdentity")
+        self.assertIn("agent_identity", agent["credentials"])
 
     def test_export_merge_deduplicates_by_any_jwt_signature(self) -> None:
         first = {
@@ -459,7 +523,7 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         await manager.list_accounts("one", 1, 20)
         self.assertEqual(logins, ["one.example", "two.example"])
 
-    async def test_import_converts_only_new_ids_to_public_pool(self) -> None:
+    async def test_import_sets_only_new_ids_public_with_concurrency_ten(self) -> None:
         account_reads = 0
         captured_import: dict = {}
         captured_share: dict = {}
@@ -495,7 +559,7 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
                     200,
                     json={"data": {"total": 2, "created": 2, "updated": 0, "failed": 0, "errors": []}},
                 )
-            if request.url.path == "/api/v1/accounts/external-placement:convert-batch":
+            if request.url.path == "/api/v1/accounts/bulk-update":
                 captured_share = json.loads(request.content)
                 return httpx.Response(
                     200,
@@ -533,13 +597,57 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item["credentials"]["plan_type"] == "plus" for item in imported_payload["accounts"]))
         self.assertTrue(all(item["name"].startswith("acct-") for item in imported_payload["accounts"]))
         self.assertEqual(captured_share["account_ids"], [2, 3])
-        self.assertEqual(captured_share["target"], "public_pool")
-        self.assertTrue(captured_share["idempotency_key"])
+        self.assertEqual(captured_share["share_mode"], "public")
+        self.assertEqual(captured_share["concurrency"], 10)
         self.assertEqual(result["shared"], 1)
         self.assertEqual(result["shareFailed"], 1)
         self.assertEqual(result["failedShareIds"], [3])
         self.assertEqual(result["status"], "partial")
         self.assertNotIn("fake-one", json.dumps(response))
+
+    async def test_share_retry_uses_bulk_update_with_public_concurrency_ten(self) -> None:
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal captured
+            if request.url.path == "/api/v1/auth/login":
+                return login_response()
+            if request.url.path == "/api/v1/accounts/bulk-update":
+                captured = json.loads(request.content)
+                return httpx.Response(
+                    200,
+                    json={"data": {"success": 2, "failed": 0}},
+                )
+            if request.url.path == "/api/v1/accounts" and request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "items": [
+                                {"id": 41, "share_mode": "public", "concurrency": 10},
+                                {"id": 42, "share_mode": "public", "concurrency": 10},
+                            ],
+                            "page": 1,
+                            "pages": 1,
+                            "total": 2,
+                        }
+                    },
+                )
+            raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+        manager = manager_with_transport(handler)
+        result = await manager.share_accounts("pixel-1", [41, 42])
+
+        self.assertEqual(
+            captured,
+            {
+                "account_ids": [41, 42],
+                "share_mode": "public",
+                "concurrency": 10,
+            },
+        )
+        self.assertEqual(result["successIds"], [41, 42])
+        self.assertEqual(result["failedIds"], [])
 
     async def test_share_rejects_empty_ids(self) -> None:
         manager = manager_with_transport(lambda _: login_response())
@@ -1152,6 +1260,21 @@ class PixelManagerEndpointTests(unittest.TestCase):
             share_mode="public",
             concurrency=6,
         )
+
+    def test_batch_import_accepts_multiple_json_files_and_retains_names(self) -> None:
+        files = [
+            ("files", ("one.json", json.dumps({"accounts": [{"credentials": {"access_token": "one"}}]}), "application/json")),
+            ("files", ("two.json", json.dumps({"accounts": [{"credentials": {"access_token": "two"}}]}), "application/json")),
+        ]
+        response = self.client.post(
+            "/gpt-api/pixel-manager/import-batch?targetIds=%5B%22pixel-1%22%5D",
+            files=files,
+        )
+
+        self.assertEqual(response.status_code, 202)
+        job = response.json()["job"]
+        self.assertEqual(job["sourceCount"], 2)
+        self.assertEqual(job["sourceFileNames"], ["one.json", "two.json"])
 
     def test_target_and_account_responses_expose_only_public_fields(self) -> None:
         targets_response = self.client.get(

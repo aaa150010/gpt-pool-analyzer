@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import UploadFile
 
 try:
     from .analytics import build_analytics
@@ -25,6 +26,7 @@ try:
         PixelManagerError,
         _safe_text,
         load_config as load_pixel_manager_config,
+        merge_credential_bundles,
         parse_credential_bundle,
     )
 except ImportError:
@@ -38,6 +40,7 @@ except ImportError:
         PixelManagerError,
         _safe_text,
         load_config as load_pixel_manager_config,
+        merge_credential_bundles,
         parse_credential_bundle,
     )
 
@@ -179,6 +182,7 @@ def init_db() -> None:
                 record_id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
                 source_file_name TEXT NOT NULL,
+                source_file_names TEXT NOT NULL DEFAULT '[]',
                 source_count INTEGER NOT NULL,
                 targets TEXT NOT NULL,
                 delete_status TEXT NOT NULL DEFAULT 'active',
@@ -197,6 +201,14 @@ def init_db() -> None:
         for column, statement in migrations.items():
             if column not in pool_columns:
                 conn.execute(statement)
+        import_record_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(pixel_import_records)").fetchall()
+        }
+        if "source_file_names" not in import_record_columns:
+            conn.execute(
+                "ALTER TABLE pixel_import_records ADD COLUMN source_file_names TEXT NOT NULL DEFAULT '[]'"
+            )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pool_history_group_date_id ON pool_history(group_name, date, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_balance_history_date_id ON balance_history(date, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pixel_import_records_created_at ON pixel_import_records(created_at, record_id)")
@@ -207,12 +219,22 @@ def _public_import_target(result: dict[str, Any]) -> dict[str, Any]:
     return {
         "targetId": str(result.get("targetId") or ""),
         "email": str(result.get("email") or ""),
+        "generatedFileName": str(result.get("generatedFileName") or ""),
         "sourceCount": flexible_int(result.get("sourceCount")),
         "created": flexible_int(result.get("created")),
         "updated": flexible_int(result.get("updated")),
         "failed": flexible_int(result.get("failed")),
         "shared": flexible_int(result.get("shared")),
         "shareFailed": flexible_int(result.get("shareFailed")),
+        "importErrors": [
+            {
+                "index": _safe_text(item.get("index"), 32),
+                "name": _safe_text(item.get("name"), 160),
+                "message": _safe_text(item.get("message"), 300),
+            }
+            for item in result.get("importErrors") or []
+            if isinstance(item, dict) and _safe_text(item.get("message"), 300)
+        ],
         "status": str(result.get("status") or "failed"),
         "message": _safe_text(result.get("message") or ""),
         "generatedNames": [
@@ -233,11 +255,12 @@ def save_pixel_import_record(record: dict[str, Any]) -> None:
         conn.execute(
             """
             INSERT INTO pixel_import_records(
-                record_id, created_at, source_file_name, source_count, targets,
+                record_id, created_at, source_file_name, source_file_names, source_count, targets,
                 delete_status, deleted_at, last_delete_results
-            ) VALUES(?, ?, ?, ?, ?, 'active', NULL, '[]')
+            ) VALUES(?, ?, ?, ?, ?, ?, 'active', NULL, '[]')
             ON CONFLICT(record_id) DO UPDATE SET
                 source_file_name = excluded.source_file_name,
+                source_file_names = excluded.source_file_names,
                 source_count = excluded.source_count,
                 targets = excluded.targets
             """,
@@ -245,6 +268,7 @@ def save_pixel_import_record(record: dict[str, Any]) -> None:
                 str(record.get("recordId") or ""),
                 str(record.get("createdAt") or utc_now()),
                 str(record.get("sourceFileName") or "accounts.json"),
+                dumps(record.get("sourceFileNames") or [record.get("sourceFileName") or "accounts.json"]),
                 flexible_int(record.get("sourceCount")),
                 dumps(targets),
             ),
@@ -256,6 +280,7 @@ def pixel_import_record_row(row: sqlite3.Row) -> dict[str, Any]:
         "recordId": row["record_id"],
         "createdAt": row["created_at"],
         "sourceFileName": row["source_file_name"],
+        "sourceFileNames": loads(row["source_file_names"], []) or [row["source_file_name"]],
         "sourceCount": row["source_count"],
         "targetCount": len(loads(row["targets"], [])),
         "targets": loads(row["targets"], []),
@@ -298,6 +323,47 @@ def update_pixel_import_record_delete(record_id: str, result: dict[str, Any]) ->
     if updated is None:
         raise HTTPException(status_code=404, detail="导入记录不存在")
     return updated
+
+
+def update_pixel_import_record_share(
+    record_id: str,
+    target_id: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    record = pixel_import_record(record_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="导入记录不存在")
+    targets = list(record.get("targets") or [])
+    updated = False
+    failed_ids = list(result.get("failedIds") or [])
+    for target in targets:
+        if str(target.get("targetId") or "") != str(target_id):
+            continue
+        target["shareFailed"] = len(failed_ids)
+        target["shared"] = max(
+            0,
+            flexible_int(target.get("created")) - target["shareFailed"],
+        )
+        share_failed = target["shareFailed"]
+        target["status"] = "success" if share_failed == 0 and not flexible_int(target.get("failed")) else "partial"
+        target["message"] = (
+            "导入完成，新增账号已开启公共共享"
+            if target["status"] == "success"
+            else f"导入完成，但有 {share_failed} 个未开启公共共享"
+        )
+        updated = True
+        break
+    if not updated:
+        raise HTTPException(status_code=404, detail="导入记录中的平台不存在")
+    with connect() as conn:
+        conn.execute(
+            "UPDATE pixel_import_records SET targets = ? WHERE record_id = ?",
+            (dumps(targets), str(record_id or "")),
+        )
+    updated_record = pixel_import_record(record_id)
+    if updated_record is None:
+        raise HTTPException(status_code=404, detail="导入记录不存在")
+    return updated_record
 
 
 def get_meta(key: str, default: str = "") -> str:
@@ -1012,6 +1078,26 @@ async def get_pixel_import_record(
     return {"record": record}
 
 
+@app.post(f"{API_PREFIX}/pixel-manager/import-records/{{record_id}}/share")
+async def retry_pixel_import_record_share(
+    record_id: str,
+    payload: dict[str, Any],
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    record = pixel_import_record(record_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="导入记录不存在")
+    target_id = str(payload.get("targetId") or "").strip()
+    if not target_id:
+        raise HTTPException(status_code=400, detail="平台账号不能为空")
+    try:
+        result = await manager.share_accounts(target_id, payload.get("accountIds") or [])
+        updated = update_pixel_import_record_share(record_id, target_id, result)
+        return {"record": updated, "result": result}
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+
+
 @app.post(f"{API_PREFIX}/pixel-manager/import-records/{{record_id}}/delete")
 async def delete_pixel_import_record(
     record_id: str,
@@ -1122,6 +1208,48 @@ async def create_pixel_import(
         return {"job": await jobs.create(bundle, target_ids)}
     except PixelManagerError as exc:
         raise pixel_http_error(exc) from exc
+
+
+@app.post(f"{API_PREFIX}/pixel-manager/import-batch", status_code=202)
+async def create_pixel_import_batch(
+    request: Request,
+    target_ids_json: str = Query(alias="targetIds"),
+    manager: PixelManager = Depends(require_pixel_manager),
+) -> dict[str, Any]:
+    try:
+        target_ids = json.loads(target_ids_json)
+        if not isinstance(target_ids, list):
+            raise ValueError
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="上传账号选择无效") from exc
+
+    uploads: list[UploadFile] = []
+    try:
+        form = await request.form()
+        uploads = [item for item in form.getlist("files") if isinstance(item, UploadFile)]
+        if not uploads:
+            raise PixelValidationError("至少选择一个 JSON 文件")
+        if len(uploads) > 100:
+            raise PixelValidationError("一次最多选择 100 个 JSON 文件")
+        total_bytes = 0
+        bundles = []
+        for upload in uploads:
+            content = await upload.read(MAX_UPLOAD_BYTES + 1)
+            total_bytes += len(content)
+            if total_bytes > MAX_UPLOAD_BYTES:
+                raise PixelManagerError("批量 JSON 文件合计不能超过 50 MB", 413)
+            bundles.append(parse_credential_bundle(upload.filename or "accounts.json", content))
+        bundle = merge_credential_bundles(bundles)
+        jobs = pixel_import_jobs
+        if jobs is None or jobs.manager is not manager:
+            jobs = PixelImportJobs(manager, record_callback=save_pixel_import_record)
+            globals()["pixel_import_jobs"] = jobs
+        return {"job": await jobs.create(bundle, target_ids)}
+    except PixelManagerError as exc:
+        raise pixel_http_error(exc) from exc
+    finally:
+        for upload in uploads:
+            await upload.close()
 
 
 @app.get(f"{API_PREFIX}/pixel-manager/import-jobs/{{job_id}}")

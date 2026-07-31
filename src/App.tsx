@@ -772,7 +772,6 @@ function DeathTimingAnalysis({
   capacityRisk: PoolAnalyticsResponse["risk"]["level"];
 }) {
   const timeline = new Map(analysis.timeline.map((item) => [`${item.date}-${item.hour}`, item]));
-  const maxRemovals = Math.max(...analysis.timeline.map((item) => item.inferredAccountRemovals), 1);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [hoveredKey, setHoveredKey] = useState<string | null>(null);
   const recent = analysis.recentErrorTrend;
@@ -820,12 +819,12 @@ function DeathTimingAnalysis({
             <div className="mt-0.5 text-xs font-semibold text-muted-foreground">基于 {analysis.snapshotCount} 条快照的新增错误与账号删除推断</div>
           </div>
           <div className="flex shrink-0 items-center gap-1.5 text-xs font-bold text-muted-foreground">
-            <span className="h-2.5 w-2.5 bg-orange-100" />
-            <span className="h-2.5 w-2.5 bg-orange-300" />
-            <span className="h-2.5 w-2.5 bg-orange-600" />
-            删除热度
-            <span className="ml-1 h-1.5 w-1.5 rounded-full bg-rose-600" />
-            新增错误
+            <span className="h-2.5 w-2.5 bg-rose-100" />
+            <span className="h-2.5 w-2.5 bg-red-500" />
+            <span className="h-2.5 w-2.5 bg-red-900" />
+            新增错误 1 / 50 / 200+
+            <span className="ml-1 h-2 w-2 rounded-full bg-red-950 ring-1 ring-white" />
+            有账号删除
           </div>
         </div>
 
@@ -843,7 +842,7 @@ function DeathTimingAnalysis({
             {Array.from({ length: 24 }, (_, hour) => (
               <div key={hour} className="pb-1 text-center text-[9px] font-bold text-muted-foreground">{String(hour).padStart(2, "0")}</div>
             ))}
-            <div className="self-end pb-1 text-right text-[10px] font-bold text-muted-foreground">删除</div>
+            <div className="self-end pb-1 text-right text-[10px] font-bold text-muted-foreground">错误</div>
             {analysis.daily.flatMap((day) => {
               const cells = Array.from({ length: 24 }, (_, hour) => timeline.get(`${day.date}-${hour}`));
               return [
@@ -856,15 +855,14 @@ function DeathTimingAnalysis({
                     date={day.date}
                     hour={hour}
                     cell={cell}
-                    maxRemovals={maxRemovals}
                     current={day.date === currentDate && hour === timing.evaluatedHour}
                     selected={activeSelectedKey === heatCellKey(day.date, hour)}
                     onSelect={() => setSelectedKey(heatCellKey(day.date, hour))}
                     onHover={(active) => setHoveredKey(active ? heatCellKey(day.date, hour) : null)}
                   />
                 )),
-                <div key={`${day.date}-total`} className="flex h-7 items-center justify-end text-[10px] font-black text-orange-700">
-                  {formatMoney(day.inferredAccountRemovals, 0)}
+                <div key={`${day.date}-total`} className="flex h-7 items-center justify-end text-[10px] font-black text-rose-700">
+                  {formatMoney(day.newErrors, 0)}
                 </div>,
               ];
             })}
@@ -946,11 +944,36 @@ function deathCellAriaLabel(date: string, hour: number, cell: DeathTimelineHour 
   return `${prefix}，账号删除 ${formatMoney(cell.inferredAccountRemovals, 0)}，新增错误 ${formatMoney(cell.newErrors, 0)}，时末错误 ${formatMoney(cell.endingErrors, 0)}，采样 ${cell.sampleCount} 条，覆盖 ${formatMoney(cell.coverage * 100, 0)}%${current ? "，当前小时进行中" : ""}，点击固定详情`;
 }
 
+function deathErrorHeatStyle(newErrors: number): React.CSSProperties {
+  if (newErrors <= 0) {
+    return { backgroundColor: "#ecfdf5", color: "#047857" };
+  }
+  const capped = Math.max(0, Math.min(newErrors, 500));
+  const normalized = Math.log1p(capped) / Math.log1p(500);
+  const hue = 18 - normalized * 18;
+  const saturation = 92;
+  const lightness = 97 - normalized * 58;
+  const textColor = lightness < 62 ? "#ffffff" : "#7f1d1d";
+  return {
+    backgroundColor: `hsl(${hue} ${saturation}% ${lightness}%)`,
+    color: textColor,
+    boxShadow:
+      newErrors >= 300
+        ? "inset 0 0 0 2px rgba(69, 10, 10, 0.95)"
+        : newErrors >= 200
+          ? "inset 0 0 0 2px rgba(127, 29, 29, 0.9)"
+          : newErrors >= 100
+            ? "inset 0 0 0 1px rgba(153, 27, 27, 0.55)"
+            : newErrors >= 50
+              ? "inset 0 0 0 1px rgba(185, 28, 28, 0.35)"
+              : "inset 0 0 0 1px rgba(251, 146, 60, 0.18)",
+  };
+}
+
 function DeathHeatCell({
   date,
   hour,
   cell,
-  maxRemovals,
   current,
   selected,
   onSelect,
@@ -959,7 +982,6 @@ function DeathHeatCell({
   date: string;
   hour: number;
   cell?: DeathTimelineHour;
-  maxRemovals: number;
   current: boolean;
   selected: boolean;
   onSelect: () => void;
@@ -967,13 +989,7 @@ function DeathHeatCell({
 }) {
   const className = !cell?.observed
     ? "bg-slate-100 text-slate-400"
-    : cell.inferredAccountRemovals <= 0
-      ? "bg-emerald-50 text-emerald-700"
-      : cell.inferredAccountRemovals / maxRemovals >= 0.75
-        ? "bg-orange-600 text-white"
-        : cell.inferredAccountRemovals / maxRemovals >= 0.45
-          ? "bg-orange-300 text-orange-950"
-          : "bg-orange-100 text-orange-800";
+    : "border border-white/70";
   return (
     <TooltipPrimitive.Root>
       <TooltipPrimitive.Trigger asChild>
@@ -987,14 +1003,15 @@ function DeathHeatCell({
           onFocus={() => onHover(true)}
           onBlur={() => onHover(false)}
           className={cn(
-            "relative flex h-7 min-w-0 items-center justify-center text-[10px] font-black outline-none transition-[box-shadow,transform] hover:z-10 hover:scale-110 focus-visible:z-10 focus-visible:ring-2 focus-visible:ring-blue-600 focus-visible:ring-offset-1",
+            "relative flex h-7 min-w-0 items-center justify-center text-[10px] font-black outline-none transition-[box-shadow,transform,filter] hover:z-10 hover:scale-110 hover:brightness-95 focus-visible:z-10 focus-visible:ring-2 focus-visible:ring-blue-600 focus-visible:ring-offset-1",
             className,
             current && "ring-2 ring-blue-600 ring-offset-1",
             selected && "z-10 ring-2 ring-slate-950 ring-offset-1",
           )}
+          style={cell?.observed ? deathErrorHeatStyle(cell.newErrors) : undefined}
         >
-          {!cell?.observed ? "--" : cell.inferredAccountRemovals || ""}
-          {cell?.observed && cell.newErrors > 0 && <span aria-label={`新增错误 ${formatMoney(cell.newErrors, 0)}`} className="absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-rose-600 ring-1 ring-white" />}
+          {!cell?.observed ? "--" : cell.newErrors || ""}
+          {cell?.observed && cell.inferredAccountRemovals > 0 && <span aria-label={`账号删除 ${formatMoney(cell.inferredAccountRemovals, 0)}`} className="absolute right-0.5 top-0.5 h-2 w-2 rounded-full bg-red-950 ring-2 ring-white" />}
         </button>
       </TooltipPrimitive.Trigger>
       <TooltipPrimitive.Portal>
@@ -1032,7 +1049,7 @@ function DeathHeatDetail({
 }) {
   if (!target) {
     return (
-      <div className="mt-3 rounded-md border border-dashed border-border bg-muted/35 px-3 py-2 text-xs font-semibold text-muted-foreground">
+      <div className="mt-3 h-[206px] overflow-y-auto overscroll-contain rounded-md border border-dashed border-border bg-muted/35 px-3 py-2 text-xs font-semibold text-muted-foreground [scrollbar-gutter:stable]">
         悬停或点击任意时段格查看新增错误、删除推断、采样和覆盖详情。
       </div>
     );
@@ -1040,7 +1057,7 @@ function DeathHeatDetail({
   const { cell, date, hour, current } = target;
   const label = cell?.label ?? deathHourLabel(hour);
   return (
-    <div className={cn("mt-3 rounded-md border px-3 py-2.5", cell?.observed ? "border-slate-200 bg-slate-50" : "border-slate-200 bg-slate-50/60")}>
+    <div className={cn("mt-3 h-[206px] overflow-y-auto overscroll-contain rounded-md border px-3 py-2.5 [scrollbar-gutter:stable]", cell?.observed ? "border-slate-200 bg-slate-50" : "border-slate-200 bg-slate-50/60")}>
       <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
         <div className="text-xs font-black text-foreground">{source}：{date} {label}</div>
         {current && <span className="rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[10px] font-black text-blue-700">当前小时进行中</span>}
@@ -1413,7 +1430,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   const [accountSearchInput, setAccountSearchInput] = useState("");
   const [accountSearch, setAccountSearch] = useState("");
   const [accountStatus, setAccountStatus] = useState("");
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [importOpen, setImportOpen] = useState(false);
   const [selectedTargetIds, setSelectedTargetIds] = useState<Set<string>>(new Set());
   const [importing, setImporting] = useState(false);
@@ -1692,7 +1709,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   }, [exportJob?.jobId]);
 
   const openImport = () => {
-    if (!selectedFile || !targets.length) return;
+    if (!selectedFiles.length || !targets.length) return;
     setSelectedTargetIds(new Set(targets.map((target) => target.id)));
     setImportOpen(true);
   };
@@ -1803,15 +1820,15 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   };
 
   const runImport = async () => {
-    if (!selectedFile || !selectedTargetIds.size) return;
+    if (!selectedFiles.length || !selectedTargetIds.size) return;
     setImporting(true);
     try {
-      const response = await api.pixelImport(selectedFile, [...selectedTargetIds]);
+      const response = await api.pixelImportBatch(selectedFiles, [...selectedTargetIds]);
       setImportJob(response.job);
       window.localStorage.setItem("pixelImportJobId", response.job.jobId);
       setResults(response.job.results);
       setImportOpen(false);
-      setSelectedFile(null);
+      setSelectedFiles([]);
       if (fileInputRef.current) fileInputRef.current.value = "";
       onToast(`导入任务已开始，将依次处理 ${response.job.totalTargets} 个平台账号`);
     } catch (error) {
@@ -1824,7 +1841,13 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
     if (!result.failedShareIds.length) return;
     setRetryingTargetId(result.targetId);
     try {
-      const response = await api.pixelShare(result.targetId, result.failedShareIds);
+      const response = importJob?.jobId
+        ? (await api.pixelRetryImportShare(importJob.jobId, result.targetId, result.failedShareIds)).result
+        : await api.pixelShare(result.targetId, result.failedShareIds);
+      if (importJob?.jobId) {
+        const recordResponse = await api.pixelImportRecords();
+        setImportRecords(recordResponse.records);
+      }
       setResults((current) =>
         current.map((item) => {
           if (item.targetId !== result.targetId) return item;
@@ -1953,8 +1976,12 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
             </div>
             <div className="min-w-0">
               <div className="text-sm font-black text-foreground">导入账号 JSON</div>
-              <div className={cn("truncate text-xs font-semibold", selectedFile ? "text-emerald-700" : "text-muted-foreground")}>
-                {selectedFile ? `${selectedFile.name} · ${formatFileSize(selectedFile.size)}` : "尚未选择文件"}
+              <div className={cn("truncate text-xs font-semibold", selectedFiles.length ? "text-emerald-700" : "text-muted-foreground")}>
+                {selectedFiles.length === 1
+                  ? `${selectedFiles[0].name} · ${formatFileSize(selectedFiles[0].size)}`
+                  : selectedFiles.length
+                    ? `${selectedFiles.length} 个 JSON · ${formatFileSize(selectedFiles.reduce((total, file) => total + file.size, 0))}`
+                    : "尚未选择文件"}
               </div>
             </div>
           </div>
@@ -1963,14 +1990,18 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               ref={fileInputRef}
               type="file"
               accept="application/json,.json"
+              multiple
               className="hidden"
-              onChange={(event) => setSelectedFile(event.target.files?.[0] ?? null)}
+              onChange={(event) => {
+                const files = Array.from(event.target.files ?? []).filter((file) => file.name.toLowerCase().endsWith(".json"));
+                setSelectedFiles(files);
+              }}
             />
             <Button variant="outline" disabled={importing} onClick={() => fileInputRef.current?.click()}>
               <FileJson className="h-4 w-4" />
               选择 JSON
             </Button>
-            <Button disabled={importing || !selectedFile || !targets.length} onClick={openImport}>
+            <Button disabled={importing || !selectedFiles.length || !targets.length} onClick={openImport}>
               <Upload className="h-4 w-4" />
               上传到平台
             </Button>
@@ -2204,7 +2235,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
       )}
       {results.length > 0 && importJob?.status === "completed" && (
         <Dialog open onOpenChange={(open) => !open && setResults([])}>
-          <DialogContent className="max-h-[min(720px,calc(100vh-48px))] max-w-5xl overflow-auto">
+          <DialogContent className="max-h-[min(720px,calc(100vh-48px))] w-[min(calc(100vw-48px),1420px)] overflow-auto">
             <DialogHeader>
               <DialogTitle>最近一次导入结果</DialogTitle>
               <DialogDescription>已完成 {results.length} 个平台账号的导入与公共共享处理。</DialogDescription>
@@ -2215,7 +2246,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
       )}
       {exportJob?.status === "completed" && (
         <Dialog open onOpenChange={(open) => !open && setExportJob(null)}>
-          <DialogContent className="max-h-[min(760px,calc(100vh-48px))] max-w-5xl overflow-auto">
+          <DialogContent className="max-h-[min(760px,calc(100vh-48px))] w-[min(calc(100vw-48px),1420px)] overflow-auto">
             <DialogHeader>
               <DialogTitle>汇总整理完成</DialogTitle>
               <DialogDescription>
@@ -2336,7 +2367,9 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
         <DialogContent className="max-w-xl">
           <DialogHeader>
             <DialogTitle>选择上传账号</DialogTitle>
-            <DialogDescription>{selectedFile?.name || "JSON 文件"} · 已选 {selectedTargetIds.size} / {targets.length} 个平台账号</DialogDescription>
+            <DialogDescription>
+              {selectedFiles.length === 1 ? selectedFiles[0].name : `已选择 ${selectedFiles.length} 个 JSON 文件`} · 已选 {selectedTargetIds.size} / {targets.length} 个平台账号
+            </DialogDescription>
           </DialogHeader>
           <div className="grid max-h-[360px] grid-cols-2 gap-2 overflow-auto">
             {targets.map((target, index) => (
@@ -2723,7 +2756,7 @@ function PixelImportRecordsDialog({
                       </button>
                     </td>
                     <td className="px-3 py-3 font-bold whitespace-nowrap">{formatDateTime(record.createdAt)}</td>
-                    <td className="max-w-[260px] px-3 py-3 font-black"><div className="truncate" title={record.sourceFileName}>{record.sourceFileName}</div></td>
+                    <td className="max-w-[260px] px-3 py-3 font-black"><div className="truncate" title={record.sourceFileNames.join("\n")}>{record.sourceFileName}</div></td>
                     <td className="px-3 py-3 font-black">{record.targetCount}</td>
                     <td className="px-3 py-3 font-black">{record.targets.reduce((total, target) => total + target.generatedNames.length, 0)}</td>
                     <td className="px-3 py-3">
@@ -2746,12 +2779,18 @@ function PixelImportRecordsDialog({
                     {expanded && (
                       <tr className="border-t border-border bg-muted/30">
                         <td colSpan={7} className="px-4 py-3">
+                          <div className="mb-3 rounded-md bg-muted px-3 py-2 text-[11px] font-bold text-muted-foreground">
+                            源文件：{record.sourceFileNames.join("、")}
+                          </div>
                           <div className="grid gap-3 md:grid-cols-2">
                             {record.targets.map((target) => (
                               <div key={target.targetId} className="rounded-md border border-border bg-background p-3">
                                 <div className="flex items-center justify-between gap-3 text-xs font-black">
                                   <span className="truncate">{target.email}</span>
                                   <span className="shrink-0 text-muted-foreground">{target.generatedNames.length} 个随机邮箱</span>
+                                </div>
+                                <div className="mt-2 truncate font-mono text-[11px] font-bold text-blue-600" title={target.generatedFileName}>
+                                  生成文件：{target.generatedFileName || "-"}
                                 </div>
                                 <div className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-[11px] text-muted-foreground">
                                   {target.generatedNames.length ? target.generatedNames.join("\n") : "没有实际新增账号"}

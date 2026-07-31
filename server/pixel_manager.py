@@ -28,6 +28,7 @@ ACCOUNT_PAGE_SIZE = 100
 MAX_ACCOUNT_PAGES = 200
 MAX_RETAINED_IMPORT_JOBS = 50
 MAX_RETAINED_EXPORT_JOBS = 20
+PUBLIC_SHARE_CONCURRENCY = 10
 TOKEN_EXPIRY_SKEW_SECONDS = 60
 DEFAULT_PLATFORM_TIMEOUT_SECONDS = 30.0
 LONG_OPERATION_TIMEOUT_SECONDS = 120.0
@@ -105,6 +106,7 @@ class CredentialBundle:
     source_file_name: str
     source_count: int
     source_payload: dict[str, Any] = field(repr=False)
+    source_file_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -333,6 +335,34 @@ def parse_credential_bundle(file_name: str, payload: bytes) -> CredentialBundle:
         source_file_name=safe_name,
         source_count=len(values),
         source_payload=source_payload,
+        source_file_names=(safe_name,),
+    )
+
+
+def merge_credential_bundles(bundles: Iterable[CredentialBundle]) -> CredentialBundle:
+    values = list(bundles)
+    if not values:
+        raise PixelValidationError("至少选择一个 JSON 文件")
+    if len(values) == 1:
+        return values[0]
+
+    source_file_names = tuple(
+        name
+        for bundle in values
+        for name in (bundle.source_file_names or (bundle.source_file_name,))
+    )
+    accounts: list[dict[str, Any]] = []
+    proxies: list[dict[str, Any]] = []
+    for bundle in values:
+        accounts.extend(copy.deepcopy(bundle.source_payload.get("accounts") or []))
+        proxies.extend(copy.deepcopy(bundle.source_payload.get("proxies") or []))
+    if len(accounts) > MAX_SOURCE_ACCOUNTS:
+        raise PixelValidationError(f"JSON 合计不能超过 {MAX_SOURCE_ACCOUNTS} 个账号")
+    return CredentialBundle(
+        source_file_name=f"批量导入（{len(source_file_names)}个JSON文件）",
+        source_count=len(accounts),
+        source_payload={"exported_at": _utc_now(), "proxies": proxies, "accounts": accounts},
+        source_file_names=source_file_names,
     )
 
 
@@ -407,6 +437,108 @@ def _remove_chatgpt_field_source(value: Any) -> None:
             _remove_chatgpt_field_source(item)
 
 
+# PixelAPI applies the same credential-safety scan to every nested field in an
+# imported account. These fields are metadata for other exporters, not OAuth
+# material required by PixelAPI, so remove them before sending the account.
+PIXEL_IMPORT_BLOCKED_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "x_api_key",
+        "xapikey",
+        "authorization",
+        "authorization_header",
+        "authorizationheader",
+        "base_url",
+        "baseurl",
+        "api_base_url",
+        "api_baseurl",
+        "custom_base_url",
+        "custom_baseurl",
+        "custom_base_url_enabled",
+        "custom_baseurl_enabled",
+        "upstream",
+        "upstream_url",
+        "upstreamurl",
+        "upstream_base_url",
+        "upstream_baseurl",
+        "upstream_endpoint",
+        "upstreamendpoint",
+        "endpoint",
+        "endpoint_url",
+        "endpointurl",
+        "url",
+        "host",
+        "proxy_url",
+        "proxyurl",
+        "cookie",
+        "cookies",
+        "set_cookie",
+        "setcookie",
+        "auth_mode",
+        "authmode",
+        "aws_access_key_id",
+        "awsaccesskeyid",
+        "aws_secret_access_key",
+        "awssecretaccesskey",
+        "aws_session_token",
+        "awssessiontoken",
+        "access_key_id",
+        "accesskeyid",
+        "secret_access_key",
+        "secretaccesskey",
+    }
+)
+
+
+def _normalized_import_key(value: Any) -> str:
+    return re.sub(r"[-.]", "_", str(value or "").strip().lower())
+
+
+def _is_agent_identity_account(account: dict[str, Any]) -> bool:
+    credentials = account.get("credentials")
+    if not isinstance(credentials, dict):
+        return False
+    auth_mode = str(
+        credentials.get("auth_mode") or credentials.get("authMode") or ""
+    ).strip().lower()
+    return auth_mode == "agentidentity" or isinstance(
+        credentials.get("agent_identity") or credentials.get("agentIdentity"), dict
+    )
+
+
+def _remove_pixel_import_blocked_fields(
+    value: Any,
+    *,
+    preserve_agent_auth_mode: bool = False,
+    preserve_auth_mode_here: bool = False,
+) -> None:
+    if isinstance(value, dict):
+        for key in list(value):
+            normalized_key = _normalized_import_key(key)
+            if normalized_key in PIXEL_IMPORT_BLOCKED_KEYS and not (
+                preserve_agent_auth_mode
+                and preserve_auth_mode_here
+                and normalized_key == "auth_mode"
+            ):
+                value.pop(key, None)
+                continue
+            _remove_pixel_import_blocked_fields(
+                value[key],
+                preserve_agent_auth_mode=preserve_agent_auth_mode,
+                preserve_auth_mode_here=(
+                    preserve_agent_auth_mode and normalized_key == "credentials"
+                ),
+            )
+    elif isinstance(value, list):
+        for item in value:
+            _remove_pixel_import_blocked_fields(
+                item,
+                preserve_agent_auth_mode=preserve_agent_auth_mode,
+                preserve_auth_mode_here=False,
+            )
+
+
 def _ensure_openai_oauth_plan_type(payload: dict[str, Any]) -> None:
     accounts = payload.get("accounts")
     if not isinstance(accounts, list):
@@ -436,6 +568,10 @@ def build_target_credential_bundle(
     generated_names: list[str] = []
     accounts = payload["accounts"]
     for account in accounts:
+        _remove_pixel_import_blocked_fields(
+            account,
+            preserve_agent_auth_mode=_is_agent_identity_account(account),
+        )
         replacement = _random_email(_account_email_domain(account), used_emails)
         account["name"] = replacement
         _replace_email_fields(account, replacement)
@@ -644,6 +780,34 @@ def _bulk_operation_result(payload: dict[str, Any], account_ids: list[int]) -> d
         "failedIds": [item["accountId"] for item in results if not item["success"]],
         "results": results,
     }
+
+
+def _bulk_response_has_account_outcomes(payload: dict[str, Any]) -> bool:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
+        return False
+    return bool(
+        data.get("success_ids")
+        or data.get("successIds")
+        or data.get("failed_ids")
+        or data.get("failedIds")
+        or data.get("results")
+    )
+
+
+def _import_error_details(data: dict[str, Any]) -> list[dict[str, str]]:
+    errors: list[dict[str, str]] = []
+    for item in data.get("errors") or []:
+        if not isinstance(item, dict):
+            continue
+        detail = {
+            "index": _safe_text(_first(item, "index", "account_index"), 32),
+            "name": _safe_text(item.get("name"), 160),
+            "message": _safe_text(_first(item, "message", "error"), 300),
+        }
+        if detail["message"]:
+            errors.append(detail)
+    return errors
 
 
 class PixelManager:
@@ -1352,6 +1516,37 @@ class PixelManager:
                 return result
         raise PixelManagerError("平台账号数量超过安全扫描上限")
 
+    async def _public_account_ids(
+        self,
+        target: PixelTarget,
+        ids: list[int],
+        concurrency: int,
+    ) -> set[int]:
+        requested = set(ids)
+        for attempt in range(3):
+            public_ids: set[int] = set()
+            for page in range(1, MAX_ACCOUNT_PAGES + 1):
+                data = await self._account_page(target, page, ACCOUNT_PAGE_SIZE)
+                for item in data["items"]:
+                    if not isinstance(item, dict):
+                        continue
+                    account_id = _positive_int(item.get("id"), -1)
+                    share_mode = str(_first(item, "share_mode", "shareMode") or "").strip().lower()
+                    account_concurrency = _positive_int(item.get("concurrency"), -1)
+                    if (
+                        account_id in requested
+                        and share_mode == "public"
+                        and account_concurrency == concurrency
+                    ):
+                        public_ids.add(account_id)
+                pages = _positive_int(data.get("pages"), page)
+                if not data["items"] or page >= pages:
+                    break
+            if public_ids == requested or attempt == 2:
+                return public_ids
+            await asyncio.sleep(0.3)
+        return set()
+
     async def _share_chunk(self, target: PixelTarget, ids: list[int]) -> dict[str, Any]:
         idempotency_key = str(uuid.uuid4())
         payload = await self._request(
@@ -1391,8 +1586,60 @@ class PixelManager:
         return {"successIds": success_ids, "failedIds": failed_ids}
 
     async def _share_accounts_unlocked(
-        self, target: PixelTarget, ids: list[int]
+        self,
+        target: PixelTarget,
+        ids: list[int],
+        *,
+        concurrency: int | None = None,
     ) -> dict[str, Any]:
+        # PixelAPI exposes public sharing through bulk-update; keep the
+        # account concurrency explicit for both import and retry paths.
+        concurrency = PUBLIC_SHARE_CONCURRENCY if concurrency is None else concurrency
+        if concurrency is not None:
+            if isinstance(concurrency, bool) or not isinstance(concurrency, int) or not 1 <= concurrency <= 50:
+                raise PixelValidationError("公共共享并发数必须是 1-50 的整数")
+            success_ids: list[int] = []
+            failed_ids: list[int] = []
+            for start in range(0, len(ids), MAX_BULK_ACCOUNTS):
+                chunk = ids[start : start + MAX_BULK_ACCOUNTS]
+                verify_after_request = False
+                try:
+                    payload = await self._request(
+                        target,
+                        "POST",
+                        "/api/v1/accounts/bulk-update",
+                        json_body={
+                            "account_ids": chunk,
+                            "share_mode": "public",
+                            "concurrency": concurrency,
+                        },
+                        timeout=LONG_OPERATION_TIMEOUT_SECONDS,
+                        retry_transient=True,
+                    )
+                    result = _bulk_operation_result(payload, chunk)
+                    success_ids.extend(result["successIds"])
+                    failed_ids.extend(result["failedIds"])
+                    verify_after_request = not _bulk_response_has_account_outcomes(payload)
+                except PixelManagerError:
+                    failed_ids.extend(chunk)
+                    verify_after_request = True
+                if verify_after_request:
+                    try:
+                        verified_ids = await self._public_account_ids(target, chunk, concurrency)
+                    except PixelManagerError:
+                        verified_ids = set()
+                    success_ids.extend(account_id for account_id in chunk if account_id in verified_ids)
+                    failed_ids = [account_id for account_id in failed_ids if account_id not in verified_ids]
+            success_ids = list(dict.fromkeys(account_id for account_id in ids if account_id in set(success_ids)))
+            failed_ids = [account_id for account_id in ids if account_id not in set(success_ids)]
+            return {
+                "ok": not failed_ids,
+                "success": len(success_ids),
+                "failed": len(failed_ids),
+                "successIds": success_ids,
+                "failedIds": failed_ids,
+            }
+
         success_ids: list[int] = []
         failed_ids: list[int] = []
         for start in range(0, len(ids), SHARE_CHUNK_SIZE):
@@ -1411,7 +1658,11 @@ class PixelManager:
         target = self._target(target_id)
         ids = _account_ids(account_ids, MAX_SHARE_ACCOUNTS)
         async with self._operation_locks[target.id]:
-            return await self._share_accounts_unlocked(target, ids)
+            return await self._share_accounts_unlocked(
+                target,
+                ids,
+                concurrency=PUBLIC_SHARE_CONCURRENCY,
+            )
 
     async def _import_target(
         self, target: PixelTarget, bundle: TargetCredentialBundle
@@ -1427,6 +1678,7 @@ class PixelManager:
             "shared": 0,
             "shareFailed": 0,
             "failedShareIds": [],
+            "importErrors": [],
             "generatedNames": [],
         }
         async with self._operation_locks[target.id]:
@@ -1456,10 +1708,15 @@ class PixelManager:
                         },
                         timeout=LONG_OPERATION_TIMEOUT_SECONDS,
                     )
-                    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                    if not isinstance(data, dict):
+                        raise PixelManagerError("平台导入返回了无效数据")
                     created += _positive_int(data.get("created"))
                     updated += _positive_int(data.get("updated"))
                     failed += _positive_int(data.get("failed"))
+                    import_errors = _import_error_details(data)
+                    base_result["importErrors"].extend(import_errors)
+                    failed = max(failed, len(base_result["importErrors"]))
                 except PixelManagerError as exc:
                     failed += sum(bundle.chunk_sizes[index:])
                     request_error = exc.public_message
@@ -1483,7 +1740,11 @@ class PixelManager:
             share_result = {"success": 0, "failed": 0, "failedIds": []}
             if imported_ids:
                 try:
-                    share_result = await self._share_accounts_unlocked(target, imported_ids)
+                    share_result = await self._share_accounts_unlocked(
+                        target,
+                        imported_ids,
+                        concurrency=PUBLIC_SHARE_CONCURRENCY,
+                    )
                 except PixelManagerError as exc:
                     share_result = {
                         "success": 0,
@@ -1494,6 +1755,11 @@ class PixelManager:
 
             unresolved_created = max(created - len(imported_ids), 0)
             share_failed = _positive_int(share_result.get("failed")) + unresolved_created
+            import_error_summary = "; ".join(
+                item["message"]
+                for item in base_result["importErrors"][:3]
+                if item.get("message")
+            )
             base_result.update(
                 {
                     "created": created,
@@ -1516,6 +1782,8 @@ class PixelManager:
             else:
                 status = "success"
                 message = "导入完成，新增账号已开启公共共享"
+            if import_error_summary:
+                message += f"；平台明细：{import_error_summary}"
             return {**base_result, "status": status, "message": message}
 
     async def import_bundle(
@@ -1652,6 +1920,7 @@ class PixelImportJobs:
                 "createdAt": now,
                 "updatedAt": now,
                 "sourceFileName": bundle.source_file_name,
+                "sourceFileNames": list(bundle.source_file_names or (bundle.source_file_name,)),
                 "sourceCount": bundle.source_count,
                 "currentTargetId": None,
                 "completedTargets": 0,
@@ -1687,6 +1956,7 @@ class PixelImportJobs:
                             "recordId": job_id,
                             "createdAt": job["createdAt"],
                             "sourceFileName": bundle.source_file_name,
+                            "sourceFileNames": list(bundle.source_file_names or (bundle.source_file_name,)),
                             "sourceCount": bundle.source_count,
                             "targets": result["results"],
                         }

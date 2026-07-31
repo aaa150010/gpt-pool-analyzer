@@ -207,8 +207,25 @@ export const api = {
       body: file,
     });
   },
+  pixelImportBatch: (files: File[], targetIds: string[]) => {
+    const params = new URLSearchParams({ targetIds: JSON.stringify(targetIds) });
+    const form = new FormData();
+    files.forEach((file) => form.append("files", file, file.name));
+    return requestPixelJson<{ job: PixelImportJob }>(`/pixel-manager/import-batch?${params.toString()}`, {
+      method: "POST",
+      body: form,
+    });
+  },
   pixelImportJob: (jobId: string) => requestPixelJson<{ job: PixelImportJob }>(`/pixel-manager/import-jobs/${encodeURIComponent(jobId)}`),
   pixelImportRecords: () => requestPixelJson<{ records: PixelImportRecord[] }>("/pixel-manager/import-records"),
+  pixelRetryImportShare: (recordId: string, targetId: string, accountIds: number[]) =>
+    requestPixelJson<{ record: PixelImportRecord; result: PixelShareResponse }>(
+      `/pixel-manager/import-records/${encodeURIComponent(recordId)}/share`,
+      {
+        method: "POST",
+        body: JSON.stringify({ targetId, accountIds }),
+      },
+    ),
   pixelDeleteImportRecord: (recordId: string) =>
     requestPixelJson<{ record: PixelImportRecord; result: unknown }>(
       `/pixel-manager/import-records/${encodeURIComponent(recordId)}/delete`,
