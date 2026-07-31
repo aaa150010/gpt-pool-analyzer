@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "GPT分析器",
-  "version": "2.2.3",
+  "version": "2.2.4",
   "identifier": "local.gpt.cost.calculator",
   "build": {
     "beforeDevCommand": "npm run dev",
