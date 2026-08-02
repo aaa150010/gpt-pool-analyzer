@@ -129,6 +129,8 @@ class WithdrawalPlanningTests(unittest.TestCase):
         self.assertIn("提现后总成本：0.00 元", body)
         self.assertIn("提现后总余额：3.33 元", body)
         self.assertIn("提现后折后利润：3.33 元", body)
+        self.assertGreater(body.index("实际提现到星星账号"), body.index("提现后折后利润"))
+        self.assertTrue(body.endswith("星星需要转给社会哥：0.00 元"))
 
     def test_loss_email_does_not_apply_profit_formula(self) -> None:
         plan = plan_withdrawal("full", 324.5, balances([20, 30, 0, 0, 0, 0, 0]))

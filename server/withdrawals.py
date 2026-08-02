@@ -268,20 +268,20 @@ def render_withdrawal_email(job: dict[str, Any], status: str = "已完成") -> t
             f"{float(item.get('amount') or 0):.0f} 元  "
             f"{item.get('statusLabel') or item.get('status') or '-'}{reason}"
         )
-    lines += [
+    settlement_lines = [
         "",
         f"实际提现到星星账号：{float(settlement.get('ownerActual') or 0):.2f} 元",
         f"实际提现到社会哥账号：{float(settlement.get('partnerActual') or 0):.2f} 元",
     ]
     if job.get("mode") == "cost":
-        lines += [
+        settlement_lines += [
             f"社会哥需要转给星星：{float(settlement.get('partnerToOwner') or 0):.2f} 元",
             f"星星本次成本回收：{float(settlement.get('costRecovery') or 0):.2f} 元",
             f"尚未收回成本：{float(settlement.get('unrecoveredCost') or 0):.2f} 元",
             f"舍入余量：{float(settlement.get('roundingRemainder') or 0):.2f} 元",
         ]
     else:
-        lines += [
+        settlement_lines += [
             f"星星应得：{float(settlement.get('ownerExpected') or 0):.2f} 元",
             f"社会哥应得：{float(settlement.get('partnerExpected') or 0):.2f} 元",
             *(["当前为亏损，社会哥应收为 0 元，亏损由星星承担。"] if float(settlement.get("profit") or 0) <= 0 else []),
@@ -309,5 +309,6 @@ def render_withdrawal_email(job: dict[str, Any], status: str = "已完成") -> t
         ),
         "折后利润计算：提现后总余额 - 提现后总成本",
     ]
+    lines += settlement_lines
     subject = f"[91] {mode_label}任务 #{job.get('jobId', '-')} {status}"
     return subject, "\n".join(lines)
