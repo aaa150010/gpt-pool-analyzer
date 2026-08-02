@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from server.cost_ledger import CostLedger
+from server.withdrawal_email import render_withdrawal_email_html
 from server.withdrawal_service import (
     WithdrawalService,
     build_notification_message,
@@ -34,6 +35,7 @@ class WithdrawalPlanningTests(unittest.TestCase):
         message = build_notification_message(
             subject="[91] test",
             body="test body",
+            html_body="<html><body><strong>test body</strong></body></html>",
             username="sender@example.com",
             sender_name="Sender",
             recipient="recipient@example.com",
@@ -42,6 +44,8 @@ class WithdrawalPlanningTests(unittest.TestCase):
         self.assertEqual(message["Auto-Submitted"], "auto-generated")
         self.assertEqual(message["Precedence"], "bulk")
         self.assertEqual(message["X-Auto-Response-Suppress"], "All")
+        self.assertEqual(message.get_body(preferencelist=("plain",)).get_content_type(), "text/plain")
+        self.assertEqual(message.get_body(preferencelist=("html",)).get_content_type(), "text/html")
 
     def test_cost_allocation_prefers_five_multiples_then_fills_remainder(self) -> None:
         plan = plan_withdrawal("cost", 324.5, balances([20, 80, 65, 60, 100, 0, 0]), 320)
@@ -131,6 +135,12 @@ class WithdrawalPlanningTests(unittest.TestCase):
         self.assertIn("提现后折后利润：3.33 元", body)
         self.assertGreater(body.index("实际提现到星星账号"), body.index("提现后折后利润"))
         self.assertTrue(body.endswith("星星需要转给社会哥：0.00 元"))
+        html_body = render_withdrawal_email_html(plan)
+        self.assertIn("<table", html_body)
+        self.assertIn("成本历史明细", html_body)
+        self.assertIn("账号提现明细", html_body)
+        self.assertGreater(html_body.index("实际到账归属"), html_body.index("提现后汇总"))
+        self.assertGreater(html_body.index("结算转账"), html_body.index("实际到账归属"))
 
     def test_loss_email_does_not_apply_profit_formula(self) -> None:
         plan = plan_withdrawal("full", 324.5, balances([20, 30, 0, 0, 0, 0, 0]))

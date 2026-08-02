@@ -11,6 +11,7 @@ from email.utils import formataddr
 from typing import Any, Callable
 
 try:
+    from .withdrawal_email import render_withdrawal_email_html
     from .withdrawals import (
         NOTIFICATION_RECIPIENTS,
         plan_withdrawal,
@@ -18,6 +19,7 @@ try:
         settlement_for,
     )
 except ImportError:
+    from withdrawal_email import render_withdrawal_email_html
     from withdrawals import (
         NOTIFICATION_RECIPIENTS,
         plan_withdrawal,
@@ -31,7 +33,8 @@ RUNNING_RECHECK_SECONDS = 5.0
 
 
 def build_notification_message(
-    *, subject: str, body: str, username: str, sender_name: str, recipient: str
+    *, subject: str, body: str, html_body: str | None = None,
+    username: str, sender_name: str, recipient: str
 ) -> EmailMessage:
     message = EmailMessage()
     message["Subject"] = subject
@@ -41,6 +44,8 @@ def build_notification_message(
     message["Precedence"] = "bulk"
     message["X-Auto-Response-Suppress"] = "All"
     message.set_content(body)
+    if html_body:
+        message.add_alternative(html_body, subtype="html")
     return message
 
 
@@ -692,6 +697,7 @@ class WithdrawalService:
         if not job:
             return
         subject, body = render_withdrawal_email(job, status)
+        html_body = render_withdrawal_email_html(job, status)
         settings = self._normalize_smtp_settings(self._get_setting("smtp_settings", {}))
         now = self._utc_now()
         if not settings["host"] or not settings["username"] or not settings["password"]:
@@ -704,6 +710,7 @@ class WithdrawalService:
                     message = build_notification_message(
                         subject=subject,
                         body=body,
+                        html_body=html_body,
                         username=settings["username"],
                         sender_name=settings.get("senderName", ""),
                         recipient=recipient,
