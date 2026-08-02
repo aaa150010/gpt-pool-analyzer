@@ -3,7 +3,6 @@ import * as TooltipPrimitive from "@radix-ui/react-tooltip";
 import {
   Activity,
   AlertTriangle,
-  Bell,
   Calculator,
   CheckCircle2,
   ChevronLeft,
@@ -12,10 +11,10 @@ import {
   Database,
   Download,
   FileJson,
+  FastForward,
   FolderTree,
   History,
   Loader2,
-  Mail,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -68,8 +67,10 @@ import type {
   PixelImportTargetResult,
   PixelTarget,
   ServerStateResponse,
-  SMTPSettings,
   StoredState,
+  WithdrawalJob,
+  WithdrawalPlan,
+  WithdrawalMode,
 } from "./lib/types";
 import {
   cn,
@@ -92,6 +93,7 @@ const defaultStored: StoredState = {
   cost: 518,
   partnerCost: 0,
   withdrawalAmount: 0,
+  withdrawalAmountManual: false,
   useBaseDeduction: false,
   baseDeductionAmount: 0,
   history: [],
@@ -109,7 +111,6 @@ const defaultPool: PoolAnalyzerState = {
   selectedGroups: ["PLUS共享号池", "K12共享号池", "TEAM共享号池"],
   availableGroups: ["PLUS共享号池", "K12共享号池", "TEAM共享号池"],
   pollingMinutes: 5,
-  warningEmail: "",
 };
 
 const hiddenPoolGroups = new Set(["CLAUDE共享号池", "GROK共享号池", "CODEX【兜底】", "FREE共享号池", "PRO共享号池"]);
@@ -158,7 +159,10 @@ export function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState("");
-  const [dialog, setDialog] = useState<null | "addCost" | "costHistory" | "accounts" | "poolCredentials" | "smtp">(null);
+  const [dialog, setDialog] = useState<null | "addCost" | "costHistory" | "accounts" | "poolCredentials" | "withdrawal">(null);
+  const [withdrawalIntent, setWithdrawalIntent] = useState<"create" | "status">("create");
+  const [withdrawalJob, setWithdrawalJob] = useState<WithdrawalJob | null>(null);
+  const withdrawalStateRefresh = useRef("");
   const editStartedAt = useRef(0);
   const saveTimer = useRef<number | null>(null);
 
@@ -199,6 +203,29 @@ export function App() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  const loadWithdrawalJob = useCallback(async () => {
+    try {
+      const response = await api.withdrawals();
+      setWithdrawalJob(response.job);
+      const current = response.job;
+      if (current && ["completed", "failed"].includes(current.status)) {
+        const marker = `${current.jobId}:${current.status}:${current.updatedAt}`;
+        if (withdrawalStateRefresh.current !== marker) {
+          withdrawalStateRefresh.current = marker;
+          await loadState();
+        }
+      }
+    } catch {
+      // Pixel manager configuration may be unavailable before the first setup.
+    }
+  }, [loadState]);
+
+  useEffect(() => {
+    void loadWithdrawalJob();
+    const timer = window.setInterval(() => void loadWithdrawalJob(), 5_000);
+    return () => window.clearInterval(timer);
+  }, [loadWithdrawalJob]);
+
   const saveStoredDebounced = useCallback(
     (next: StoredState, delay = 700) => {
       editStartedAt.current = Date.now();
@@ -229,13 +256,6 @@ export function App() {
   );
   const activeSelectedGroups = selectedGroups.length ? selectedGroups : availableGroups;
   const totalCost = stored.cost || 0;
-  const partnerCost = stored.partnerCost || 0;
-  const costSummary = totalCost + partnerCost;
-  const withdrawal = stored.withdrawalAmount || 0;
-  const settlementBase = withdrawal;
-  const netOutcome = settlementBase - totalCost;
-  const partnerReceivable = netOutcome >= 0 ? partnerCost + netOutcome * 0.4 : partnerCost + netOutcome / 2;
-  const ownerReceivable = withdrawal - partnerReceivable;
 
   const updateStoredField = (patch: Partial<StoredState>) => {
     saveStoredDebounced({ ...stored, ...patch });
@@ -341,7 +361,6 @@ export function App() {
                 <OverviewCards
                   latestTotal={latestBalance?.total}
                   cost={totalCost}
-                  costSummary={costSummary}
                   net={latestBalance ? latestBalance.total - totalCost : undefined}
                 />
               )
@@ -379,18 +398,20 @@ export function App() {
               {!loading && view === "manager" && <PixelManagerView onToast={setToast} />}
               {!loading && view === "cost" && (
                 <CostView
-                  stored={stored}
                   latestBalance={latestBalance}
-                  totalCost={totalCost}
-                  netOutcome={netOutcome}
-                  partnerReceivable={partnerReceivable}
-                  ownerReceivable={ownerReceivable}
-                  updateStoredField={updateStoredField}
                   onAddCost={() => setDialog("addCost")}
                   onHistory={() => setDialog("costHistory")}
                   onAccounts={() => setDialog("accounts")}
                   onPoolCredentials={() => setDialog("poolCredentials")}
-                  onSmtp={() => setDialog("smtp")}
+                  onWithdrawal={() => {
+                    setWithdrawalIntent("create");
+                    setDialog("withdrawal");
+                  }}
+                  onWithdrawalStatus={() => {
+                    setWithdrawalIntent("status");
+                    setDialog("withdrawal");
+                  }}
+                  withdrawalJob={withdrawalJob}
                 />
               )}
               {!loading && view === "history" && <HistoryView stored={stored} />}
@@ -430,7 +451,15 @@ export function App() {
         onOpenChange={(open) => setDialog(open ? "poolCredentials" : null)}
         onSaved={() => void refreshNow()}
       />
-      <SmtpDialog open={dialog === "smtp"} onOpenChange={(open) => setDialog(open ? "smtp" : null)} />
+      <WithdrawalDialog
+        open={dialog === "withdrawal"}
+        intent={withdrawalIntent}
+        totalCost={totalCost}
+        job={withdrawalJob}
+        onJobChange={setWithdrawalJob}
+        onOpenChange={(open) => setDialog(open ? "withdrawal" : null)}
+        onToast={setToast}
+      />
 
       <AnimatePresence>
         {toast && (
@@ -451,16 +480,14 @@ export function App() {
 function OverviewCards({
   latestTotal,
   cost,
-  costSummary,
   net,
 }: {
   latestTotal?: number;
   cost: number;
-  costSummary: number;
   net?: number;
 }) {
   const cards = [
-    { title: "成本合计", value: costSummary, accent: "text-blue-600", sub: "星星 + 社会哥", digits: 2, signed: false },
+    { title: "总成本", value: cost, accent: "text-blue-600", sub: "全部由星星出资", digits: 2, signed: false },
     { title: "余额合计", value: latestTotal, accent: "text-emerald-600", sub: "服务器最近一次刷新", digits: 2, signed: false },
     { title: "扣后利润", value: net, accent: net !== undefined && net < 0 ? "text-rose-600" : "text-indigo-600", sub: "余额合计 - 总出资", digits: 2, signed: true },
     { title: "星星出资", value: cost, accent: "text-violet-600", sub: "含累加成本", digits: 2, signed: false },
@@ -1364,7 +1391,7 @@ function PoolsView({
   availableGroups: string[];
   onPoolChange: (pool: PoolAnalyzerState) => void;
   onRefresh: () => void;
-  onOpenDialog: (dialog: "poolCredentials" | "smtp") => void;
+  onOpenDialog: (dialog: "poolCredentials") => void;
 }) {
   const grouped = useMemo(() => groupPoolRows(pool.history), [pool.history]);
   const toggleGroup = (group: string) => {
@@ -1392,10 +1419,6 @@ function PoolsView({
             <Button variant="outline" onClick={() => onOpenDialog("poolCredentials")}>
               <Settings className="h-4 w-4" />
               接口账号
-            </Button>
-            <Button variant="outline" onClick={() => onOpenDialog("smtp")}>
-              <Bell className="h-4 w-4" />
-              预警设置
             </Button>
           </div>
         </CardContent>
@@ -1447,6 +1470,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   const [importRecordsLoading, setImportRecordsLoading] = useState(false);
   const [deletingRecordId, setDeletingRecordId] = useState("");
   const [deleteRecord, setDeleteRecord] = useState<PixelImportRecord | null>(null);
+  const [removeRecord, setRemoveRecord] = useState<PixelImportRecord | null>(null);
   const exportBackupDownloadedRef = useRef<Set<string>>(new Set());
   const accountsRequestSequence = useRef(0);
   const [selectedAccountIds, setSelectedAccountIds] = useState<Set<number>>(new Set());
@@ -1758,6 +1782,21 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
       onToast(response.record.deleteStatus === "deleted" ? "导入记录账号已全部删除" : "导入记录删除完成，但存在未处理账号");
     } catch (error) {
       onToast(error instanceof Error ? error.message : "导入记录删除失败");
+    } finally {
+      setDeletingRecordId("");
+    }
+  };
+
+  const runRemoveImportRecord = async () => {
+    if (!removeRecord) return;
+    setDeletingRecordId(removeRecord.recordId);
+    try {
+      await api.pixelRemoveImportRecord(removeRecord.recordId);
+      setImportRecords((current) => current.filter((item) => item.recordId !== removeRecord.recordId));
+      setRemoveRecord(null);
+      onToast("导入历史记录已删除，平台账号未变动");
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "导入历史记录删除失败");
     } finally {
       setDeletingRecordId("");
     }
@@ -2282,6 +2321,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
         deletingRecordId={deletingRecordId}
         onOpenChange={setImportRecordsOpen}
         onDelete={setDeleteRecord}
+        onRemove={setRemoveRecord}
       />
 
       <Dialog open={Boolean(deleteRecord)} onOpenChange={(open) => !open && !deletingRecordId && setDeleteRecord(null)}>
@@ -2300,6 +2340,22 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
             <Button variant="destructive" disabled={Boolean(deletingRecordId)} onClick={() => void runDeleteImportRecord()}>
               {deletingRecordId ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
               {deletingRecordId ? "正在删除" : "确认删除"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(removeRecord)} onOpenChange={(open) => !open && !deletingRecordId && setRemoveRecord(null)}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>仅删除导入历史</DialogTitle>
+            <DialogDescription>只移除“{removeRecord?.sourceFileName || "JSON 文件"}”这条本地记录，不会调用 PixelAPI 删除任何账号。</DialogDescription>
+          </DialogHeader>
+          <div className="mt-5 flex justify-end gap-2">
+            <Button variant="outline" disabled={Boolean(deletingRecordId)} onClick={() => setRemoveRecord(null)}>取消</Button>
+            <Button variant="destructive" disabled={Boolean(deletingRecordId)} onClick={() => void runRemoveImportRecord()}>
+              {deletingRecordId ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+              删除历史记录
             </Button>
           </div>
         </DialogContent>
@@ -2697,6 +2753,7 @@ function PixelImportRecordsDialog({
   deletingRecordId,
   onOpenChange,
   onDelete,
+  onRemove,
 }: {
   open: boolean;
   records: PixelImportRecord[];
@@ -2704,6 +2761,7 @@ function PixelImportRecordsDialog({
   deletingRecordId: string;
   onOpenChange: (open: boolean) => void;
   onDelete: (record: PixelImportRecord) => void;
+  onRemove: (record: PixelImportRecord) => void;
 }) {
   const [expandedRecordId, setExpandedRecordId] = useState("");
   const statusLabel = (status: PixelImportRecord["deleteStatus"]) => {
@@ -2765,15 +2823,21 @@ function PixelImportRecordsDialog({
                       </StatusPill>
                     </td>
                     <td className="px-3 py-3">
-                      <Button
-                        variant="destructive"
-                        size="sm"
-                        disabled={record.deleteStatus === "deleted" || Boolean(deletingRecordId)}
-                        onClick={() => onDelete(record)}
-                      >
-                        {deletingRecordId === record.recordId ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
-                        {record.deleteStatus === "partial" ? "重试删除" : "删除账号"}
-                      </Button>
+                      <div className="flex flex-wrap gap-1.5">
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          disabled={record.deleteStatus === "deleted" || Boolean(deletingRecordId)}
+                          onClick={() => onDelete(record)}
+                        >
+                          {deletingRecordId === record.recordId ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                          {record.deleteStatus === "partial" ? "重试删账号" : "删本次账号"}
+                        </Button>
+                        <Button variant="outline" size="sm" disabled={Boolean(deletingRecordId)} onClick={() => onRemove(record)}>
+                          <X className="h-3.5 w-3.5" />
+                          删历史
+                        </Button>
+                      </div>
                     </td>
                     </tr>
                     {expanded && (
@@ -3024,96 +3088,102 @@ function formatFileSize(bytes: number) {
 }
 
 function CostView({
-  stored,
   latestBalance,
-  totalCost,
-  netOutcome,
-  partnerReceivable,
-  ownerReceivable,
-  updateStoredField,
   onAddCost,
   onHistory,
   onAccounts,
   onPoolCredentials,
-  onSmtp,
+  onWithdrawal,
+  onWithdrawalStatus,
+  withdrawalJob,
 }: {
-  stored: StoredState;
   latestBalance?: { total: number; amounts: number[]; accounts?: string[]; date: string };
-  totalCost: number;
-  netOutcome: number;
-  partnerReceivable: number;
-  ownerReceivable: number;
-  updateStoredField: (patch: Partial<StoredState>) => void;
   onAddCost: () => void;
   onHistory: () => void;
   onAccounts: () => void;
   onPoolCredentials: () => void;
-  onSmtp: () => void;
+  onWithdrawal: () => void;
+  onWithdrawalStatus: () => void;
+  withdrawalJob: WithdrawalJob | null;
 }) {
   const rows = latestBalance?.amounts.map((amount, index) => ({
     account: latestBalance.accounts?.[index] || `账号${index + 1}`,
     current: amount,
   })) ?? [];
+  const activeWithdrawal = Boolean(withdrawalJob && ["queued", "waiting", "running"].includes(withdrawalJob.status));
+  const handledWithdrawalItems = withdrawalJob?.items.filter((item) => ["submitted", "skipped"].includes(item.status)).length ?? 0;
+  const withdrawalStatusLabel = activeWithdrawal && withdrawalJob
+    ? `提现进度 ${handledWithdrawalItems}/${withdrawalJob.items.length}`
+    : withdrawalJob?.status === "failed"
+      ? "提现已暂停"
+      : withdrawalJob?.status === "completed"
+        ? "最近提现"
+        : "提现进度";
   return (
     <div className="space-y-4">
       <Card>
-        <CardContent className="grid grid-cols-[repeat(4,minmax(120px,1fr))_auto] items-end gap-3 p-4">
-          <Field label="星星出资">
-            <div className="flex h-9 items-center rounded-md border border-border bg-muted px-3 text-sm font-black">
-              {formatMoney(totalCost)}
-            </div>
-          </Field>
-          <Field label="社会哥出资">
-            <Input value={stored.partnerCost ?? 0} onChange={(event) => updateStoredField({ partnerCost: parseMoney(event.target.value) })} />
-          </Field>
-          <Field label="本次提现">
-            <Input value={stored.withdrawalAmount ?? ""} onChange={(event) => updateStoredField({ withdrawalAmount: parseMoney(event.target.value) })} />
-          </Field>
-          <Field label="最近余额">
-            <div className="flex h-9 items-center rounded-md border border-border bg-muted px-3 text-sm font-black">
-              <AnimatedNumber value={latestBalance?.total} digits={2} />
-            </div>
-          </Field>
-          <div className="flex flex-wrap justify-end gap-2">
-            <Button onClick={onAddCost}>
-              <Plus className="h-4 w-4" />
-              累加成本
-            </Button>
-            <Button variant="outline" onClick={onHistory}>
-              <History className="h-4 w-4" />
-              累加历史
-            </Button>
-            <Button variant="outline" onClick={onAccounts}>
-              <WalletCards className="h-4 w-4" />
-              账号配置
-            </Button>
-            <Button variant="outline" onClick={onPoolCredentials}>
-              <Settings className="h-4 w-4" />
-              接口账号
-            </Button>
-            <Button variant="outline" onClick={onSmtp}>
-              <Mail className="h-4 w-4" />
-              预警设置
-            </Button>
+        <CardContent className="p-0">
+          <div className="grid divide-y divide-border lg:grid-cols-3 lg:divide-x lg:divide-y-0">
+            <section className="bg-emerald-50/45 px-4 py-4">
+              <div className="mb-2 text-xs font-black text-emerald-800">成本记录</div>
+              <div className="grid grid-cols-2 gap-2">
+                <Button size="sm" className="bg-emerald-600 text-white hover:bg-emerald-700" onClick={onAddCost}>
+                  <Plus className="h-4 w-4" />
+                  累加成本
+                </Button>
+                <Button size="sm" variant="outline" className="border-emerald-200 text-emerald-800 hover:bg-emerald-100/70" onClick={onHistory}>
+                  <History className="h-4 w-4" />
+                  累加历史
+                </Button>
+              </div>
+            </section>
+
+            <section className="bg-cyan-50/35 px-4 py-4">
+              <div className="mb-2 text-xs font-black text-cyan-900">账号与通知</div>
+              <div className="grid grid-cols-2 gap-2">
+                <Button size="sm" variant="outline" className="border-cyan-200 text-cyan-900 hover:bg-cyan-100/70" onClick={onAccounts}>
+                  <Users className="h-4 w-4" />
+                  账号配置
+                </Button>
+                <Button size="sm" variant="outline" className="border-slate-300 text-slate-700 hover:bg-slate-100" onClick={onPoolCredentials}>
+                  <Server className="h-4 w-4" />
+                  接口账号
+                </Button>
+              </div>
+            </section>
+
+            <section className="bg-violet-50/40 px-4 py-4">
+              <div className="mb-2 text-xs font-black text-violet-900">提现操作</div>
+              <div className="grid grid-cols-2 gap-2">
+                <Button size="sm" className="bg-violet-600 text-white hover:bg-violet-700" onClick={onWithdrawal} disabled={activeWithdrawal} title={activeWithdrawal ? "当前提现任务完成前不能创建新任务" : undefined}>
+                  <WalletCards className="h-4 w-4" />
+                  快捷提现
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className={cn(
+                    activeWithdrawal && "border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100",
+                    withdrawalJob?.status === "failed" && "border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100",
+                    withdrawalJob?.status === "completed" && "border-emerald-300 bg-emerald-50 text-emerald-800 hover:bg-emerald-100",
+                    !withdrawalJob && "border-violet-200 bg-white/80 text-violet-800 hover:bg-violet-100/70",
+                  )}
+                  onClick={onWithdrawalStatus}
+                >
+                  {activeWithdrawal ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : withdrawalJob?.status === "failed" ? (
+                    <AlertTriangle className="h-4 w-4" />
+                  ) : withdrawalJob?.status === "completed" ? (
+                    <CheckCircle2 className="h-4 w-4" />
+                  ) : (
+                    <Clock3 className="h-4 w-4" />
+                  )}
+                  {withdrawalStatusLabel}
+                </Button>
+              </div>
+            </section>
           </div>
-        </CardContent>
-      </Card>
-
-      <div className="grid grid-cols-4 gap-3">
-        <MetricTile title="总出资" value={totalCost} accent="text-blue-600" sub="星星出资合计" size="normal" digits={2} suffix=" 元" />
-        <MetricTile title="当前提现利润" value={netOutcome} accent={netOutcome < 0 ? "text-rose-600" : "text-indigo-600"} signed sub="本次提现 - 总出资" size="normal" digits={2} suffix=" 元" />
-        <MetricTile title="社会哥应收" value={partnerReceivable} accent="text-orange-600" sub="按结算比例计算" size="normal" digits={2} suffix=" 元" />
-        <MetricTile title="星星应收" value={ownerReceivable} accent="text-violet-600" sub="本次提现剩余" size="normal" digits={2} suffix=" 元" />
-      </div>
-
-      <Card className="bg-indigo-50/55">
-        <CardContent className="grid grid-cols-[110px_1fr] gap-x-4 gap-y-2.5 p-3 text-sm font-bold text-foreground">
-          <span className="text-blue-700">本次提现</span>
-          <span>本次提现金额 = {formatMoney(stored.withdrawalAmount)}</span>
-          <span className="text-blue-700">当前提现利润</span>
-          <span>本次提现 {formatMoney(stored.withdrawalAmount)} - 总出资 {formatMoney(totalCost)} = {formatSignedMoney(netOutcome)}</span>
-          <span className="text-blue-700">结算结果</span>
-          <span>社会哥应收 {formatMoney(partnerReceivable)}；星星应收 {formatMoney(ownerReceivable)}</span>
         </CardContent>
       </Card>
 
@@ -3125,6 +3195,411 @@ function CostView({
           formatMoney(row.current),
         ])}
       />
+    </div>
+  );
+}
+
+const withdrawalItemStatusLabels: Record<string, string> = {
+  queued: "待执行",
+  waiting: "等待中",
+  running: "提交中",
+  submitted: "已提交",
+  skipped: "已跳过",
+  failed: "失败",
+};
+
+const withdrawalJobStatusLabels: Record<string, string> = {
+  queued: "待执行",
+  waiting: "等待中",
+  running: "提交中",
+  completed: "已完成",
+  failed: "失败",
+};
+
+function withdrawalItemStatusLabel(status: string, fallback?: string) {
+  return withdrawalItemStatusLabels[status] || fallback || status || "未知";
+}
+
+function WithdrawalDialog({
+  open,
+  intent,
+  totalCost,
+  job,
+  onJobChange,
+  onOpenChange,
+  onToast,
+}: {
+  open: boolean;
+  intent: "create" | "status";
+  totalCost: number;
+  job: WithdrawalJob | null;
+  onJobChange: (job: WithdrawalJob | null) => void;
+  onOpenChange: (open: boolean) => void;
+  onToast: (message: string) => void;
+}) {
+  const [mode, setMode] = useState<WithdrawalMode>("cost");
+  const [amount, setAmount] = useState("");
+  const [preview, setPreview] = useState<WithdrawalPlan | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [accelerating, setAccelerating] = useState(false);
+  const [progressTab, setProgressTab] = useState<"current" | "history">("current");
+  const [historyJobs, setHistoryJobs] = useState<WithdrawalJob[]>([]);
+  const [historyTotal, setHistoryTotal] = useState(0);
+  const [historyPage, setHistoryPage] = useState(0);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const [selectedHistoryJob, setSelectedHistoryJob] = useState<WithdrawalJob | null>(null);
+  const [clock, setClock] = useState(Date.now());
+  const createInFlight = useRef(false);
+  const active = Boolean(job && ["queued", "waiting", "running"].includes(job.status));
+  const showingJob = intent === "status" || active;
+
+  useEffect(() => {
+    if (!open) return;
+    setPreview(null);
+    setPreviewError("");
+    setProgressTab("current");
+    setHistoryPage(0);
+    setSelectedHistoryJob(null);
+    if (intent === "create") {
+      setMode("cost");
+      setAmount(String(Math.max(1, Math.ceil(totalCost - 1e-9))));
+    }
+  }, [open, intent, totalCost]);
+
+  useEffect(() => {
+    if (!open) return;
+    const timer = window.setInterval(() => setClock(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open || showingJob) return;
+    setPreview(null);
+    setPreviewError("");
+
+    const requestedAmount = Number(amount);
+    if (mode === "cost" && (!Number.isInteger(requestedAmount) || requestedAmount <= 0)) {
+      setPreviewLoading(false);
+      setPreviewError("提现金额必须是大于 0 的整数");
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      setPreviewLoading(true);
+      try {
+        const response = await api.withdrawalPreview(mode, mode === "cost" ? requestedAmount : undefined);
+        if (!cancelled) setPreview(response);
+      } catch (error) {
+        if (!cancelled) setPreviewError(error instanceof Error ? error.message : "提现预览失败");
+      } finally {
+        if (!cancelled) setPreviewLoading(false);
+      }
+    }, mode === "cost" ? 250 : 0);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [amount, mode, open, showingJob]);
+
+  useEffect(() => {
+    if (!open || !showingJob || progressTab !== "history") return;
+    let cancelled = false;
+    setHistoryLoading(true);
+    setHistoryError("");
+    void api.withdrawalHistory(10, historyPage * 10)
+      .then((response) => {
+        if (cancelled) return;
+        setHistoryJobs(response.jobs);
+        setHistoryTotal(response.total);
+        setSelectedHistoryJob((current) => response.jobs.find((item) => item.jobId === current?.jobId) ?? response.jobs[0] ?? null);
+      })
+      .catch((error) => {
+        if (!cancelled) setHistoryError(error instanceof Error ? error.message : "提现记录读取失败");
+      })
+      .finally(() => {
+        if (!cancelled) setHistoryLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [historyPage, job?.updatedAt, open, progressTab, showingJob]);
+
+  const create = async () => {
+    if (createInFlight.current || active) return;
+    createInFlight.current = true;
+    setCreating(true);
+    try {
+      const response = await api.createWithdrawal(mode, mode === "cost" ? Number(amount) : undefined);
+      onJobChange(response.job);
+      setPreview(null);
+      onToast("提现任务已创建，第一笔将立即执行");
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "提现任务创建失败");
+    } finally {
+      createInFlight.current = false;
+      setCreating(false);
+    }
+  };
+
+  const accelerate = async () => {
+    if (!job) return;
+    setAccelerating(true);
+    try {
+      const response = await api.accelerateWithdrawal(job.jobId);
+      onJobChange(response.job);
+      onToast("已加速下一笔提现");
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "提现加速失败");
+    } finally {
+      setAccelerating(false);
+    }
+  };
+
+  const countdown = job?.nextRunAt
+    ? Math.max(0, Math.ceil((new Date(job.nextRunAt).getTime() - clock) / 1000))
+    : 0;
+  const submittedCount = job?.items.filter((item) => ["submitted", "skipped"].includes(item.status)).length ?? 0;
+  const shownPlan = preview ?? (showingJob ? job : null);
+  const nextQueuedItem = job?.items.find((item) => item.status === "queued");
+  const currentItem = job?.status === "running"
+    ? job.items.find((item) => item.sequence === job.currentSequence)
+    : nextQueuedItem;
+  const progressPercent = job?.items.length ? Math.round((submittedCount / job.items.length) * 100) : 0;
+  const historyPages = Math.max(1, Math.ceil(historyTotal / 10));
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="!w-[min(calc(100vw-32px),1040px)] max-w-none max-h-[min(860px,calc(100vh-36px))] overflow-auto">
+        <DialogHeader>
+          <DialogTitle>{showingJob ? "提现进度" : "快捷提现"}</DialogTitle>
+          <DialogDescription>{showingJob ? "这里显示当前账号、已完成数量、等待倒计时和每笔提交结果。" : "每次只提交一个账号。提交成功后随机等待 20-60 分钟，再执行下一个账号。"}</DialogDescription>
+        </DialogHeader>
+
+        {showingJob && (
+          <div className="mb-4 flex border-b border-border" role="tablist" aria-label="提现信息">
+            {(["current", "history"] as const).map((tab) => (
+              <button
+                key={tab}
+                type="button"
+                role="tab"
+                aria-selected={progressTab === tab}
+                className={cn(
+                  "border-b-2 px-4 py-2 text-sm font-black transition",
+                  progressTab === tab ? "border-violet-600 text-violet-700" : "border-transparent text-muted-foreground hover:border-border hover:text-foreground",
+                )}
+                onClick={() => setProgressTab(tab)}
+              >
+                {tab === "current" ? "当前进度" : "提现记录"}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {!showingJob && <div className="grid gap-3 rounded-md border border-border bg-muted/35 p-3 md:grid-cols-[minmax(240px,1fr)_190px_auto] md:items-end">
+          <Field label="提现模式">
+            <div className="flex h-9 w-fit rounded-md border border-border bg-card p-0.5">
+              {(["cost", "full"] as WithdrawalMode[]).map((item) => (
+                <button
+                  type="button"
+                  key={item}
+                  disabled={Boolean(active)}
+                  onClick={() => {
+                    setMode(item);
+                    setAmount(item === "cost" ? String(Math.max(1, Math.ceil(totalCost - 1e-9))) : "");
+                    setPreview(null);
+                    setPreviewError("");
+                  }}
+                  className={cn("rounded px-3 text-xs font-black", mode === item ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted")}
+                >
+                  {item === "cost" ? "提成本" : "全部提现"}
+                </button>
+              ))}
+            </div>
+          </Field>
+          {mode === "cost" && (
+            <Field label="计划提现金额">
+              <Input type="number" min="1" step="1" value={amount} disabled={Boolean(active)} onChange={(event) => { setAmount(event.target.value); setPreview(null); setPreviewError(""); }} />
+            </Field>
+          )}
+          {mode === "full" && <Field label="提现规则"><div className="flex h-9 items-center rounded-md border border-border bg-card px-3 text-sm font-bold">各账号整数余额</div></Field>}
+          <Button className="bg-violet-600 text-white hover:bg-violet-700" onClick={() => void create()} disabled={creating || previewLoading || !preview || Boolean(previewError) || active}>
+            {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <WalletCards className="h-4 w-4" />}
+            创建提现任务
+          </Button>
+        </div>}
+
+        {progressTab === "current" && active && job && (
+          <div className="rounded-md border border-blue-200 bg-blue-50 px-4 py-3 text-sm font-bold text-blue-900">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span>任务 {job.jobId} · {job.status === "waiting" ? `等待中（${Math.floor(countdown / 60)}分${countdown % 60}秒）` : job.status === "running" ? "提交中" : "待执行"}</span>
+              <span>{submittedCount}/{job.items.length} 个账号已处理</span>
+            </div>
+            <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-blue-100"><div className="h-full rounded-full bg-blue-600 transition-all" style={{ width: `${progressPercent}%` }} /></div>
+            {currentItem && <div className="mt-2 text-xs">{job.status === "waiting" ? "下一账号" : "当前账号"}：第 {currentItem.sequence} 个 · {currentItem.email} · {currentItem.ownerLabel} · {formatMoney(currentItem.amount, 0)} 元</div>}
+            <div className="mt-1 text-xs">下一次执行：{job.nextRunAt ? formatDateTime(job.nextRunAt) : "立即"}</div>
+            {job.status === "waiting" && <Button className="mt-3" size="sm" onClick={() => void accelerate()} disabled={accelerating}>{accelerating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FastForward className="h-3.5 w-3.5" />}加速下一笔</Button>}
+          </div>
+        )}
+
+        {progressTab === "current" && showingJob && job?.status === "completed" && <div className="rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-bold text-emerald-800">任务 {job.jobId} 已完成，共处理 {submittedCount}/{job.items.length} 个账号。</div>}
+        {progressTab === "current" && showingJob && job?.status === "failed" && <div className="rounded-md border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">任务 {job.jobId} 已暂停：{job.error || "当前账号提现失败"}</div>}
+        {progressTab === "current" && showingJob && !job && <div className="rounded-md border border-border bg-muted px-4 py-6 text-center text-sm font-bold text-muted-foreground">暂无提现任务</div>}
+
+        {!showingJob && previewLoading && <div className="flex min-h-44 items-center justify-center rounded-md border border-border bg-card text-sm font-bold text-muted-foreground"><Loader2 className="mr-2 h-4 w-4 animate-spin" />正在刷新分配预览</div>}
+        {!showingJob && previewError && <div className="rounded-md border border-rose-200 bg-rose-50 px-4 py-4 text-sm font-bold text-rose-700">{previewError}</div>}
+
+        {(!showingJob || progressTab === "current") && shownPlan && <div className="mt-4"><WithdrawalPlanDetails plan={shownPlan} /></div>}
+
+        {showingJob && progressTab === "history" && (
+          <div className="space-y-4">
+            {historyLoading && <div className="flex min-h-32 items-center justify-center rounded-md border border-border text-sm font-bold text-muted-foreground"><Loader2 className="mr-2 h-4 w-4 animate-spin" />正在读取提现记录</div>}
+            {historyError && <div className="rounded-md border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">{historyError}</div>}
+            {!historyLoading && !historyError && (
+              <Fragment>
+                <div className="overflow-auto rounded-md border border-border">
+                  <table className="w-full min-w-[760px] text-left text-xs">
+                    <thead className="bg-muted font-black text-muted-foreground"><tr><th className="px-3 py-2">创建时间</th><th className="px-3 py-2">提现模式</th><th className="px-3 py-2">提现金额</th><th className="px-3 py-2">任务状态</th><th className="w-9 px-3 py-2" /></tr></thead>
+                    <tbody>
+                      {historyJobs.map((historyJob) => {
+                        const selected = selectedHistoryJob?.jobId === historyJob.jobId;
+                        const actualAmount = ["completed", "failed"].includes(historyJob.status) ? historyJob.settlement.gross : historyJob.totalAmount;
+                        return (
+                          <tr
+                            key={historyJob.jobId}
+                            role="button"
+                            tabIndex={0}
+                            aria-selected={selected}
+                            className={cn("cursor-pointer border-t border-border transition hover:bg-muted/60", selected && "bg-violet-50")}
+                            onClick={() => setSelectedHistoryJob(historyJob)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" || event.key === " ") setSelectedHistoryJob(historyJob);
+                            }}
+                          >
+                            <td className="px-3 py-2 font-bold">{formatDateTime(historyJob.createdAt)}</td>
+                            <td className="px-3 py-2">{historyJob.mode === "cost" ? "提成本" : "全部提现"}</td>
+                            <td className="px-3 py-2 font-black">{formatMoney(actualAmount)} 元</td>
+                            <td className="px-3 py-2"><StatusPill tone={withdrawalJobStatusTone(historyJob.status)}>{withdrawalJobStatusLabels[historyJob.status] || historyJob.status}</StatusPill></td>
+                            <td className="px-3 py-2"><ChevronRight className={cn("h-4 w-4 text-muted-foreground transition", selected && "text-violet-600")} /></td>
+                          </tr>
+                        );
+                      })}
+                      {!historyJobs.length && <tr><td colSpan={5} className="px-3 py-10 text-center font-bold text-muted-foreground">暂无提现记录</td></tr>}
+                    </tbody>
+                  </table>
+                </div>
+                {historyTotal > 10 && (
+                  <div className="flex items-center justify-end gap-2 text-xs font-bold text-muted-foreground">
+                    <Button size="sm" variant="outline" disabled={historyPage <= 0} onClick={() => setHistoryPage((page) => Math.max(0, page - 1))}><ChevronLeft className="h-4 w-4" />上一页</Button>
+                    <span>{historyPage + 1} / {historyPages}</span>
+                    <Button size="sm" variant="outline" disabled={historyPage + 1 >= historyPages} onClick={() => setHistoryPage((page) => Math.min(historyPages - 1, page + 1))}>下一页<ChevronRight className="h-4 w-4" /></Button>
+                  </div>
+                )}
+                {selectedHistoryJob && (
+                  <div className="space-y-3 border-t border-border pt-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="text-sm font-black">账号提现明细</div>
+                      <div className="text-xs font-bold text-muted-foreground">任务 {selectedHistoryJob.jobId}</div>
+                    </div>
+                    <WithdrawalPlanDetails plan={selectedHistoryJob} />
+                  </div>
+                )}
+              </Fragment>
+            )}
+          </div>
+        )}
+
+        <div className="mt-6 flex justify-end gap-2 border-t border-border pt-4"><Button variant="outline" onClick={() => onOpenChange(false)}>关闭</Button></div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function withdrawalJobStatusTone(status: WithdrawalJob["status"]): "green" | "red" | "amber" | "blue" | "gray" {
+  if (status === "completed") return "green";
+  if (status === "failed") return "red";
+  if (status === "running") return "blue";
+  return "amber";
+}
+
+function WithdrawalPlanDetails({ plan }: { plan: WithdrawalPlan | WithdrawalJob }) {
+  const finalized = "status" in plan && ["completed", "failed"].includes(plan.status);
+  const displayedAmount = finalized ? plan.settlement.gross : plan.totalAmount;
+  const recoveryDifference = Number((displayedAmount - plan.cost).toFixed(2));
+  const finalizedJob = finalized ? (plan as WithdrawalJob) : null;
+  const costHistory = plan.costHistory ?? [];
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <MetricTile title="总成本" value={plan.cost} accent="text-violet-600" sub="全部由星星出资" size="normal" digits={2} suffix=" 元" />
+        <MetricTile title={plan.mode === "cost" ? "计划提现" : "提现总额"} value={displayedAmount} accent="text-blue-600" sub={finalized ? "实际已提交金额" : "计划提交整数金额"} size="normal" digits={2} suffix=" 元" />
+        <MetricTile title={plan.mode === "cost" ? "成本回收差额" : "可分配利润"} value={plan.mode === "cost" ? recoveryDifference : plan.settlement.profit} accent={(plan.mode === "cost" ? recoveryDifference : plan.settlement.profit) < 0 ? "text-rose-600" : "text-indigo-600"} signed sub={plan.mode === "cost" ? "提现金额 - 总成本" : "提现总额 - 总成本"} size="normal" digits={2} suffix=" 元" />
+        <MetricTile title={plan.mode === "cost" ? "社会哥转给星星" : "社会哥应得"} value={plan.mode === "cost" ? plan.settlement.partnerToOwner : plan.settlement.partnerExpected} accent="text-orange-600" sub={plan.mode === "cost" ? "按实际收款归属" : "利润的 40%"} size="normal" digits={2} suffix=" 元" />
+      </div>
+      <div className="overflow-auto rounded-md border border-border">
+        <table className="w-full min-w-[760px] text-left text-xs">
+          <thead className="bg-muted font-black text-muted-foreground"><tr><th className="px-3 py-2">序号</th><th className="px-3 py-2">账号</th><th className="px-3 py-2">收款方式</th><th className="px-3 py-2">当前余额</th><th className="px-3 py-2">提现金额</th><th className="px-3 py-2">状态</th></tr></thead>
+          <tbody>
+            {plan.items.map((item, index) => (
+              <tr key={item.email} className="border-t border-border">
+                <td className="px-3 py-2 font-black">{item.sequence ?? index + 1}</td>
+                <td className="px-3 py-2 font-bold">{item.email}</td>
+                <td className="px-3 py-2">{item.ownerLabel}</td>
+                <td className="px-3 py-2">{formatMoney(item.balance)}</td>
+                <td className="px-3 py-2 font-black">{formatMoney(item.amount, 0)}</td>
+                <td className="px-3 py-2">
+                  <StatusPill tone={item.status === "failed" ? "red" : item.status === "submitted" ? "green" : item.status === "skipped" ? "gray" : item.status === "running" ? "blue" : "amber"}>{withdrawalItemStatusLabel(item.status, item.statusLabel)}</StatusPill>
+                  {item.error && <div className="mt-1 text-rose-600">{item.error}</div>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {finalizedJob && (
+        <div className="space-y-3 border-t border-border pt-4">
+          <div className="text-sm font-black">提现后汇总</div>
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+            <MetricTile title="提现后总成本" value={finalizedJob.postWithdrawalCost ?? plan.cost} accent="text-violet-600" sub="已收回成本自动结清" size="normal" digits={2} suffix=" 元" />
+            <MetricTile title="提现后总余额" value={finalizedJob.postWithdrawalBalance ?? undefined} accent="text-emerald-600" sub="余额快照扣除实际提现" size="normal" digits={2} suffix=" 元" />
+            <MetricTile title="提现后折后利润" value={finalizedJob.discountedProfit ?? undefined} accent={(finalizedJob.discountedProfit ?? 0) < 0 ? "text-rose-600" : "text-indigo-600"} signed sub="提现后总余额 - 总成本" size="normal" digits={2} suffix=" 元" />
+          </div>
+          <div className="text-xs font-bold text-muted-foreground">
+            {finalizedJob.costSettlementStatus === "cleared"
+              ? "成本历史已自动清空 " + formatMoney(finalizedJob.costClearedAmount ?? 0) + " 元，提现记录仍保留本次快照。"
+              : finalizedJob.costSettlementStatus === "not_recovered"
+                ? "本次未完整收回成本，成本历史未清空。"
+                : "成本历史未重复扣减。"}
+          </div>
+        </div>
+      )}
+      {costHistory.length > 0 && (
+        <div className="space-y-2 border-t border-border pt-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-sm font-black">本次成本历史快照</div>
+            <div className="text-xs font-bold text-muted-foreground">合计 {formatMoney(plan.costHistoryTotal ?? costHistory.reduce((sum, item) => sum + item.amount, 0))} 元</div>
+          </div>
+          <div className="max-h-64 overflow-auto rounded-md border border-border">
+            <table className="w-full min-w-[680px] text-left text-xs">
+              <thead className="sticky top-0 bg-muted font-black text-muted-foreground"><tr><th className="px-3 py-2">成本日期</th><th className="px-3 py-2">金额</th><th className="px-3 py-2">备注</th><th className="px-3 py-2">录入时间</th></tr></thead>
+              <tbody>
+                {costHistory.map((item) => (
+                  <tr key={item.id} className="border-t border-border">
+                    <td className="px-3 py-2 font-semibold">{formatDateTime(item.date)}</td>
+                    <td className="px-3 py-2 font-black">{formatMoney(item.amount)} 元</td>
+                    <td className="px-3 py-2">{item.note || "-"}</td>
+                    <td className="px-3 py-2 text-muted-foreground">{formatDateTime(item.createdAt)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -3348,61 +3823,6 @@ function PoolCredentialsDialog({
           value={form.password}
           placeholder="已保存，留空不修改"
           onChange={(event) => setForm({ ...form, password: event.target.value })}
-        />
-      </Field>
-    </ConfigDialog>
-  );
-}
-
-function SmtpDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
-  const [form, setForm] = useState<SMTPSettings>({ host: "smtp.qq.com", port: 465, username: "", password: "", recipient: "" });
-  const [saving, setSaving] = useState(false);
-  useEffect(() => {
-    if (!open) return;
-    api.smtpSettings().then((response) => setForm(response.settings));
-  }, [open]);
-  return (
-    <ConfigDialog
-      open={open}
-      title="预警邮箱设置"
-      description="SMTP 授权码保存在服务器且不会回显；留空表示不修改。"
-      saving={saving}
-      onOpenChange={onOpenChange}
-      onSave={async () => {
-        setSaving(true);
-        await api.updateSmtpSettings(form);
-        setSaving(false);
-        onOpenChange(false);
-      }}
-    >
-      <div className="grid grid-cols-2 gap-3">
-        <Field label="SMTP Host">
-          <Input value={form.host} onChange={(event) => setForm({ ...form, host: event.target.value })} />
-        </Field>
-        <Field label="端口">
-          <Input value={form.port} onChange={(event) => setForm({ ...form, port: Number(event.target.value) || 465 })} />
-        </Field>
-      </div>
-      <Field label="发件邮箱">
-        <Input
-          value={form.username}
-          placeholder="已保存，留空不修改"
-          onChange={(event) => setForm({ ...form, username: event.target.value })}
-        />
-      </Field>
-      <Field label="SMTP 授权码">
-        <Input
-          type="password"
-          value={form.password}
-          placeholder="已保存，留空不修改"
-          onChange={(event) => setForm({ ...form, password: event.target.value })}
-        />
-      </Field>
-      <Field label="预警收件邮箱">
-        <Input
-          value={form.recipient}
-          placeholder="已保存，留空不修改"
-          onChange={(event) => setForm({ ...form, recipient: event.target.value })}
         />
       </Field>
     </ConfigDialog>
@@ -3973,9 +4393,22 @@ function SkeletonLine({ className }: { className?: string }) {
 }
 
 function normalizeStored(value: StoredState): StoredState {
+  const cost = Number.isFinite(value.cost) ? value.cost : defaultStored.cost;
+  const storedWithdrawal = Number(value.withdrawalAmount);
+  const legacyRoundedDownDefault = value.withdrawalAmountManual === undefined
+    && !Number.isInteger(cost)
+    && storedWithdrawal === Math.floor(cost);
+  const shouldUseDefault = !Number.isFinite(storedWithdrawal)
+    || storedWithdrawal <= 0
+    || value.withdrawalAmountManual === false
+    || legacyRoundedDownDefault;
   return {
     ...defaultStored,
     ...value,
+    cost,
+    partnerCost: 0,
+    withdrawalAmount: shouldUseDefault ? Math.ceil(cost) : storedWithdrawal,
+    withdrawalAmountManual: value.withdrawalAmountManual ?? !shouldUseDefault,
     history: value.history ?? [],
     costAdditions: value.costAdditions ?? [],
   };

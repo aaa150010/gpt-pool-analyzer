@@ -116,7 +116,6 @@ struct PoolAnalyzerState: Codable {
     var selectedGroups: [String]?
     var availableGroups: [String]?
     var pollingMinutes: Double?
-    var warningEmail: String?
     var accessToken: String?
     var refreshToken: String?
 }
@@ -235,7 +234,7 @@ struct SMTPSettings: Codable {
         port: 465,
         username: "",
         password: "",
-        recipient: "706137702@qq.com"
+        recipient: "1745627971@qq.com,252715669@qq.com"
     )
 }
 
@@ -282,14 +281,6 @@ struct BalanceAccountsPayload: Codable {
 struct BalanceAccountsUpdateResponse: Codable {
     var ok: Bool
     var count: Int?
-}
-
-struct SMTPSettingsResponse: Codable {
-    var settings: SMTPSettings
-}
-
-struct SMTPSettingsPayload: Codable {
-    var settings: SMTPSettings
 }
 
 struct PoolCredentialsResponse: Codable {
@@ -896,7 +887,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private let poolPollingField = NSTextField(string: "5")
     private let poolRefreshButton = NSButton(title: "刷新", target: nil, action: nil)
     private let poolCredentialsButton = NSButton(title: "接口账号", target: nil, action: nil)
-    private let poolWarningButton = NSButton(title: "预警设置", target: nil, action: nil)
     private let tabControl = NSSegmentedControl(labels: ["趋势分析", "账号池分析", "成本计算", "成本历史"], trackingMode: .selectOne, target: nil, action: nil)
     private let trendMetricControl = NSSegmentedControl(labels: PoolTrendMetric.allCases.map(\.title), trackingMode: .selectOne, target: nil, action: nil)
     private let trendChartView = PoolTrendChartView()
@@ -930,7 +920,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var poolPollingTimer: Timer?
     private var selectedTrendMetric: PoolTrendMetric = .remaining5h
     private var smtpSettings = SMTPSettings.default
-    private var poolWarningDedup: Set<String> = []
     private var balanceAccounts: [BalanceAccount] = []
     private var balancePollingTimer: Timer?
     private var balanceQueryInProgress = false
@@ -998,7 +987,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             backing: .buffered,
             defer: false
         )
-        window.title = "GPT分析器"
+        window.title = "91"
         window.center()
 
         configureField(costField, placeholder: "200")
@@ -1141,7 +1130,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         appMenu.addItem(.separator())
 
         let quitItem = NSMenuItem(
-            title: "退出 GPT分析器",
+            title: "退出 91",
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
         )
@@ -1524,7 +1513,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         toolbar.addArrangedSubview(spacer)
         toolbar.addArrangedSubview(trendMetricControl)
 
-        let hint = NSTextField(labelWithString: "每次手动刷新或自动轮询都会追加历史；10 分钟内某分组总账号减少超过 100 会触发预警。")
+        let hint = NSTextField(labelWithString: "每次手动刷新或自动轮询都会追加历史。")
         hint.font = .systemFont(ofSize: 12, weight: .medium)
         hint.textColor = .secondaryLabelColor
         hint.maximumNumberOfLines = 1
@@ -1610,13 +1599,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         poolCredentialsButton.font = .systemFont(ofSize: 13, weight: .semibold)
         poolCredentialsButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 96).isActive = true
 
-        poolWarningButton.target = self
-        poolWarningButton.action = #selector(editWarningSettings)
-        poolWarningButton.bezelStyle = .rounded
-        poolWarningButton.controlSize = .large
-        poolWarningButton.font = .systemFont(ofSize: 13, weight: .semibold)
-        poolWarningButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 96).isActive = true
-
         let info = NSTextField(labelWithString: "平台共享容量池")
         info.font = .systemFont(ofSize: 13, weight: .semibold)
         info.textColor = .secondaryLabelColor
@@ -1638,7 +1620,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         right.addArrangedSubview(label("分钟"))
         right.addArrangedSubview(poolRefreshButton)
         right.addArrangedSubview(poolCredentialsButton)
-        right.addArrangedSubview(poolWarningButton)
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -2701,64 +2682,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }.resume()
     }
 
-    private func fetchSMTPSettingsFromServer(completion: @escaping (Result<SMTPSettings, Error>) -> Void) {
-        guard let url = URL(string: "\(analyzerServerBaseURL)/smtp-settings") else {
-            completion(.failure(AppError("服务器地址无效。")))
-            return
-        }
-        URLSession.shared.dataTask(with: url) { data, response, error in
-            DispatchQueue.main.async {
-                if let error {
-                    completion(.failure(error))
-                    return
-                }
-                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-                guard (200..<300).contains(statusCode), let data else {
-                    completion(.failure(AppError("HTTP \(statusCode)")))
-                    return
-                }
-                do {
-                    let decoded = try JSONDecoder().decode(SMTPSettingsResponse.self, from: data)
-                    completion(.success(decoded.settings))
-                } catch {
-                    completion(.failure(error))
-                }
-            }
-        }.resume()
-    }
-
-    private func saveSMTPSettingsToServer(_ settings: SMTPSettings) {
-        guard let url = URL(string: "\(analyzerServerBaseURL)/smtp-settings") else {
-            showError("服务器地址无效。")
-            return
-        }
-        guard let body = try? serverEncoder().encode(SMTPSettingsPayload(settings: settings)) else {
-            showError("预警设置编码失败。")
-            return
-        }
-        showFeedback("正在保存服务器预警设置...", color: .white, autoHide: false)
-        var request = URLRequest(url: url)
-        request.httpMethod = "PUT"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = body
-        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if let error {
-                    self.showError("服务器预警设置保存失败：\(error.localizedDescription)")
-                    return
-                }
-                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-                guard (200..<300).contains(statusCode) else {
-                    self.showError("服务器预警设置保存失败：HTTP \(statusCode)")
-                    return
-                }
-                self.showFeedback("服务器掉号预警设置已保存。", color: .systemGreen)
-                self.fetchServerState(manual: false)
-            }
-        }.resume()
-    }
-
     private func fetchPoolCredentialsFromServer(completion: @escaping (Result<PoolCredentials?, Error>) -> Void) {
         guard let url = URL(string: "\(analyzerServerBaseURL)/pool-credentials") else {
             completion(.failure(AppError("服务器地址无效。")))
@@ -3093,65 +3016,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         refreshOutput()
     }
 
-    @objc private func editWarningSettings() {
-        showFeedback("正在读取服务器预警设置...", color: .white, autoHide: false)
-        fetchSMTPSettingsFromServer { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .success(let settings):
-                self.smtpSettings = settings
-                self.presentWarningSettingsEditor(existing: settings)
-            case .failure(let error):
-                self.showError("服务器预警设置读取失败：\(error.localizedDescription)")
-            }
-        }
-    }
-
-    private func presentWarningSettingsEditor(existing: SMTPSettings) {
-        let alert = NSAlert()
-        alert.messageText = "掉号预警设置"
-        alert.informativeText = "配置保存在服务器，由服务器定时轮询时发送掉号预警。QQ 邮箱密码填 SMTP 授权码。"
-        alert.addButton(withTitle: "保存")
-        alert.addButton(withTitle: "取消")
-
-        let recipientField = NSTextField(string: existing.recipient)
-        recipientField.placeholderString = "预警收件邮箱"
-        let hostField = NSTextField(string: existing.host)
-        hostField.placeholderString = "SMTP 服务器"
-        let portField = NSTextField(string: "\(existing.port)")
-        portField.placeholderString = "端口"
-        let usernameField = NSTextField(string: existing.username)
-        usernameField.placeholderString = "发件邮箱账号"
-        let passwordField = NSSecureTextField(string: existing.password)
-        passwordField.placeholderString = "SMTP 授权码"
-        for field in [recipientField, hostField, portField, usernameField, passwordField] {
-            field.translatesAutoresizingMaskIntoConstraints = false
-            field.widthAnchor.constraint(equalToConstant: 360).isActive = true
-            field.heightAnchor.constraint(equalToConstant: 26).isActive = true
-        }
-        let stack = NSStackView(views: [recipientField, hostField, portField, usernameField, passwordField])
-        stack.orientation = .vertical
-        stack.spacing = 7
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 160))
-        container.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
-            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 8)
-        ])
-        alert.accessoryView = container
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        smtpSettings = SMTPSettings(
-            host: hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-            port: Int(portField.stringValue) ?? 465,
-            username: usernameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-            password: passwordField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-            recipient: normalizedEmail(recipientField.stringValue)
-        )
-        saveSMTPSettingsToServer(smtpSettings)
-    }
-
     @objc private func selectPoolGroups() {
         fetchServerState(manual: false)
         presentPoolGroupPicker()
@@ -3275,40 +3139,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         poolHistory.append(contentsOf: snapshots)
         trimPoolHistory()
-        checkPoolDropWarnings(for: snapshots)
         savePoolState()
         refreshOutput()
         let names = snapshots.map(\.groupName).joined(separator: "、")
         showFeedback("已同步 \(names)，新增 \(snapshots.count) 条历史。", color: .systemGreen)
-    }
-
-    private func checkPoolDropWarnings(for snapshots: [PoolSnapshot]) {
-        for snapshot in snapshots {
-            let windowStart = snapshot.date.addingTimeInterval(-10 * 60)
-            guard let baseline = poolHistory
-                .filter({ $0.groupName == snapshot.groupName && $0.date >= windowStart && $0.date < snapshot.date })
-                .min(by: { $0.date < $1.date }) else {
-                continue
-            }
-            let drop = baseline.total - snapshot.total
-            guard drop > 100 else { continue }
-            let minuteKey = Int(snapshot.date.timeIntervalSince1970 / 60)
-            let dedupKey = "\(snapshot.groupName):\(minuteKey)"
-            guard !poolWarningDedup.contains(dedupKey) else { continue }
-            poolWarningDedup.insert(dedupKey)
-            let message = "\(snapshot.groupName) 10 分钟内减少 \(drop) 个账号（\(baseline.total) -> \(snapshot.total)）。"
-            showFeedback("掉号预警：\(message)", color: .systemRed, autoHide: false)
-            sendPoolWarningEmailIfConfigured(subject: "GPT分析器掉号预警", body: message)
-        }
-    }
-
-    private func sendPoolWarningEmailIfConfigured(subject: String, body: String) {
-        guard !smtpSettings.recipient.isEmpty else { return }
-        guard !smtpSettings.host.isEmpty, !smtpSettings.username.isEmpty, !smtpSettings.password.isEmpty else {
-            showFeedback("掉号预警已触发；SMTP 未配置完整，未发送邮件。", color: .systemOrange, autoHide: false)
-            return
-        }
-        showFeedback("掉号预警已触发；邮件发送通道已配置，待接入 SMTP 发送。", color: .systemOrange, autoHide: false)
     }
 
     private func fetchQuotaDashboard(retryAfterLogin: Bool, completion: @escaping (Result<[APIGroupSummary], Error>) -> Void) {
@@ -4966,7 +4800,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             selectedGroups: selectedPoolGroups,
             availableGroups: availablePoolGroups,
             pollingMinutes: poolPollingMinutes,
-            warningEmail: smtpSettings.recipient,
             accessToken: poolAccessToken,
             refreshToken: poolRefreshToken
         )
@@ -5273,13 +5106,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         availablePoolGroups = state.availableGroups ?? ["PLUS共享号池", "K12共享号池"]
         poolPollingMinutes = normalizedPollingMinutes(state.pollingMinutes ?? defaultPollingMinutes)
         poolPollingField.stringValue = money(poolPollingMinutes)
-        smtpSettings = SMTPSettings(
-            host: SMTPSettings.default.host,
-            port: SMTPSettings.default.port,
-            username: "",
-            password: "",
-            recipient: state.warningEmail ?? SMTPSettings.default.recipient
-        )
         updatePoolGroupsLabel()
         poolAccessToken = state.accessToken
         poolRefreshToken = state.refreshToken
@@ -5386,27 +5212,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return nil
         }
         return try? JSONDecoder().decode(PoolCredentials.self, from: data)
-    }
-
-    private func saveSMTPSettings(_ settings: SMTPSettings) -> Bool {
-        guard let data = try? JSONEncoder().encode(settings) else { return false }
-        var query = keychainQuery(account: "pool-warning-smtp")
-        SecItemDelete(query as CFDictionary)
-        query[kSecValueData as String] = data
-        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        return SecItemAdd(query as CFDictionary, nil) == errSecSuccess
-    }
-
-    private func loadSMTPSettings() -> SMTPSettings? {
-        var query = keychainQuery(account: "pool-warning-smtp")
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data else {
-            return nil
-        }
-        return try? JSONDecoder().decode(SMTPSettings.self, from: data)
     }
 
     private func saveBalanceAccounts(_ accounts: [BalanceAccount]) -> Bool {

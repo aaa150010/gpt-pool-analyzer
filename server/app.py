@@ -1,22 +1,21 @@
 import asyncio
 import json
 import os
-import smtplib
 import sqlite3
 from collections.abc import Iterator
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.datastructures import UploadFile
 
 try:
     from .analytics import build_analytics
+    from .cost_ledger import CostLedger
+    from .pixel_routes import create_pixel_router
     from .pixel_manager import (
         MAX_UPLOAD_BYTES,
         PixelConfigError,
@@ -26,11 +25,13 @@ try:
         PixelManagerError,
         _safe_text,
         load_config as load_pixel_manager_config,
-        merge_credential_bundles,
-        parse_credential_bundle,
     )
+    from .withdrawal_service import WithdrawalService, initialize_withdrawal_schema
+    from .withdrawal_routes import create_withdrawal_router
 except ImportError:
     from analytics import build_analytics
+    from cost_ledger import CostLedger
+    from pixel_routes import create_pixel_router
     from pixel_manager import (
         MAX_UPLOAD_BYTES,
         PixelConfigError,
@@ -40,9 +41,9 @@ except ImportError:
         PixelManagerError,
         _safe_text,
         load_config as load_pixel_manager_config,
-        merge_credential_bundles,
-        parse_credential_bundle,
     )
+    from withdrawal_service import WithdrawalService, initialize_withdrawal_schema
+    from withdrawal_routes import create_withdrawal_router
 
 
 API_PREFIX = "/gpt-api"
@@ -60,9 +61,12 @@ STATE_HISTORY_SECONDS = 86400
 POOL_DASHBOARD_URL = "https://cf.ai-pixel.online/api/v1/accounts/quota-dashboard?timezone=Asia%2FShanghai"
 POOL_LOGIN_URL = "https://cf.ai-pixel.online/api/v1/auth/login"
 PIXEL_MANAGER_CONFIG_PATH = Path(os.getenv("PIXEL_MANAGER_CONFIG_PATH", "/data/pixel_manager.json"))
+PIXEL_HTTP_PROXY = str(os.getenv("PIXEL_HTTP_PROXY", "")).strip()
 pixel_manager: PixelManager | None = None
 pixel_import_jobs: PixelImportJobs | None = None
 pixel_export_jobs: PixelExportJobs | None = None
+withdrawal_worker_task: asyncio.Task[Any] | None = None
+withdrawal_wake_event = asyncio.Event()
 
 
 def initialize_pixel_manager() -> None:
@@ -74,9 +78,35 @@ def initialize_pixel_manager() -> None:
         pixel_import_jobs = None
         pixel_export_jobs = None
         return
-    pixel_manager = PixelManager(config)
+    direct_client_factory = lambda: httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0), follow_redirects=False
+    )
+    proxy_client_factory = (
+        lambda: httpx.AsyncClient(
+            proxies=PIXEL_HTTP_PROXY,
+            timeout=httpx.Timeout(30.0),
+            follow_redirects=False,
+        )
+        if PIXEL_HTTP_PROXY
+        else direct_client_factory
+    )
+    pixel_manager = PixelManager(
+        config,
+        client_factory=proxy_client_factory,
+        fallback_client_factory=direct_client_factory if PIXEL_HTTP_PROXY else None,
+    )
     pixel_import_jobs = PixelImportJobs(pixel_manager, record_callback=save_pixel_import_record)
     pixel_export_jobs = PixelExportJobs(pixel_manager, DATA_DIR / "pixel_exports")
+
+
+def set_pixel_import_jobs(value: PixelImportJobs) -> None:
+    global pixel_import_jobs
+    pixel_import_jobs = value
+
+
+def set_pixel_export_jobs(value: PixelExportJobs) -> None:
+    global pixel_export_jobs
+    pixel_export_jobs = value
 
 
 def require_pixel_manager(
@@ -191,6 +221,7 @@ def init_db() -> None:
             );
             """
         )
+        initialize_withdrawal_schema(conn)
         pool_columns = {row["name"] for row in conn.execute("PRAGMA table_info(pool_history)").fetchall()}
         migrations = {
             "capacity_5h": "ALTER TABLE pool_history ADD COLUMN capacity_5h INTEGER",
@@ -419,6 +450,7 @@ def flexible_int(value: Any, default: int = 0) -> int:
 
 def compact_stored_state(raw: dict[str, Any]) -> dict[str, Any]:
     state = dict(raw)
+    state["partnerCost"] = 0
     state.pop("history", None)
     state.pop("costAdditions", None)
     return state
@@ -452,6 +484,7 @@ def normalize_smtp_settings(raw: dict[str, Any]) -> dict[str, Any]:
         "port": flexible_int(raw.get("port"), 465),
         "username": str(raw.get("username") or "").strip(),
         "password": str(raw.get("password") or "").strip(),
+        "senderName": str(raw.get("senderName") or "").strip(),
         "recipient": str(raw.get("recipient") or "").strip(),
     }
 
@@ -492,6 +525,7 @@ def public_smtp_settings(raw: Any) -> dict[str, Any]:
         "port": settings["port"],
         "username": "",
         "password": "",
+        "senderName": settings["senderName"],
         "recipient": "",
         "hasUsername": bool(settings["username"]),
         "hasPassword": bool(settings["password"]),
@@ -582,86 +616,17 @@ def insert_pool_snapshot(snapshot: dict[str, Any]) -> None:
         )
 
 
-def warning_dedup_seen(key: str) -> bool:
-    values = get_setting("pool_warning_dedup", [])
-    if key in values:
-        return True
-    values.append(key)
-    set_setting("pool_warning_dedup", values[-500:])
-    return False
-
-
-def send_warning_email(subject: str, body: str) -> None:
-    settings = normalize_smtp_settings(get_setting("smtp_settings", {}))
-    if not settings["recipient"] or not settings["host"] or not settings["username"] or not settings["password"]:
-        set_setting("last_warning_email_error", {"time": utc_now(), "message": "smtp settings incomplete"})
-        return
-
-    message = EmailMessage()
-    message["Subject"] = subject
-    message["From"] = settings["username"]
-    message["To"] = settings["recipient"]
-    message.set_content(body)
-    try:
-        with smtplib.SMTP_SSL(settings["host"], int(settings["port"]), timeout=20) as smtp:
-            smtp.login(settings["username"], settings["password"])
-            smtp.send_message(message)
-        set_setting("last_warning_email", {"time": utc_now(), "subject": subject, "recipient": settings["recipient"]})
-    except Exception as exc:
-        set_setting("last_warning_email_error", {"time": utc_now(), "message": str(exc)})
-
-
-def check_pool_drop_warning(snapshot: dict[str, Any]) -> None:
-    group_name = snapshot.get("groupName") or snapshot.get("group_name") or ""
-    snapshot_time = parse_time(snapshot.get("date")) or datetime.now(timezone.utc)
-    snapshot_date = snapshot_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    window_start = (snapshot_time - timedelta(minutes=10)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    with connect() as conn:
-        baseline = conn.execute(
-            """
-            SELECT total FROM pool_history
-            WHERE group_name = ? AND date >= ? AND date < ?
-            ORDER BY date ASC, id ASC LIMIT 1
-            """,
-            (group_name, window_start, snapshot_date),
-        ).fetchone()
-    if not baseline:
-        return
-    drop = flexible_int(baseline["total"]) - flexible_int(snapshot.get("total"))
-    if drop <= 100:
-        return
-    minute_key = int(snapshot_time.timestamp() / 60)
-    dedup_key = f"{group_name}:{minute_key}"
-    if warning_dedup_seen(dedup_key):
-        return
-    body = f"{group_name} 10 分钟内减少 {drop} 个账号（{baseline['total']} -> {snapshot.get('total')}）。"
-    set_setting("last_pool_warning", {"time": snapshot_date, "message": body})
-    send_warning_email("GPT分析器掉号预警", body)
-
-
-def insert_cost_addition(item: dict[str, Any]) -> None:
-    with connect() as conn:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO cost_additions(id, date, note, amount, created_at)
-            VALUES(?, ?, ?, ?, ?)
-            """,
-            (
-                item.get("id") or f"server-{utc_now()}",
-                item.get("date") or utc_now(),
-                item.get("note") or "",
-                flexible_number(item.get("amount")),
-                item.get("createdAt") or item.get("created_at") or utc_now(),
-            ),
-        )
-
-
-def clear_cost_additions() -> float:
-    with connect() as conn:
-        row = conn.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM cost_additions").fetchone()
-        total = flexible_number(row["total"] if row else 0)
-        conn.execute("DELETE FROM cost_additions")
-    return total
+cost_ledger = CostLedger(
+    connect=connect,
+    dumps=dumps,
+    loads=loads,
+    utc_now=utc_now,
+    number=flexible_number,
+)
+insert_cost_addition = cost_ledger.insert
+clear_cost_additions = cost_ledger.clear_all
+cost_additions_snapshot = cost_ledger.list
+clear_cost_additions_if_snapshot = cost_ledger.clear_snapshot
 
 
 def balance_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -671,6 +636,12 @@ def balance_row(row: sqlite3.Row) -> dict[str, Any]:
         "amounts": loads(row["amounts"], []),
         "accounts": loads(row["accounts"], []),
     }
+
+
+def latest_balance_snapshot_for_withdrawal() -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM balance_history ORDER BY date DESC, id DESC LIMIT 1").fetchone()
+    return balance_row(row) if row else None
 
 
 def pool_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -765,19 +736,7 @@ def pool_history_page(group_name: str, cursor: int | None, limit: int) -> dict[s
     return {"items": items, "nextCursor": page_rows[-1]["id"] if has_more and page_rows else None, "hasMore": has_more}
 
 
-def cost_additions() -> list[dict[str, Any]]:
-    with connect() as conn:
-        rows = conn.execute("SELECT * FROM cost_additions ORDER BY date ASC, created_at ASC").fetchall()
-    return [
-        {
-            "id": row["id"],
-            "date": row["date"],
-            "note": row["note"],
-            "amount": row["amount"],
-            "createdAt": row["created_at"],
-        }
-        for row in rows
-    ]
+cost_additions = cost_ledger.list
 
 
 def current_state() -> dict[str, Any]:
@@ -939,7 +898,6 @@ async def poll_pools(client: httpx.AsyncClient) -> None:
     for summary in summaries:
         snapshot = pool_snapshot_from_summary(summary)
         insert_pool_snapshot(snapshot)
-        check_pool_drop_warning(snapshot)
 
 
 async def poll_once() -> None:
@@ -960,18 +918,40 @@ async def poll_loop() -> None:
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
+withdrawal_service = WithdrawalService(
+    connect=connect,
+    dumps=dumps,
+    loads=loads,
+    utc_now=utc_now,
+    parse_time=parse_time,
+    flexible_number=flexible_number,
+    get_setting=get_setting,
+    normalize_smtp_settings=normalize_smtp_settings,
+    latest_balance_snapshot=latest_balance_snapshot_for_withdrawal,
+    get_pixel_manager=lambda: pixel_manager,
+    initialize_pixel_manager=initialize_pixel_manager,
+    wake_event=withdrawal_wake_event,
+    cost_additions_snapshot=cost_additions_snapshot,
+    clear_cost_additions_if_snapshot=clear_cost_additions_if_snapshot,
+)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global withdrawal_worker_task
     init_db()
     initialize_pixel_manager()
     task = asyncio.create_task(poll_loop())
+    withdrawal_worker_task = asyncio.create_task(withdrawal_service.run_worker())
     try:
         yield
     finally:
         task.cancel()
+        withdrawal_worker_task.cancel()
+        await asyncio.gather(task, withdrawal_worker_task, return_exceptions=True)
 
 
-app = FastAPI(title="GPT Analyzer Server", lifespan=lifespan)
+app = FastAPI(title="91 Server", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -1032,328 +1012,40 @@ async def get_balance_history_page(
     return balance_history_page(cursor, limit)
 
 
-@app.get(f"{API_PREFIX}/pixel-manager/targets")
-async def get_pixel_targets(
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    return {"targets": manager.targets()}
+withdrawal_router, withdrawal_route_handlers = create_withdrawal_router(
+    api_prefix=API_PREFIX,
+    require_manager=require_pixel_manager,
+    pixel_http_error=pixel_http_error,
+    service=withdrawal_service,
+)
+app.include_router(withdrawal_router)
+withdrawal_plan_for_request = withdrawal_route_handlers.plan_for_request
+preview_withdrawal = withdrawal_route_handlers.preview
+list_withdrawals = withdrawal_route_handlers.list_jobs
+list_withdrawal_history = withdrawal_route_handlers.history
+create_withdrawal = withdrawal_route_handlers.create
+get_withdrawal = withdrawal_route_handlers.get
+accelerate_withdrawal = withdrawal_route_handlers.accelerate
 
 
-@app.get(f"{API_PREFIX}/pixel-manager/targets/{{target_id}}/accounts")
-async def get_pixel_accounts(
-    target_id: str,
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=50, alias="pageSize", ge=1, le=100),
-    search: str = Query(default="", max_length=120),
-    status: str = Query(default="", max_length=40),
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    try:
-        return await manager.list_accounts(
-            target_id,
-            page,
-            page_size,
-            search=search.strip(),
-            status=status,
-        )
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-
-
-@app.get(f"{API_PREFIX}/pixel-manager/import-records")
-async def get_pixel_import_records(
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    return {"records": pixel_import_records()}
-
-
-@app.get(f"{API_PREFIX}/pixel-manager/import-records/{{record_id}}")
-async def get_pixel_import_record(
-    record_id: str,
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    record = pixel_import_record(record_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="导入记录不存在")
-    return {"record": record}
-
-
-@app.post(f"{API_PREFIX}/pixel-manager/import-records/{{record_id}}/share")
-async def retry_pixel_import_record_share(
-    record_id: str,
-    payload: dict[str, Any],
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    record = pixel_import_record(record_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="导入记录不存在")
-    target_id = str(payload.get("targetId") or "").strip()
-    if not target_id:
-        raise HTTPException(status_code=400, detail="平台账号不能为空")
-    try:
-        result = await manager.share_accounts(target_id, payload.get("accountIds") or [])
-        updated = update_pixel_import_record_share(record_id, target_id, result)
-        return {"record": updated, "result": result}
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-
-
-@app.post(f"{API_PREFIX}/pixel-manager/import-records/{{record_id}}/delete")
-async def delete_pixel_import_record(
-    record_id: str,
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    record = pixel_import_record(record_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="导入记录不存在")
-    try:
-        result = await manager.delete_import_record(record)
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-    return {"record": update_pixel_import_record_delete(record_id, result), "result": result}
-
-
-@app.get(f"{API_PREFIX}/pixel-manager/targets/{{target_id}}/accounts/{{account_id}}/usage")
-async def get_pixel_account_usage(
-    target_id: str,
-    account_id: int,
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    try:
-        return await manager.account_usage(target_id, account_id)
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-
-
-@app.post(f"{API_PREFIX}/pixel-manager/targets/{{target_id}}/relogin")
-async def relogin_pixel_target(
-    target_id: str,
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    try:
-        return await manager.relogin(target_id)
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-
-
-@app.post(f"{API_PREFIX}/pixel-manager/targets/{{target_id}}/accounts/bulk-delete")
-async def bulk_delete_pixel_accounts(
-    target_id: str,
-    payload: dict[str, Any],
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    try:
-        return await manager.bulk_delete_accounts(target_id, payload.get("accountIds") or [])
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-
-
-@app.post(f"{API_PREFIX}/pixel-manager/targets/{{target_id}}/accounts/bulk-test")
-async def bulk_test_pixel_accounts(
-    target_id: str,
-    payload: dict[str, Any],
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    try:
-        return await manager.bulk_test_accounts(target_id, payload.get("accountIds") or [])
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-
-
-@app.post(f"{API_PREFIX}/pixel-manager/targets/{{target_id}}/accounts/bulk-update")
-async def bulk_update_pixel_accounts(
-    target_id: str,
-    payload: dict[str, Any],
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    try:
-        return await manager.bulk_update_accounts(
-            target_id,
-            payload.get("accountIds") or [],
-            share_mode=payload.get("shareMode") or ("public" if payload.get("makePublic") else None),
-            concurrency=payload.get("concurrency"),
-        )
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-
-
-@app.post(f"{API_PREFIX}/pixel-manager/import", status_code=202)
-async def create_pixel_import(
-    request: Request,
-    target_ids_json: str = Query(alias="targetIds"),
-    file_name: str | None = Query(default=None, alias="fileName"),
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    try:
-        target_ids = json.loads(target_ids_json)
-        if not isinstance(target_ids, list):
-            raise ValueError
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=400, detail="上传账号选择无效") from exc
-    content_length = request.headers.get("content-length")
-    if content_length and content_length.isdigit() and int(content_length) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="JSON 文件不能超过 50 MB")
-    payload_buffer = bytearray()
-    async for chunk in request.stream():
-        if len(payload_buffer) + len(chunk) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="JSON 文件不能超过 50 MB")
-        payload_buffer.extend(chunk)
-    payload = bytes(payload_buffer)
-    try:
-        bundle = parse_credential_bundle(file_name or "accounts.json", payload)
-        jobs = pixel_import_jobs
-        if jobs is None or jobs.manager is not manager:
-            jobs = PixelImportJobs(manager, record_callback=save_pixel_import_record)
-            globals()["pixel_import_jobs"] = jobs
-        return {"job": await jobs.create(bundle, target_ids)}
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-
-
-@app.post(f"{API_PREFIX}/pixel-manager/import-batch", status_code=202)
-async def create_pixel_import_batch(
-    request: Request,
-    target_ids_json: str = Query(alias="targetIds"),
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    try:
-        target_ids = json.loads(target_ids_json)
-        if not isinstance(target_ids, list):
-            raise ValueError
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=400, detail="上传账号选择无效") from exc
-
-    uploads: list[UploadFile] = []
-    try:
-        form = await request.form()
-        uploads = [item for item in form.getlist("files") if isinstance(item, UploadFile)]
-        if not uploads:
-            raise PixelValidationError("至少选择一个 JSON 文件")
-        if len(uploads) > 100:
-            raise PixelValidationError("一次最多选择 100 个 JSON 文件")
-        total_bytes = 0
-        bundles = []
-        for upload in uploads:
-            content = await upload.read(MAX_UPLOAD_BYTES + 1)
-            total_bytes += len(content)
-            if total_bytes > MAX_UPLOAD_BYTES:
-                raise PixelManagerError("批量 JSON 文件合计不能超过 50 MB", 413)
-            bundles.append(parse_credential_bundle(upload.filename or "accounts.json", content))
-        bundle = merge_credential_bundles(bundles)
-        jobs = pixel_import_jobs
-        if jobs is None or jobs.manager is not manager:
-            jobs = PixelImportJobs(manager, record_callback=save_pixel_import_record)
-            globals()["pixel_import_jobs"] = jobs
-        return {"job": await jobs.create(bundle, target_ids)}
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-    finally:
-        for upload in uploads:
-            await upload.close()
-
-
-@app.get(f"{API_PREFIX}/pixel-manager/import-jobs/{{job_id}}")
-async def get_pixel_import_job(
-    job_id: str,
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    jobs = pixel_import_jobs
-    if jobs is None or jobs.manager is not manager:
-        raise HTTPException(status_code=404, detail="导入任务不存在")
-    try:
-        return {"job": jobs.get(job_id)}
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-
-
-@app.post(f"{API_PREFIX}/pixel-manager/targets/{{target_id}}/share")
-async def share_pixel_accounts(
-    target_id: str,
-    payload: dict[str, Any],
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    try:
-        return await manager.share_accounts(target_id, payload.get("accountIds") or [])
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-
-
-@app.get(f"{API_PREFIX}/pixel-manager/export")
-async def export_pixel_accounts(
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> Response:
-    try:
-        export = await manager.export_all()
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    return Response(
-        content=export.content,
-        media_type="application/json",
-        headers={
-            "Content-Disposition": f'attachment; filename="pixel-accounts-{stamp}.json"',
-            "X-Pixel-Source-Count": str(export.source_count),
-            "X-Pixel-Deduplicated-Count": str(export.deduplicated_count),
-            "X-Pixel-Duplicate-Count": str(export.duplicate_count),
-            "X-Pixel-Batch-Count": str(export.batch_count),
-            "Cache-Control": "no-store, max-age=0",
-            "Pragma": "no-cache",
-        },
-    )
-
-
-@app.post(f"{API_PREFIX}/pixel-manager/export-jobs", status_code=202)
-async def create_pixel_export_job(
-    payload: dict[str, Any],
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    jobs = pixel_export_jobs
-    if jobs is None or jobs.manager is not manager:
-        jobs = PixelExportJobs(manager, DATA_DIR / "pixel_exports")
-        globals()["pixel_export_jobs"] = jobs
-    if not payload.get("deleteAllAndReimport"):
-        raise HTTPException(status_code=400, detail="汇总整理任务必须确认删除并重新导入")
-    try:
-        return {"job": await jobs.create_rebuild(payload.get("targetIds") or [])}
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-
-
-@app.get(f"{API_PREFIX}/pixel-manager/export-jobs/{{job_id}}")
-async def get_pixel_export_job(
-    job_id: str,
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> dict[str, Any]:
-    jobs = pixel_export_jobs
-    if jobs is None or jobs.manager is not manager:
-        raise HTTPException(status_code=404, detail="汇总整理任务不存在")
-    try:
-        return {"job": jobs.get(job_id)}
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-
-
-@app.get(f"{API_PREFIX}/pixel-manager/export-jobs/{{job_id}}/download")
-async def download_pixel_export_job_backup(
-    job_id: str,
-    manager: PixelManager = Depends(require_pixel_manager),
-) -> Response:
-    jobs = pixel_export_jobs
-    if jobs is None or jobs.manager is not manager:
-        raise HTTPException(status_code=404, detail="汇总整理任务不存在")
-    try:
-        file_name, content = jobs.backup_content(job_id)
-    except PixelManagerError as exc:
-        raise pixel_http_error(exc) from exc
-    return Response(
-        content=content,
-        media_type="application/json",
-        headers={
-            "Content-Disposition": f'attachment; filename="{file_name}"',
-            "Cache-Control": "no-store, max-age=0",
-            "Pragma": "no-cache",
-        },
-    )
+pixel_router = create_pixel_router(
+    api_prefix=API_PREFIX,
+    require_manager=require_pixel_manager,
+    pixel_http_error=pixel_http_error,
+    connect=connect,
+    import_records=pixel_import_records,
+    import_record=pixel_import_record,
+    update_import_delete=update_pixel_import_record_delete,
+    update_import_share=update_pixel_import_record_share,
+    save_import_record=save_pixel_import_record,
+    get_import_jobs=lambda: pixel_import_jobs,
+    set_import_jobs=set_pixel_import_jobs,
+    get_export_jobs=lambda: pixel_export_jobs,
+    set_export_jobs=set_pixel_export_jobs,
+    get_data_dir=lambda: DATA_DIR,
+    get_max_upload_bytes=lambda: MAX_UPLOAD_BYTES,
+)
+app.include_router(pixel_router)
 
 
 @app.post(f"{API_PREFIX}/bootstrap")
@@ -1471,13 +1163,9 @@ async def update_smtp_settings(payload: dict[str, Any]) -> dict[str, Any]:
     existing = normalize_smtp_settings(get_setting("smtp_settings", {}))
     settings["username"] = settings["username"] or existing["username"]
     settings["password"] = settings["password"] or existing["password"]
+    settings["senderName"] = settings["senderName"] or existing["senderName"]
     settings["recipient"] = settings["recipient"] or existing["recipient"]
-    if not settings["recipient"]:
-        raise HTTPException(status_code=400, detail="recipient required")
     set_setting("smtp_settings", settings)
-    pool_state = compact_pool_state(get_setting("pool_state", {}))
-    pool_state["warningEmail"] = settings["recipient"]
-    set_setting("pool_state", pool_state)
     return {"ok": True}
 
 

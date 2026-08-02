@@ -162,6 +162,7 @@ class DatabaseTests(unittest.TestCase):
                 "port": 465,
                 "username": "mailer@example.com",
                 "password": "smtp-secret",
+                "senderName": "91 通知",
                 "recipient": "ops@example.com",
             },
         )
@@ -195,6 +196,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(smtp_response["settings"]["host"], "smtp.example.com")
         self.assertEqual(smtp_response["settings"]["username"], "")
         self.assertEqual(smtp_response["settings"]["password"], "")
+        self.assertEqual(smtp_response["settings"]["senderName"], "91 通知")
         self.assertEqual(smtp_response["settings"]["recipient"], "")
         self.assertTrue(smtp_response["settings"]["hasUsername"])
         self.assertTrue(smtp_response["settings"]["hasPassword"])
@@ -215,6 +217,7 @@ class DatabaseTests(unittest.TestCase):
                 "port": 465,
                 "username": "mailer@example.com",
                 "password": "smtp-secret",
+                "senderName": "Existing Sender",
                 "recipient": "old-ops@example.com",
             },
         )
@@ -237,6 +240,7 @@ class DatabaseTests(unittest.TestCase):
                         "port": 587,
                         "username": "",
                         "password": "",
+                        "senderName": "",
                         "recipient": "",
                     }
                 }
@@ -248,6 +252,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(app.get_setting("pool_credentials", {})["email"], "old@example.com")
         self.assertEqual(app.get_setting("smtp_settings", {})["password"], "smtp-secret")
         self.assertEqual(app.get_setting("smtp_settings", {})["username"], "mailer@example.com")
+        self.assertEqual(app.get_setting("smtp_settings", {})["senderName"], "Existing Sender")
         self.assertEqual(app.get_setting("smtp_settings", {})["recipient"], "old-ops@example.com")
         self.assertEqual(app.get_setting("smtp_settings", {})["host"], "smtp2.example.com")
 

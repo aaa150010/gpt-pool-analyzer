@@ -61,21 +61,21 @@ RELEASE_DIR="$PROJECT_DIR/build/release"
 rm -rf "$RELEASE_DIR"
 mkdir -p "$RELEASE_DIR"
 
-cp "dist/GPT分析器.zip" "$RELEASE_DIR/GPT分析器-$VERSION.zip"
+cp "dist/91.zip" "$RELEASE_DIR/91-$VERSION.zip"
 
 RELEASE_ASSETS=(
-    "$RELEASE_DIR/GPT分析器-$VERSION.zip"
+    "$RELEASE_DIR/91-$VERSION.zip"
     "$RELEASE_DIR/SHA256SUMS.txt"
 )
 
-if [[ -f "dist/GPT分析器.dmg" ]]; then
-    cp "dist/GPT分析器.dmg" "$RELEASE_DIR/GPT分析器-$VERSION.dmg"
-    RELEASE_ASSETS=("$RELEASE_DIR/GPT分析器-$VERSION.dmg" "${RELEASE_ASSETS[@]}")
+if [[ -f "dist/91.dmg" ]]; then
+    cp "dist/91.dmg" "$RELEASE_DIR/91-$VERSION.dmg"
+    RELEASE_ASSETS=("$RELEASE_DIR/91-$VERSION.dmg" "${RELEASE_ASSETS[@]}")
 fi
 
-shasum -a 256 "$RELEASE_DIR/GPT分析器-$VERSION.zip" > "$RELEASE_DIR/SHA256SUMS.txt"
-if [[ -f "$RELEASE_DIR/GPT分析器-$VERSION.dmg" ]]; then
-    shasum -a 256 "$RELEASE_DIR/GPT分析器-$VERSION.dmg" >> "$RELEASE_DIR/SHA256SUMS.txt"
+shasum -a 256 "$RELEASE_DIR/91-$VERSION.zip" > "$RELEASE_DIR/SHA256SUMS.txt"
+if [[ -f "$RELEASE_DIR/91-$VERSION.dmg" ]]; then
+    shasum -a 256 "$RELEASE_DIR/91-$VERSION.dmg" >> "$RELEASE_DIR/SHA256SUMS.txt"
 fi
 
 if [[ -n "$(git status --porcelain -- Info.plist RELEASE_NOTES.md package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock)" ]]; then
@@ -90,12 +90,12 @@ gh release create "$TAG" \
     --repo "$REPOSITORY" \
     --target "$(git rev-parse HEAD)" \
     --draft \
-    --title "GPT分析器 $VERSION" \
+    --title "91 $VERSION" \
     --notes-file RELEASE_NOTES.md
 
 gh release edit "$TAG" --repo "$REPOSITORY" --draft=false
 git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
 
-rm -rf "$PROJECT_DIR/build/GPT分析器.app" "$PROJECT_DIR/build/dmg-stage"
+rm -rf "$PROJECT_DIR/build/91.app" "$PROJECT_DIR/build/dmg-stage"
 
 echo "Release $TAG is available at https://github.com/$REPOSITORY/releases/tag/$TAG"

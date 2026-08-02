@@ -816,6 +816,7 @@ class PixelManager:
         config: PixelManagerConfig,
         *,
         client_factory: Callable[[], httpx.AsyncClient] | None = None,
+        fallback_client_factory: Callable[[], httpx.AsyncClient] | None = None,
         clock: Callable[[], float] = time.monotonic,
         inter_target_delay_seconds: float = 30.0,
         sleeper: Callable[[float], Any] = asyncio.sleep,
@@ -825,6 +826,7 @@ class PixelManager:
         self._client_factory = client_factory or (
             lambda: httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=False)
         )
+        self._fallback_client_factory = fallback_client_factory
         self._tokens: dict[str, TokenState] = {}
         self._token_locks = {target_id: asyncio.Lock() for target_id in config.targets}
         self._operation_locks = {target_id: asyncio.Lock() for target_id in config.targets}
@@ -912,8 +914,8 @@ class PixelManager:
                     json=login_payload,
                     headers={"Accept": "application/json", "x-user-ui-request": "1"},
                 )
-            except httpx.HTTPError as exc:
-                raise PixelManagerError("平台登录连接失败") from exc
+            except httpx.HTTPError:
+                raise
             if not response.is_success:
                 raise PixelManagerError(f"平台登录失败（HTTP {response.status_code}）")
             try:
@@ -952,8 +954,40 @@ class PixelManager:
         timeout: float | None = None,
         retry_transient: bool = False,
     ) -> dict[str, Any]:
+        factories = [self._client_factory]
+        if self._fallback_client_factory is not None:
+            factories.append(self._fallback_client_factory)
+        for index, factory in enumerate(factories):
+            try:
+                return await self._request_once(
+                    factory,
+                    target,
+                    method,
+                    path,
+                    params=params,
+                    json_body=json_body,
+                    timeout=timeout,
+                    retry_transient=retry_transient,
+                )
+            except httpx.HTTPError as exc:
+                if index + 1 == len(factories):
+                    raise PixelManagerError("平台连接失败") from exc
+        raise PixelManagerError("平台连接失败")
+
+    async def _request_once(
+        self,
+        client_factory: Callable[[], httpx.AsyncClient],
+        target: PixelTarget,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        timeout: float | None = None,
+        retry_transient: bool = False,
+    ) -> dict[str, Any]:
         try:
-            async with self._client_factory() as client:
+            async with client_factory() as client:
                 token = await self._authenticate(target, client)
                 attempts = 3 if retry_transient else 1
                 request_timeout = timeout if timeout is not None else DEFAULT_PLATFORM_TIMEOUT_SECONDS
@@ -1016,8 +1050,8 @@ class PixelManager:
                 return await self._decode_response(response)
         except PixelManagerError:
             raise
-        except httpx.HTTPError as exc:
-            raise PixelManagerError("平台连接失败") from exc
+        except httpx.HTTPError:
+            raise
 
     async def _account_page(
         self,
@@ -1126,6 +1160,36 @@ class PixelManager:
             "source": _safe_text(data.get("source"), 20) or "local",
             "updatedAt": data.get("updated_at"),
         }
+
+    async def submit_withdrawal(
+        self, target_id: str, amount: int, payment_method: str
+    ) -> dict[str, Any]:
+        if amount < 1:
+            raise PixelValidationError("提现金额必须至少为 1 元")
+        if payment_method not in {"wechat", "alipay"}:
+            raise PixelValidationError("提现方式无效")
+        target = self._target(target_id)
+        async with self._operation_locks[target.id]:
+            return await self._request(
+                target,
+                "POST",
+                "/api/v1/user/withdrawals",
+                json_body={"amount": amount, "payment_method": payment_method},
+                timeout=30,
+            )
+
+    async def receipt_code(self, target_id: str, payment_method: str) -> dict[str, Any] | None:
+        if payment_method not in {"wechat", "alipay"}:
+            raise PixelValidationError("提现方式无效")
+        target = self._target(target_id)
+        payload = await self._request(
+            target,
+            "GET",
+            "/api/v1/user/receipt-code",
+            params={"payment_method": payment_method},
+        )
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        return data if isinstance(data, dict) and data else None
 
     async def relogin(self, target_id: str) -> dict[str, Any]:
         target = self._target(target_id)

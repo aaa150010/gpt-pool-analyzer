@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_NAME="GPT分析器"
+APP_NAME="91"
 OUTPUT_DIR="$PROJECT_DIR/dist"
 STAGE_DIR="$PROJECT_DIR/build/dmg-stage"
 TAURI_APP="$PROJECT_DIR/src-tauri/target/release/bundle/macos/$APP_NAME.app"
@@ -22,7 +22,7 @@ if swift "$PROJECT_DIR/tools/generate_icon.swift" "$PROJECT_DIR/build/AppIcon.ic
     python3 "$PROJECT_DIR/tools/pngs_to_icns.py" "$PROJECT_DIR/build/AppIcon.iconset" "$PROJECT_DIR/src-tauri/icons/icon.icns"
     cp "$PROJECT_DIR/build/AppIcon.iconset/icon_512x512.png" "$PROJECT_DIR/src-tauri/icons/icon.png"
 else
-    echo "Warning: Swift icon generation failed; reusing the checked-in GPT分析器 icons." >&2
+    echo "Warning: Swift icon generation failed; reusing the checked-in 91 icons." >&2
     if [[ ! -f "$PROJECT_DIR/src-tauri/icons/icon.icns" || ! -f "$PROJECT_DIR/src-tauri/icons/icon.png" ]]; then
         echo "Checked-in icons are missing." >&2
         exit 1
@@ -41,6 +41,8 @@ codesign --verify --deep --strict "$TAURI_APP"
 
 ditto -c -k --sequesterRsrc --keepParent "$TAURI_APP" "$ZIP_PATH"
 
+# Tauri's build cleanup may remove the project build directory.
+mkdir -p "$STAGE_DIR"
 cp -R "$TAURI_APP" "$STAGE_DIR/$APP_NAME.app"
 ln -s /Applications "$STAGE_DIR/Applications"
 if ! hdiutil create \

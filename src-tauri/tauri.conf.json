@@ -1,6 +1,6 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "GPT分析器",
+  "productName": "91",
   "version": "2.2.4",
   "identifier": "local.gpt.cost.calculator",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "GPT分析器",
+        "title": "91",
         "width": 1360,
         "height": 880,
         "minWidth": 1180,

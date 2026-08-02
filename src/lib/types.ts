@@ -31,6 +31,7 @@ export type StoredState = {
   partnerCost?: number;
   manualBaseTotal?: number;
   withdrawalAmount?: number;
+  withdrawalAmountManual?: boolean;
   useBaseDeduction?: boolean;
   baseDeductionAmount?: number;
   initial?: Snapshot;
@@ -67,7 +68,6 @@ export type PoolAnalyzerState = {
   selectedGroups?: string[];
   availableGroups?: string[];
   pollingMinutes?: number;
-  warningEmail?: string;
   accessToken?: string;
   refreshToken?: string;
   analyticsGroup?: string;
@@ -286,12 +286,73 @@ export type PoolCredentials = {
   password: string;
 };
 
-export type SMTPSettings = {
-  host: string;
-  port: number;
-  username: string;
-  password: string;
-  recipient: string;
+export type WithdrawalMode = "cost" | "full";
+
+export type WithdrawalItem = {
+  itemId?: number;
+  sequence: number;
+  email: string;
+  targetId?: string;
+  owner: "owner" | "partner";
+  ownerLabel: string;
+  paymentMethod: "wechat" | "alipay";
+  balance: number;
+  amount: number;
+  status: "queued" | "waiting" | "running" | "submitted" | "skipped" | "failed";
+  statusLabel?: string;
+  error?: string | null;
+  submittedAt?: string | null;
+};
+
+export type WithdrawalSettlement = {
+  gross: number;
+  cost: number;
+  profit: number;
+  ownerActual: number;
+  partnerActual: number;
+  ownerExpected: number;
+  partnerExpected: number;
+  partnerToOwner: number;
+  ownerToPartner: number;
+  roundingRemainder: number;
+  costRecovery: number;
+  unrecoveredCost: number;
+};
+
+export type WithdrawalPlan = {
+  mode: WithdrawalMode;
+  requestedAmount: number;
+  totalAmount: number;
+  cost: number;
+  balanceSnapshotAt: string;
+  balanceSnapshotTotal?: number | null;
+  costHistory?: CostAddition[];
+  costHistoryTotal?: number;
+  settlement: WithdrawalSettlement;
+  items: WithdrawalItem[];
+};
+
+export type WithdrawalJob = WithdrawalPlan & {
+  jobId: string;
+  status: "queued" | "waiting" | "running" | "completed" | "failed";
+  currentSequence: number;
+  nextRunAt: string | null;
+  error: string | null;
+  postWithdrawalCost?: number | null;
+  postWithdrawalBalance?: number | null;
+  discountedProfit?: number | null;
+  costClearedAt?: string | null;
+  costClearedAmount?: number;
+  costSettlementStatus?: "pending" | "cleared" | "already_cleared" | "not_recovered" | "not_applicable";
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type WithdrawalHistoryResponse = {
+  jobs: WithdrawalJob[];
+  total: number;
+  limit: number;
+  offset: number;
 };
 
 export type ServerStateResponse = {

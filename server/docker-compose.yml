@@ -7,6 +7,7 @@ services:
       DATA_DIR: /data
       POLL_INTERVAL_SECONDS: "300"
       PIXEL_MANAGER_CONFIG_PATH: "/data/pixel_manager.json"
+      PIXEL_HTTP_PROXY: "http://mihomo-sub2:7890"
       TZ: Asia/Shanghai
     volumes:
       - ./data:/data
@@ -15,7 +16,10 @@ services:
     networks:
       - default
       - note_default
+      - json-card-system_default
 
 networks:
   note_default:
+    external: true
+  json-card-system_default:
     external: true

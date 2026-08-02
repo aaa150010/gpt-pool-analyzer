@@ -19,8 +19,11 @@ import type {
   ServerRefreshResponse,
   ServerStateResponse,
   Snapshot,
-  SMTPSettings,
   StoredState,
+  WithdrawalHistoryResponse,
+  WithdrawalJob,
+  WithdrawalPlan,
+  WithdrawalMode,
 } from "./types";
 
 const API_BASE = import.meta.env.DEV ? "/gpt-api" : "https://lynote.xyz/gpt-api";
@@ -30,6 +33,8 @@ let pixelManagerKeyPromise: Promise<string> | null = null;
 async function pixelManagerKey(): Promise<string> {
   const previewKey = import.meta.env.DEV ? import.meta.env.VITE_PIXEL_MANAGER_API_KEY : "";
   if (previewKey) return previewKey;
+  const isTauriRuntime = "__TAURI_INTERNALS__" in globalThis || "__TAURI__" in globalThis;
+  if (!isTauriRuntime) return "";
   if (!pixelManagerKeyPromise) {
     pixelManagerKeyPromise = import("@tauri-apps/api/core")
       .then(({ invoke }) => invoke<string>("pixel_manager_api_key"))
@@ -166,12 +171,22 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ credentials }),
     }),
-  smtpSettings: () => requestJson<{ settings: SMTPSettings }>("/smtp-settings"),
-  updateSmtpSettings: (settings: SMTPSettings) =>
-    requestJson<{ ok: boolean }>("/smtp-settings", {
-      method: "PUT",
-      body: JSON.stringify({ settings }),
+  withdrawalPreview: (mode: WithdrawalMode, amount?: number) => {
+    const params = new URLSearchParams({ mode });
+    if (amount !== undefined) params.set("amount", String(amount));
+    return requestPixelJson<WithdrawalPlan>(`/withdrawals/preview?${params.toString()}`);
+  },
+  withdrawals: () => requestPixelJson<{ job: WithdrawalJob | null }>("/withdrawals"),
+  withdrawalHistory: (limit = 20, offset = 0) =>
+    requestPixelJson<WithdrawalHistoryResponse>(`/withdrawals/history?limit=${limit}&offset=${offset}`),
+  createWithdrawal: (mode: WithdrawalMode, amount?: number) =>
+    requestPixelJson<{ job: WithdrawalJob }>("/withdrawals", {
+      method: "POST",
+      body: JSON.stringify({ mode, ...(amount === undefined ? {} : { amount }) }),
     }),
+  withdrawal: (jobId: string) => requestPixelJson<{ job: WithdrawalJob }>(`/withdrawals/${encodeURIComponent(jobId)}`),
+  accelerateWithdrawal: (jobId: string) =>
+    requestPixelJson<{ job: WithdrawalJob }>(`/withdrawals/${encodeURIComponent(jobId)}/accelerate`, { method: "POST" }),
   pixelTargets: () => requestPixelJson<{ targets: PixelTarget[] }>("/pixel-manager/targets"),
   pixelAccounts: (targetId: string, page = 1, pageSize = 50, status = "", search = "") => {
     const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
@@ -231,6 +246,8 @@ export const api = {
       `/pixel-manager/import-records/${encodeURIComponent(recordId)}/delete`,
       { method: "POST" },
     ),
+  pixelRemoveImportRecord: (recordId: string) =>
+    requestPixelJson<{ ok: boolean }>(`/pixel-manager/import-records/${encodeURIComponent(recordId)}`, { method: "DELETE" }),
   pixelShare: (targetId: string, accountIds: number[]) =>
     requestPixelJson<PixelShareResponse>(`/pixel-manager/targets/${encodeURIComponent(targetId)}/share`, {
       method: "POST",
