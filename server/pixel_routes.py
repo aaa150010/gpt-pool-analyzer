@@ -267,6 +267,19 @@ def create_pixel_router(
         except PixelManagerError as exc:
             raise pixel_http_error(exc) from exc
 
+    @router.post("/pixel-manager/import-jobs/{job_id}/accelerate")
+    async def accelerate_import_job(
+        job_id: str,
+        manager: Any = Depends(require_manager),
+    ) -> dict[str, Any]:
+        jobs = get_import_jobs()
+        if jobs is None or jobs.manager is not manager:
+            raise HTTPException(status_code=404, detail="导入任务不存在")
+        try:
+            return {"job": await jobs.accelerate(job_id)}
+        except PixelManagerError as exc:
+            raise pixel_http_error(exc) from exc
+
     @router.post("/pixel-manager/targets/{target_id}/share")
     async def share_accounts(
         target_id: str,

@@ -1876,6 +1876,7 @@ class PixelManager:
             prepared = build_target_credential_bundle(bundle, used_emails)
             results.append(await self._import_target(self._target(target_id), prepared))
             if index + 1 < len(normalized) and self._inter_target_delay_seconds:
+                wait_handled = False
                 if progress_callback:
                     update = progress_callback(
                         {
@@ -1888,8 +1889,10 @@ class PixelManager:
                         }
                     )
                     if asyncio.iscoroutine(update):
-                        await update
-                await self._sleeper(self._inter_target_delay_seconds)
+                        update = await update
+                    wait_handled = update is True
+                if not wait_handled:
+                    await self._sleeper(self._inter_target_delay_seconds)
         return {
             "ok": all(item["status"] == "success" for item in results),
             "sourceFileName": bundle.source_file_name,
@@ -1990,8 +1993,10 @@ class PixelImportJobs:
                 "completedTargets": 0,
                 "totalTargets": len(normalized),
                 "waitSeconds": 0,
+                "nextRunAt": None,
                 "results": [],
                 "error": None,
+                "_accelerateEvent": asyncio.Event(),
             }
             self._jobs[job_id] = job
             self._tasks[job_id] = asyncio.create_task(
@@ -2006,10 +2011,34 @@ class PixelImportJobs:
         job = self._jobs[job_id]
         job.update({"status": "running", "phase": "processing", "updatedAt": _utc_now()})
 
-        async def progress(update: dict[str, Any]) -> None:
+        async def progress(update: dict[str, Any]) -> bool:
+            if update.get("phase") != "waiting":
+                job.update(update)
+                job["status"] = "running"
+                job["nextRunAt"] = None
+                job["updatedAt"] = _utc_now()
+                return False
+
+            wait_seconds = max(float(update.get("waitSeconds") or 0), 0.0)
+            accelerate_event: asyncio.Event = job["_accelerateEvent"]
+            accelerate_event.clear()
             job.update(update)
             job["status"] = "running"
             job["updatedAt"] = _utc_now()
+            job["nextRunAt"] = datetime.fromtimestamp(
+                time.time() + wait_seconds,
+                tz=timezone.utc,
+            ).isoformat()
+            try:
+                await asyncio.wait_for(accelerate_event.wait(), timeout=wait_seconds)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                accelerate_event.clear()
+                job["waitSeconds"] = 0
+                job["nextRunAt"] = None
+                job["updatedAt"] = _utc_now()
+            return True
 
         try:
             result = await self.manager.import_bundle(bundle, target_ids, progress)
@@ -2035,6 +2064,7 @@ class PixelImportJobs:
                     "currentTargetId": None,
                     "completedTargets": len(target_ids),
                     "waitSeconds": 0,
+                    "nextRunAt": None,
                     "results": result["results"],
                     "updatedAt": _utc_now(),
                 }
@@ -2072,7 +2102,33 @@ class PixelImportJobs:
         job = self._jobs.get(str(job_id or ""))
         if job is None:
             raise PixelManagerError("导入任务不存在", 404)
-        return self._public_job(job)
+        public = self._public_job(job)
+        if public.get("phase") == "waiting" and public.get("nextRunAt"):
+            try:
+                deadline = datetime.fromisoformat(str(public["nextRunAt"]).replace("Z", "+00:00"))
+                public["waitSeconds"] = max(
+                    math.ceil((deadline - datetime.now(timezone.utc)).total_seconds()),
+                    0,
+                )
+            except (TypeError, ValueError):
+                pass
+        return public
+
+    async def accelerate(self, job_id: str) -> dict[str, Any]:
+        async with self._lock:
+            job = self._jobs.get(str(job_id or ""))
+            if job is None:
+                raise PixelManagerError("导入任务不存在", 404)
+            if job.get("status") != "running" or job.get("phase") != "waiting":
+                raise PixelManagerError("当前导入任务没有可加速的等待步骤", 409)
+            accelerate_event = job.get("_accelerateEvent")
+            if not isinstance(accelerate_event, asyncio.Event):
+                raise PixelManagerError("当前导入任务无法加速", 409)
+            job["waitSeconds"] = 0
+            job["nextRunAt"] = _utc_now()
+            job["updatedAt"] = _utc_now()
+            accelerate_event.set()
+            return self._public_job(job)
 
 
 class PixelExportJobs:

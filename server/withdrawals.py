@@ -89,6 +89,8 @@ def plan_withdrawal(
 
     total_cost = round(max(_money(cost), 0.0), 2)
     if mode == "cost":
+        if total_cost <= 0:
+            raise ValueError("当前没有待回收成本，请切换到全部提现")
         if requested_amount is None:
             target = max(int(math.ceil(total_cost - 1e-9)), 0)
         else:
@@ -230,8 +232,13 @@ def render_withdrawal_email(job: dict[str, Any], status: str = "已完成") -> t
     cost_status = job.get("costSettlementStatus")
     if cost_status == "cleared":
         lines.append(
-            f"成本历史处理：本次成本已收回，已自动清空任务快照中的成本记录，"
-            f"共 {float(job.get('costClearedAmount') or 0):.2f} 元。"
+            f"成本处理：各账号提交成功后已逐笔冲减，共回收 "
+            f"{float(job.get('costClearedAmount') or 0):.2f} 元，当前总成本 {float(post_cost):.2f} 元。"
+        )
+    elif cost_status == "partial":
+        lines.append(
+            f"成本处理：已逐笔回收 {float(job.get('costClearedAmount') or 0):.2f} 元，"
+            f"尚余 {float(post_cost):.2f} 元成本继续保留。"
         )
     elif cost_status == "already_cleared":
         lines.append("成本历史处理：任务快照中的记录此前已清空，本次未重复扣减。")
@@ -266,7 +273,8 @@ def render_withdrawal_email(job: dict[str, Any], status: str = "已完成") -> t
         lines.append(
             f"{item.get('email', '-'):<22} {item.get('ownerLabel', '-'):<10} "
             f"{float(item.get('amount') or 0):.0f} 元  "
-            f"{item.get('statusLabel') or item.get('status') or '-'}{reason}"
+            f"{item.get('statusLabel') or item.get('status') or '-'}  "
+            f"冲减成本 {float(item.get('costRecoveredAmount') or 0):.2f} 元{reason}"
         )
     settlement_lines = [
         "",

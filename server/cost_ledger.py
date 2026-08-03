@@ -108,3 +108,80 @@ class CostLedger:
             "clearedCount": len(rows),
             "remainingCost": stored["cost"],
         }
+
+    def recover_snapshot(self, conn: Any, snapshot: list[dict[str, Any]], amount: float) -> dict[str, Any]:
+        """Apply one successful withdrawal to the live cost ledger.
+
+        Frozen rows are consumed oldest-first. Costs added after the withdrawal
+        task was created are never edited, while the stored total also supports
+        legacy costs that do not have a matching history row.
+        """
+        requested_cents = max(int(round(self._number(amount, 0) * 100)), 0)
+        stored_row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'stored_state'"
+        ).fetchone()
+        stored = self._loads(stored_row["value"], {}) if stored_row else {}
+        live_cents = max(int(round(self._number(stored.get("cost"), 0) * 100)), 0)
+        recovered_cents = min(requested_cents, live_cents)
+        if recovered_cents <= 0:
+            return {
+                "recoveredAmount": 0.0,
+                "remainingCost": live_cents / 100,
+                "updatedRows": 0,
+            }
+
+        ordered_snapshot: list[tuple[str, int]] = []
+        seen_ids: set[str] = set()
+        for item in snapshot:
+            item_id = str(item.get("id") or "").strip()
+            if not item_id or item_id in seen_ids:
+                continue
+            seen_ids.add(item_id)
+            ordered_snapshot.append(
+                (item_id, max(int(round(self._number(item.get("amount"), 0) * 100)), 0))
+            )
+
+        rows_by_id: dict[str, Any] = {}
+        if ordered_snapshot:
+            placeholders = ", ".join("?" for _ in ordered_snapshot)
+            rows = conn.execute(
+                f"SELECT id, amount FROM cost_additions WHERE id IN ({placeholders})",
+                tuple(item_id for item_id, _ in ordered_snapshot),
+            ).fetchall()
+            rows_by_id = {str(row["id"]): row for row in rows}
+
+        remaining_cents = recovered_cents
+        updated_rows = 0
+        for item_id, frozen_cents in ordered_snapshot:
+            if remaining_cents <= 0:
+                break
+            row = rows_by_id.get(item_id)
+            if not row:
+                continue
+            current_cents = max(int(round(self._number(row["amount"], 0) * 100)), 0)
+            available_cents = min(current_cents, frozen_cents) if frozen_cents else current_cents
+            consumed_cents = min(remaining_cents, available_cents)
+            if consumed_cents <= 0:
+                continue
+            next_cents = current_cents - consumed_cents
+            if next_cents <= 0:
+                conn.execute("DELETE FROM cost_additions WHERE id = ?", (item_id,))
+            else:
+                conn.execute(
+                    "UPDATE cost_additions SET amount = ? WHERE id = ?",
+                    (next_cents / 100, item_id),
+                )
+            remaining_cents -= consumed_cents
+            updated_rows += 1
+
+        stored["cost"] = (live_cents - recovered_cents) / 100
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('stored_state', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (self._dumps(stored),),
+        )
+        return {
+            "recoveredAmount": recovered_cents / 100,
+            "remainingCost": stored["cost"],
+            "updatedRows": updated_rows,
+        }

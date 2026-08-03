@@ -79,6 +79,12 @@ class WithdrawalPlanningTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "必须为整数"):
             plan_withdrawal("cost", 324.5, balances([400, 0, 0, 0, 0, 0, 0]), 320.5)
 
+    def test_cost_plan_is_disabled_when_there_is_no_cost_to_recover(self) -> None:
+        with self.assertRaisesRegex(ValueError, "当前没有待回收成本"):
+            plan_withdrawal("cost", 0, balances([0, 0, 0, 0, 0, 1.6, 0]), 1)
+        full = plan_withdrawal("full", 0, balances([0, 0, 0, 0, 0, 1.6, 0]))
+        self.assertEqual(full["totalAmount"], 1)
+
     def test_cost_rounding_remainder_belongs_to_owner(self) -> None:
         plan = plan_withdrawal("cost", 324.5, balances([20, 80, 65, 60, 100, 0, 0]))
         settlement = settlement_for(plan)
@@ -238,6 +244,12 @@ class WithdrawalServiceConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         )
         self.manager = BlockingWithdrawalManager()
         self.balance_values = [1, 0, 0, 0, 0, 0, 0]
+
+        def get_setting(key: str, default):
+            with self.connect() as connection:
+                row = connection.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            return json.loads(row["value"]) if row else default
+
         self.service = WithdrawalService(
             connect=self.connect,
             dumps=lambda value: json.dumps(value, ensure_ascii=False),
@@ -245,7 +257,7 @@ class WithdrawalServiceConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             utc_now=lambda: datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             parse_time=lambda value: datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None,
             flexible_number=lambda value, default=0: float(value) if value is not None else default,
-            get_setting=lambda key, default: {"cost": 1} if key == "stored_state" else default,
+            get_setting=get_setting,
             normalize_smtp_settings=lambda raw: {
                 "host": "smtp.qq.com",
                 "port": 465,
@@ -261,7 +273,7 @@ class WithdrawalServiceConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             initialize_pixel_manager=lambda: None,
             wake_event=asyncio.Event(),
             cost_additions_snapshot=self.ledger.list,
-            clear_cost_additions_if_snapshot=self.ledger.clear_snapshot,
+            recover_cost_additions_if_snapshot=self.ledger.recover_snapshot,
         )
         self.target_ids = {account.email: f"target-{index}" for index, account in enumerate(WITHDRAWAL_ACCOUNTS)}
 
@@ -368,6 +380,44 @@ class WithdrawalServiceConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         with self.connect() as connection:
             stored = json.loads(connection.execute("SELECT value FROM settings WHERE key = 'stored_state'").fetchone()[0])
         self.assertEqual(stored["cost"], 0.5)
+
+    async def test_each_submitted_account_immediately_reduces_cost(self) -> None:
+        with self.connect() as connection:
+            connection.execute("UPDATE cost_additions SET amount = 324.5 WHERE id = 'cost-1'")
+            connection.execute(
+                "UPDATE settings SET value = ? WHERE key = 'stored_state'",
+                (json.dumps({"cost": 324.5}),),
+            )
+        self.balance_values = [20, 304, 0, 0, 0, 0, 0]
+        plan = self.service.latest_plan("cost", 324)
+        self.assertEqual([item["amount"] for item in plan["items"][:2]], [20, 304])
+        job = self.service.create_job(plan, self.target_ids)
+        self.manager.release.set()
+
+        await self.service.process_once()
+        waiting = self.service.job_detail(job["jobId"])
+        self.assertEqual(waiting["status"], "waiting")
+        self.assertEqual(waiting["costClearedAmount"], 20)
+        self.assertEqual(waiting["costSettlementStatus"], "partial")
+        self.assertEqual(waiting["postWithdrawalCost"], 304.5)
+        self.assertEqual(waiting["items"][0]["costRecoveredAmount"], 20)
+        self.assertEqual(waiting["items"][0]["remainingCostAfter"], 304.5)
+        self.assertEqual(self.ledger.list()[0]["amount"], 304.5)
+
+        self.service.accelerate_job(job["jobId"])
+        await self.service.process_once()
+        completed = self.service.job_detail(job["jobId"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["costClearedAmount"], 324)
+        self.assertEqual(completed["costSettlementStatus"], "partial")
+        self.assertEqual(completed["postWithdrawalCost"], 0.5)
+        self.assertEqual(completed["items"][1]["costRecoveredAmount"], 304)
+        self.assertEqual(completed["items"][1]["remainingCostAfter"], 0.5)
+        self.assertEqual(self.ledger.list()[0]["amount"], 0.5)
+
+        self.service._finalize_financials(job["jobId"])
+        self.assertEqual(self.service.job_detail(job["jobId"])["costClearedAmount"], 324)
+        self.assertEqual(self.ledger.list()[0]["amount"], 0.5)
 
     async def test_failed_job_never_clears_cost_history(self) -> None:
         self.manager = FailingWithdrawalManager()

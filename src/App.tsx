@@ -120,7 +120,6 @@ const navItems = [
   { key: "pools", label: "账号池分析", icon: Users },
   { key: "manager", label: "账号池管理", icon: FolderTree },
   { key: "cost", label: "成本计算", icon: Calculator },
-  { key: "history", label: "成本历史", icon: History },
 ] as const;
 
 type ViewKey = (typeof navItems)[number]["key"];
@@ -208,8 +207,8 @@ export function App() {
       const response = await api.withdrawals();
       setWithdrawalJob(response.job);
       const current = response.job;
-      if (current && ["completed", "failed"].includes(current.status)) {
-        const marker = `${current.jobId}:${current.status}:${current.updatedAt}`;
+      if (current) {
+        const marker = `${current.jobId}:${current.status}:${current.costClearedAmount ?? 0}`;
         if (withdrawalStateRefresh.current !== marker) {
           withdrawalStateRefresh.current = marker;
           await loadState();
@@ -399,6 +398,7 @@ export function App() {
               {!loading && view === "cost" && (
                 <CostView
                   latestBalance={latestBalance}
+                  balanceHistory={stored.history}
                   onAddCost={() => setDialog("addCost")}
                   onHistory={() => setDialog("costHistory")}
                   onAccounts={() => setDialog("accounts")}
@@ -414,7 +414,6 @@ export function App() {
                   withdrawalJob={withdrawalJob}
                 />
               )}
-              {!loading && view === "history" && <HistoryView stored={stored} />}
             </motion.div>
           </AnimatePresence>
         </section>
@@ -1459,6 +1458,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   const [importing, setImporting] = useState(false);
   const [results, setResults] = useState<PixelImportTargetResult[]>([]);
   const [importJob, setImportJob] = useState<PixelImportJob | null>(null);
+  const [importAccelerating, setImportAccelerating] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [exportDeleteAndReimport, setExportDeleteAndReimport] = useState(false);
   const [exportSelectedTargetIds, setExportSelectedTargetIds] = useState<Set<string>>(new Set());
@@ -1912,6 +1912,20 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
     }
   };
 
+  const accelerateImport = async () => {
+    if (!importJob || importJob.phase !== "waiting") return;
+    setImportAccelerating(true);
+    try {
+      const response = await api.acceleratePixelImport(importJob.jobId);
+      setImportJob(response.job);
+      onToast("已加速下一个平台上传");
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "导入加速失败");
+    } finally {
+      setImportAccelerating(false);
+    }
+  };
+
   const toggleSelectedAccount = (accountId: number) => {
     setSelectedAccountIds((current) => {
       const next = new Set(current);
@@ -2264,7 +2278,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
 
       {importJob && (importJob.status === "queued" || importJob.status === "running") && (
         <div className="fixed bottom-4 right-4 z-40 w-[min(560px,calc(100vw-32px))] shadow-admin">
-          <PixelImportProgress job={importJob} targets={targets} />
+          <PixelImportProgress job={importJob} targets={targets} accelerating={importAccelerating} onAccelerate={accelerateImport} />
         </div>
       )}
       {exportJob && (exportJob.status === "queued" || exportJob.status === "running") && (
@@ -2706,7 +2720,17 @@ function PixelUsageValue({ state, window }: { state?: PixelUsageLoadState; windo
   return <span className={cn("font-black", window === "5h" ? "text-emerald-700" : "text-violet-700")}>{formatPercent(value)}</span>;
 }
 
-function PixelImportProgress({ job, targets }: { job: PixelImportJob; targets: PixelTarget[] }) {
+function PixelImportProgress({
+  job,
+  targets,
+  accelerating,
+  onAccelerate,
+}: {
+  job: PixelImportJob;
+  targets: PixelTarget[];
+  accelerating: boolean;
+  onAccelerate: () => Promise<void>;
+}) {
   const currentTarget = targets.find((target) => target.id === job.currentTargetId);
   const completed = Math.min(job.completedTargets, job.totalTargets);
   const percent = job.totalTargets ? Math.round((completed / job.totalTargets) * 100) : 0;
@@ -2741,6 +2765,12 @@ function PixelImportProgress({ job, targets }: { job: PixelImportJob; targets: P
             />
           </div>
         </div>
+        {waiting && (
+          <Button size="sm" className="shrink-0 bg-amber-600 text-white hover:bg-amber-700" disabled={accelerating} onClick={() => void onAccelerate()}>
+            {accelerating ? <Loader2 className="h-4 w-4 animate-spin" /> : <FastForward className="h-4 w-4" />}
+            加速下一步
+          </Button>
+        )}
       </CardContent>
     </Card>
   );
@@ -3089,6 +3119,7 @@ function formatFileSize(bytes: number) {
 
 function CostView({
   latestBalance,
+  balanceHistory,
   onAddCost,
   onHistory,
   onAccounts,
@@ -3098,6 +3129,7 @@ function CostView({
   withdrawalJob,
 }: {
   latestBalance?: { total: number; amounts: number[]; accounts?: string[]; date: string };
+  balanceHistory: StoredState["history"];
   onAddCost: () => void;
   onHistory: () => void;
   onAccounts: () => void;
@@ -3195,6 +3227,7 @@ function CostView({
           formatMoney(row.current),
         ])}
       />
+      <PagedBalanceHistory stateRows={balanceHistory} />
     </div>
   );
 }
@@ -3265,7 +3298,7 @@ function WithdrawalDialog({
     setSelectedHistoryJob(null);
     if (intent === "create") {
       setMode("cost");
-      setAmount(String(Math.max(1, Math.ceil(totalCost - 1e-9))));
+      setAmount(String(Math.max(0, Math.ceil(totalCost - 1e-9))));
     }
   }, [open, intent, totalCost]);
 
@@ -3281,6 +3314,11 @@ function WithdrawalDialog({
     setPreviewError("");
 
     const requestedAmount = Number(amount);
+    if (mode === "cost" && totalCost <= 0) {
+      setPreviewLoading(false);
+      setPreviewError("当前没有待回收成本，请切换到全部提现");
+      return;
+    }
     if (mode === "cost" && (!Number.isInteger(requestedAmount) || requestedAmount <= 0)) {
       setPreviewLoading(false);
       setPreviewError("提现金额必须是大于 0 的整数");
@@ -3304,7 +3342,7 @@ function WithdrawalDialog({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [amount, mode, open, showingJob]);
+  }, [amount, mode, open, showingJob, totalCost]);
 
   useEffect(() => {
     if (!open || !showingJob || progressTab !== "history") return;
@@ -3331,6 +3369,10 @@ function WithdrawalDialog({
 
   const create = async () => {
     if (createInFlight.current || active) return;
+    if (mode === "cost" && totalCost <= 0) {
+      onToast("当前没有待回收成本，请切换到全部提现");
+      return;
+    }
     createInFlight.current = true;
     setCreating(true);
     try {
@@ -3410,7 +3452,7 @@ function WithdrawalDialog({
                   disabled={Boolean(active)}
                   onClick={() => {
                     setMode(item);
-                    setAmount(item === "cost" ? String(Math.max(1, Math.ceil(totalCost - 1e-9))) : "");
+                    setAmount(item === "cost" ? String(Math.max(0, Math.ceil(totalCost - 1e-9))) : "");
                     setPreview(null);
                     setPreviewError("");
                   }}
@@ -3423,7 +3465,7 @@ function WithdrawalDialog({
           </Field>
           {mode === "cost" && (
             <Field label="计划提现金额">
-              <Input type="number" min="1" step="1" value={amount} disabled={Boolean(active)} onChange={(event) => { setAmount(event.target.value); setPreview(null); setPreviewError(""); }} />
+              <Input type="number" min="0" step="1" value={amount} disabled={Boolean(active) || totalCost <= 0} onChange={(event) => { setAmount(event.target.value); setPreview(null); setPreviewError(""); }} />
             </Field>
           )}
           {mode === "full" && <Field label="提现规则"><div className="flex h-9 items-center rounded-md border border-border bg-card px-3 text-sm font-bold">各账号整数余额</div></Field>}
@@ -3442,6 +3484,7 @@ function WithdrawalDialog({
             <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-blue-100"><div className="h-full rounded-full bg-blue-600 transition-all" style={{ width: `${progressPercent}%` }} /></div>
             {currentItem && <div className="mt-2 text-xs">{job.status === "waiting" ? "下一账号" : "当前账号"}：第 {currentItem.sequence} 个 · {currentItem.email} · {currentItem.ownerLabel} · {formatMoney(currentItem.amount, 0)} 元</div>}
             <div className="mt-1 text-xs">下一次执行：{job.nextRunAt ? formatDateTime(job.nextRunAt) : "立即"}</div>
+            <div className="mt-1 text-xs">已逐笔冲减成本：{formatMoney(job.costClearedAmount ?? 0)} 元 · 当前剩余成本：{formatMoney(job.postWithdrawalCost ?? job.cost)} 元</div>
             {job.status === "waiting" && <Button className="mt-3" size="sm" onClick={() => void accelerate()} disabled={accelerating}>{accelerating ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FastForward className="h-3.5 w-3.5" />}加速下一笔</Button>}
           </div>
         )}
@@ -3541,8 +3584,8 @@ function WithdrawalPlanDetails({ plan }: { plan: WithdrawalPlan | WithdrawalJob 
         <MetricTile title={plan.mode === "cost" ? "社会哥转给星星" : "社会哥应得"} value={plan.mode === "cost" ? plan.settlement.partnerToOwner : plan.settlement.partnerExpected} accent="text-orange-600" sub={plan.mode === "cost" ? "按实际收款归属" : "利润的 40%"} size="normal" digits={2} suffix=" 元" />
       </div>
       <div className="overflow-auto rounded-md border border-border">
-        <table className="w-full min-w-[760px] text-left text-xs">
-          <thead className="bg-muted font-black text-muted-foreground"><tr><th className="px-3 py-2">序号</th><th className="px-3 py-2">账号</th><th className="px-3 py-2">收款方式</th><th className="px-3 py-2">当前余额</th><th className="px-3 py-2">提现金额</th><th className="px-3 py-2">状态</th></tr></thead>
+        <table className="w-full min-w-[860px] text-left text-xs">
+          <thead className="bg-muted font-black text-muted-foreground"><tr><th className="px-3 py-2">序号</th><th className="px-3 py-2">账号</th><th className="px-3 py-2">收款方式</th><th className="px-3 py-2">当前余额</th><th className="px-3 py-2">提现金额</th><th className="px-3 py-2">冲减成本</th><th className="px-3 py-2">状态</th></tr></thead>
           <tbody>
             {plan.items.map((item, index) => (
               <tr key={item.email} className="border-t border-border">
@@ -3551,6 +3594,7 @@ function WithdrawalPlanDetails({ plan }: { plan: WithdrawalPlan | WithdrawalJob 
                 <td className="px-3 py-2">{item.ownerLabel}</td>
                 <td className="px-3 py-2">{formatMoney(item.balance)}</td>
                 <td className="px-3 py-2 font-black">{formatMoney(item.amount, 0)}</td>
+                <td className="px-3 py-2 font-black text-emerald-700">{item.costRecoveredAt ? `${formatMoney(item.costRecoveredAmount ?? 0)} 元` : "-"}</td>
                 <td className="px-3 py-2">
                   <StatusPill tone={item.status === "failed" ? "red" : item.status === "submitted" ? "green" : item.status === "skipped" ? "gray" : item.status === "running" ? "blue" : "amber"}>{withdrawalItemStatusLabel(item.status, item.statusLabel)}</StatusPill>
                   {item.error && <div className="mt-1 text-rose-600">{item.error}</div>}
@@ -3570,10 +3614,12 @@ function WithdrawalPlanDetails({ plan }: { plan: WithdrawalPlan | WithdrawalJob 
           </div>
           <div className="text-xs font-bold text-muted-foreground">
             {finalizedJob.costSettlementStatus === "cleared"
-              ? "成本历史已自动清空 " + formatMoney(finalizedJob.costClearedAmount ?? 0) + " 元，提现记录仍保留本次快照。"
-              : finalizedJob.costSettlementStatus === "not_recovered"
-                ? "本次未完整收回成本，成本历史未清空。"
-                : "成本历史未重复扣减。"}
+              ? "各账号提交成功后已逐笔冲减成本，共回收 " + formatMoney(finalizedJob.costClearedAmount ?? 0) + " 元；提现记录仍保留创建时快照。"
+              : finalizedJob.costSettlementStatus === "partial"
+                ? "已逐笔回收 " + formatMoney(finalizedJob.costClearedAmount ?? 0) + " 元，剩余成本继续保留。"
+                : finalizedJob.costSettlementStatus === "not_recovered"
+                  ? "本次没有成功回收成本，成本记录继续保留。"
+                  : "本次没有需要冲减的成本。"}
           </div>
         </div>
       )}
@@ -3600,24 +3646,6 @@ function WithdrawalPlanDetails({ plan }: { plan: WithdrawalPlan | WithdrawalJob 
           </div>
         </div>
       )}
-    </div>
-  );
-}
-
-function HistoryView({ stored }: { stored: StoredState }) {
-  return (
-    <div className="space-y-4">
-      <PagedBalanceHistory stateRows={stored.history} />
-      <DataTable
-        title="累加成本历史"
-        columns={["日期", "金额", "备注", "创建时间"]}
-        rows={(stored.costAdditions ?? []).map((item) => [
-          formatDateTime(item.date),
-          formatSignedMoney(item.amount),
-          item.note || "-",
-          formatDateTime(item.createdAt),
-        ])}
-      />
     </div>
   );
 }
@@ -4316,15 +4344,6 @@ function ViewSkeleton({ view }: { view: ViewKey }) {
           ))}
         </div>
         <SkeletonTable />
-      </div>
-    );
-  }
-
-  if (view === "history") {
-    return (
-      <div className="space-y-4">
-        <SkeletonTable />
-        <SkeletonTable rows={4} />
       </div>
     );
   }

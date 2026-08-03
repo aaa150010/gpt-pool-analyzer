@@ -91,6 +91,9 @@ def initialize_withdrawal_schema(conn: Any) -> None:
             status_label TEXT NOT NULL DEFAULT '',
             error TEXT,
             submitted_at TEXT,
+            cost_recovered_amount REAL NOT NULL DEFAULT 0,
+            cost_recovered_at TEXT,
+            remaining_cost_after REAL,
             response TEXT NOT NULL DEFAULT '{}',
             UNIQUE(job_id, sequence)
         );
@@ -124,6 +127,16 @@ def initialize_withdrawal_schema(conn: Any) -> None:
     }
     for column, statement in migrations.items():
         if column not in columns:
+            conn.execute(statement)
+
+    item_columns = {row["name"] for row in conn.execute("PRAGMA table_info(withdrawal_items)").fetchall()}
+    item_migrations = {
+        "cost_recovered_amount": "ALTER TABLE withdrawal_items ADD COLUMN cost_recovered_amount REAL NOT NULL DEFAULT 0",
+        "cost_recovered_at": "ALTER TABLE withdrawal_items ADD COLUMN cost_recovered_at TEXT",
+        "remaining_cost_after": "ALTER TABLE withdrawal_items ADD COLUMN remaining_cost_after REAL",
+    }
+    for column, statement in item_migrations.items():
+        if column not in item_columns:
             conn.execute(statement)
 
     # Older jobs predate the auditable cost snapshot. Backfill only active jobs
@@ -197,7 +210,7 @@ class WithdrawalService:
         initialize_pixel_manager: Callable[[], None],
         wake_event: asyncio.Event,
         cost_additions_snapshot: Callable[[], list[dict[str, Any]]] | None = None,
-        clear_cost_additions_if_snapshot: Callable[[Any, list[dict[str, Any]]], dict[str, Any]] | None = None,
+        recover_cost_additions_if_snapshot: Callable[[Any, list[dict[str, Any]], float], dict[str, Any]] | None = None,
     ) -> None:
         self._connect = connect
         self._dumps = dumps
@@ -212,7 +225,7 @@ class WithdrawalService:
         self._initialize_pixel_manager = initialize_pixel_manager
         self.wake_event = wake_event
         self._cost_additions_snapshot = cost_additions_snapshot or (lambda: [])
-        self._clear_cost_additions_if_snapshot = clear_cost_additions_if_snapshot
+        self._recover_cost_additions_if_snapshot = recover_cost_additions_if_snapshot
 
     def latest_plan(self, mode: str, requested_amount: Any | None = None) -> dict[str, Any]:
         snapshot = self._latest_balance_snapshot()
@@ -308,6 +321,9 @@ class WithdrawalService:
                 "statusLabel": self.item_label(item["status"]),
                 "error": item["error"],
                 "submittedAt": item["submitted_at"],
+                "costRecoveredAmount": item["cost_recovered_amount"],
+                "costRecoveredAt": item["cost_recovered_at"],
+                "remainingCostAfter": item["remaining_cost_after"],
             }
             for item in items
         ]
@@ -435,85 +451,139 @@ class WithdrawalService:
     def _submitted_total(items: list[dict[str, Any]]) -> float:
         return round(sum(float(item.get("amount") or 0) for item in items if item.get("status") == "submitted"), 2)
 
-    def _finalize_financials(self, job_id: str) -> None:
-        """Persist the final ledger fields and clear only recovered cost rows.
+    def _live_cost(self, conn: Any, fallback: float = 0.0) -> float:
+        row = conn.execute("SELECT value FROM settings WHERE key = 'stored_state'").fetchone()
+        state = self._loads(row["value"], {}) if row else {}
+        value = state.get("cost") if state.get("cost") is not None else fallback
+        return round(max(float(value or 0), 0.0), 2)
 
-        This runs after the last PixelAPI response is durably recorded. It is
-        idempotent: a worker restart can call it again without deleting newer
-        cost rows or changing the already recorded settlement.
-        """
+    def _apply_item_cost_recovery(self, conn: Any, job: Any, item: Any, now: str) -> dict[str, Any]:
+        """Recover cost for one submitted item exactly once inside its transaction."""
+        if item["cost_recovered_at"]:
+            return {
+                "recovered": round(float(item["cost_recovered_amount"] or 0), 2),
+                "cumulative": round(float(job["cost_cleared_amount"] or 0), 2),
+                "remainingCost": self._live_cost(conn, float(job["cost"] or 0)),
+                "status": str(job["cost_settlement_status"] or "pending"),
+            }
+
+        job_cost = round(max(float(job["cost"] or 0), 0.0), 2)
+        cumulative = round(max(float(job["cost_cleared_amount"] or 0), 0.0), 2)
+        outstanding = round(max(job_cost - cumulative, 0.0), 2)
+        requested = round(min(max(float(item["amount"] or 0), 0.0), outstanding), 2)
+        remaining_cost = self._live_cost(conn, job_cost)
+        recovered = 0.0
+        if requested > 0 and self._recover_cost_additions_if_snapshot:
+            result = self._recover_cost_additions_if_snapshot(
+                conn,
+                self._loads(job["cost_history"], []),
+                requested,
+            )
+            recovered = round(max(float(result.get("recoveredAmount") or 0), 0.0), 2)
+            remaining_cost = round(max(float(result.get("remainingCost") or 0), 0.0), 2)
+
+        cumulative = round(min(cumulative + recovered, job_cost), 2)
+        if job_cost <= 0:
+            cost_status = "not_applicable"
+        elif cumulative >= job_cost:
+            cost_status = "cleared"
+        elif cumulative > 0:
+            cost_status = "partial"
+        else:
+            cost_status = "pending"
+        cleared_at = job["cost_cleared_at"] or (now if cost_status == "cleared" else None)
+
+        conn.execute(
+            """UPDATE withdrawal_items SET
+               cost_recovered_amount = ?, cost_recovered_at = ?, remaining_cost_after = ?
+               WHERE item_id = ?""",
+            (recovered, now, remaining_cost, item["item_id"]),
+        )
+        conn.execute(
+            """UPDATE withdrawal_jobs SET
+               cost_cleared_amount = ?, cost_cleared_at = ?, cost_settlement_status = ?
+               WHERE job_id = ?""",
+            (cumulative, cleared_at, cost_status, job["job_id"]),
+        )
+        return {
+            "recovered": recovered,
+            "cumulative": cumulative,
+            "remainingCost": remaining_cost,
+            "status": cost_status,
+        }
+
+    def _sync_submitted_cost_recovery(self, job_id: str) -> None:
+        """Backfill a submitted item after a restart without double recovery."""
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job_row = conn.execute(
+                "SELECT * FROM withdrawal_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if not job_row:
+                return
+            job = dict(job_row)
+            items = conn.execute(
+                """SELECT * FROM withdrawal_items
+                   WHERE job_id = ? AND status = 'submitted' AND cost_recovered_at IS NULL
+                   ORDER BY sequence ASC""",
+                (job_id,),
+            ).fetchall()
+            if not items:
+                return
+            now = self._utc_now()
+            for item in items:
+                result = self._apply_item_cost_recovery(conn, job, item, now)
+                job["cost_cleared_amount"] = result["cumulative"]
+                job["cost_settlement_status"] = result["status"]
+                if result["status"] == "cleared" and not job.get("cost_cleared_at"):
+                    job["cost_cleared_at"] = now
+            conn.execute(
+                "UPDATE withdrawal_jobs SET updated_at = ? WHERE job_id = ?",
+                (now, job_id),
+            )
+
+    def _refresh_financials(self, job_id: str, *, final: bool = False) -> None:
+        self._sync_submitted_cost_recovery(job_id)
         job = self.job_detail(job_id)
-        if not job or job.get("status") not in {"completed", "failed"}:
+        if not job:
             return
         settlement = settlement_for(job)
         submitted_total = self._submitted_total(job.get("items") or [])
-        cost = round(float(job.get("cost") or 0), 2)
-        recovered = job.get("status") == "completed" and submitted_total >= cost and cost > 0
-        cost_status = "not_recovered"
-        cleared_amount = 0.0
-        cleared_at: str | None = None
-        remaining_cost = cost
-        if recovered and self._clear_cost_additions_if_snapshot and job.get("costHistory"):
-            with self._connect() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                existing = conn.execute(
-                    "SELECT cost_settlement_status, cost_cleared_amount, cost_cleared_at "
-                    "FROM withdrawal_jobs WHERE job_id = ?",
-                    (job_id,),
-                ).fetchone()
-                if existing and existing["cost_settlement_status"] == "cleared":
-                    cleared_amount = float(existing["cost_cleared_amount"] or 0)
-                    cleared_at = existing["cost_cleared_at"]
-                    cost_status = "cleared"
-                else:
-                    cleared = self._clear_cost_additions_if_snapshot(conn, job.get("costHistory") or [])
-                    cleared_amount = round(float(cleared.get("clearedAmount") or 0), 2)
-                    remaining_cost = round(float(cleared.get("remainingCost") or 0), 2)
-                    if cleared_amount > 0:
-                        cost_status = "cleared"
-                        cleared_at = self._utc_now()
-                    else:
-                        cost_status = "already_cleared"
-                live_cost = conn.execute("SELECT value FROM settings WHERE key = 'stored_state'").fetchone()
-                live_state = self._loads(live_cost["value"], {}) if live_cost else {}
-                remaining_cost = round(float(live_state.get("cost") or remaining_cost), 2)
-                post_balance = job.get("balanceSnapshotTotal")
-                if post_balance is not None:
-                    post_balance = round(max(float(post_balance) - submitted_total, 0), 2)
-                discounted_profit = round((post_balance or 0) - remaining_cost, 2) if post_balance is not None else None
-                conn.execute(
-                    """UPDATE withdrawal_jobs SET
-                       post_withdrawal_cost = ?, post_withdrawal_balance = ?,
-                       discounted_profit = ?, cost_cleared_at = ?,
-                       cost_cleared_amount = ?, cost_settlement_status = ?,
-                       settlement = ?, updated_at = ?
-                       WHERE job_id = ?""",
-                    (
-                        remaining_cost,
-                        post_balance,
-                        discounted_profit,
-                        cleared_at,
-                        cleared_amount,
-                        cost_status,
-                        self._dumps(settlement),
-                        self._utc_now(),
-                        job_id,
-                    ),
-                )
-            return
-
+        with self._connect() as conn:
+            remaining_cost = self._live_cost(conn, float(job.get("cost") or 0))
         post_balance = job.get("balanceSnapshotTotal")
         if post_balance is not None:
             post_balance = round(max(float(post_balance) - submitted_total, 0), 2)
-        discounted_profit = round((post_balance or 0) - cost, 2) if post_balance is not None else None
+        discounted_profit = round((post_balance or 0) - remaining_cost, 2) if post_balance is not None else None
+
+        job_cost = round(max(float(job.get("cost") or 0), 0.0), 2)
+        recovered = round(max(float(job.get("costClearedAmount") or 0), 0.0), 2)
+        if job_cost <= 0:
+            cost_status = "not_applicable"
+        elif recovered >= job_cost:
+            cost_status = "cleared"
+        elif recovered > 0:
+            cost_status = "partial"
+        elif final:
+            cost_status = "not_recovered"
+        else:
+            cost_status = "pending"
         self.update_job(
             job_id,
             settlement=settlement,
-            post_withdrawal_cost=cost,
+            post_withdrawal_cost=remaining_cost,
             post_withdrawal_balance=post_balance,
             discounted_profit=discounted_profit,
             cost_settlement_status=cost_status,
         )
+
+    def _finalize_financials(self, job_id: str) -> None:
+        """Persist final totals after all per-item recoveries have been applied."""
+        job = self.job_detail(job_id)
+        if not job or job.get("status") not in {"completed", "failed"}:
+            return
+        self._refresh_financials(job_id, final=True)
 
     def _refresh_settlement(self, job_id: str) -> None:
         job = self.job_detail(job_id)
@@ -525,11 +595,11 @@ class WithdrawalService:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             job = conn.execute(
-                "SELECT status FROM withdrawal_jobs WHERE job_id = ?",
+                "SELECT * FROM withdrawal_jobs WHERE job_id = ?",
                 (job_id,),
             ).fetchone()
             item = conn.execute(
-                "SELECT status FROM withdrawal_items WHERE item_id = ? AND job_id = ?",
+                "SELECT * FROM withdrawal_items WHERE item_id = ? AND job_id = ?",
                 (item_id, job_id),
             ).fetchone()
             if not job or not item or job["status"] != "running" or item["status"] != "running":
@@ -557,11 +627,11 @@ class WithdrawalService:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             job = conn.execute(
-                "SELECT status FROM withdrawal_jobs WHERE job_id = ?",
+                "SELECT * FROM withdrawal_jobs WHERE job_id = ?",
                 (job_id,),
             ).fetchone()
             item = conn.execute(
-                "SELECT status FROM withdrawal_items WHERE item_id = ? AND job_id = ?",
+                "SELECT * FROM withdrawal_items WHERE item_id = ? AND job_id = ?",
                 (item_id, job_id),
             ).fetchone()
             if not job or not item or job["status"] != "running" or item["status"] != "running":
@@ -571,6 +641,7 @@ class WithdrawalService:
                 "WHERE item_id = ?",
                 (self.item_label("submitted"), now, self._dumps(response), item_id),
             )
+            self._apply_item_cost_recovery(conn, job, item, now)
             remaining = conn.execute(
                 "SELECT 1 FROM withdrawal_items WHERE job_id = ? AND status = 'queued' LIMIT 1",
                 (job_id,),
@@ -583,15 +654,19 @@ class WithdrawalService:
                     "WHERE job_id = ?",
                     (next_run_at, now, job_id),
                 )
-                return "waiting", delay
-            conn.execute(
-                "UPDATE withdrawal_jobs SET status = 'completed', next_run_at = NULL, error = NULL, updated_at = ? "
-                "WHERE job_id = ?",
-                (now, job_id),
-            )
-        self._refresh_settlement(job_id)
-        self._finalize_financials(job_id)
-        return "completed", 1.0
+                outcome = "waiting"
+            else:
+                conn.execute(
+                    "UPDATE withdrawal_jobs SET status = 'completed', next_run_at = NULL, error = NULL, updated_at = ? "
+                    "WHERE job_id = ?",
+                    (now, job_id),
+                )
+                outcome, delay = "completed", 1.0
+        if outcome == "completed":
+            self._finalize_financials(job_id)
+        else:
+            self._refresh_financials(job_id)
+        return outcome, delay
 
     def _complete_job_without_queued_items(self, job_id: str) -> bool:
         now = self._utc_now()
@@ -756,6 +831,7 @@ class WithdrawalService:
                 await asyncio.to_thread(self.send_notification, job["jobId"], "执行失败")
             return 60.0
         if job["status"] == "running" and next_item is not None:
+            self._refresh_financials(job["jobId"])
             return self._recover_submitted_transition(job["jobId"])
         if next_item is None:
             if self._complete_job_without_queued_items(job["jobId"]):

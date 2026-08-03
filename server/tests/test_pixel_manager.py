@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tempfile
 import unittest
@@ -1015,6 +1016,105 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finished["status"], "completed")
         self.assertEqual(finished["completedTargets"], 1)
 
+    async def test_waiting_import_job_can_accelerate_without_parallel_targets(self) -> None:
+        manager = PixelManager(
+            PixelManagerConfig(
+                manager_key=MANAGER_KEY,
+                targets={"one": target("one"), "two": target("two")},
+            ),
+            inter_target_delay_seconds=30,
+        )
+        call_order: list[str] = []
+        in_flight = 0
+        max_in_flight = 0
+
+        async def fake_import(item: PixelTarget, _bundle) -> dict:
+            nonlocal in_flight, max_in_flight
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            call_order.append(item.id)
+            await asyncio.sleep(0)
+            in_flight -= 1
+            return {
+                "targetId": item.id,
+                "email": item.email,
+                "generatedFileName": f"{item.id}.json",
+                "sourceCount": 1,
+                "created": 1,
+                "updated": 0,
+                "failed": 0,
+                "shared": 1,
+                "shareFailed": 0,
+                "failedShareIds": [],
+                "status": "success",
+                "message": "ok",
+            }
+
+        manager._import_target = fake_import
+        jobs = PixelImportJobs(manager)
+        bundle = parse_credential_bundle(
+            "source.json",
+            json.dumps([{"credentials": {"email": "a@example.com"}}]).encode(),
+        )
+        created = await jobs.create(bundle, ["one", "two"])
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if jobs.get(created["jobId"])["phase"] == "waiting":
+                break
+        waiting = jobs.get(created["jobId"])
+        self.assertEqual(waiting["phase"], "waiting")
+        self.assertGreater(waiting["waitSeconds"], 0)
+
+        accelerated = await jobs.accelerate(created["jobId"])
+        self.assertEqual(accelerated["phase"], "waiting")
+        await asyncio.wait_for(jobs._tasks[created["jobId"]], timeout=1)
+        finished = jobs.get(created["jobId"])
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual(call_order, ["one", "two"])
+        self.assertEqual(max_in_flight, 1)
+        with self.assertRaisesRegex(PixelManagerError, "没有可加速"):
+            await jobs.accelerate(created["jobId"])
+
+    async def test_processing_import_job_cannot_accelerate(self) -> None:
+        manager = PixelManager(
+            PixelManagerConfig(manager_key=MANAGER_KEY, targets={"one": target("one")}),
+            inter_target_delay_seconds=30,
+        )
+        release = asyncio.Event()
+
+        async def fake_import(_bundle, target_ids, progress_callback=None):
+            if progress_callback:
+                await progress_callback(
+                    {
+                        "phase": "processing",
+                        "currentTargetId": target_ids[0],
+                        "completedTargets": 0,
+                        "totalTargets": 1,
+                        "results": [],
+                    }
+                )
+            await release.wait()
+            return {"ok": True, "sourceFileName": "source.json", "sourceCount": 1, "results": []}
+
+        manager.import_bundle = AsyncMock(side_effect=fake_import)
+        jobs = PixelImportJobs(manager)
+        bundle = parse_credential_bundle(
+            "source.json",
+            json.dumps([{"credentials": {"email": "a@example.com"}}]).encode(),
+        )
+        created = await jobs.create(bundle, ["one"])
+        try:
+            for _ in range(20):
+                await asyncio.sleep(0)
+                if jobs.get(created["jobId"])["phase"] == "processing":
+                    break
+            self.assertEqual(jobs.get(created["jobId"])["phase"], "processing")
+            with self.assertRaisesRegex(PixelManagerError, "没有可加速"):
+                await jobs.accelerate(created["jobId"])
+        finally:
+            release.set()
+            await jobs._tasks[created["jobId"]]
+
     async def test_export_rebuild_stops_before_delete_when_export_fails(self) -> None:
         manager = PixelManager(
             PixelManagerConfig(manager_key=MANAGER_KEY, targets={"one": target("one")}),
@@ -1438,6 +1538,7 @@ class PixelManagerEndpointTests(unittest.TestCase):
             manager=self.manager,
             create=AsyncMock(return_value=created_job),
             get=Mock(return_value=completed_job),
+            accelerate=AsyncMock(return_value={**created_job, "status": "running", "phase": "waiting", "waitSeconds": 0}),
         )
         server_app.pixel_import_jobs = jobs
 
@@ -1461,6 +1562,14 @@ class PixelManagerEndpointTests(unittest.TestCase):
         self.assertEqual(polled.json()["job"]["status"], "completed")
         self.assertNotIn("uploaded-secret", polled.text)
         jobs.get.assert_called_once_with("job-123")
+
+        accelerated = self.client.post(
+            "/gpt-api/pixel-manager/import-jobs/job-123/accelerate",
+            headers=self._headers(),
+        )
+        self.assertEqual(accelerated.status_code, 200)
+        self.assertEqual(accelerated.json()["job"]["phase"], "waiting")
+        jobs.accelerate.assert_awaited_once_with("job-123")
 
     def test_export_returns_download_metadata_without_key_by_default(self) -> None:
         self.manager.export_all = AsyncMock(

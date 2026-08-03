@@ -626,7 +626,7 @@ cost_ledger = CostLedger(
 insert_cost_addition = cost_ledger.insert
 clear_cost_additions = cost_ledger.clear_all
 cost_additions_snapshot = cost_ledger.list
-clear_cost_additions_if_snapshot = cost_ledger.clear_snapshot
+recover_cost_additions_if_snapshot = cost_ledger.recover_snapshot
 
 
 def balance_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -932,7 +932,7 @@ withdrawal_service = WithdrawalService(
     initialize_pixel_manager=initialize_pixel_manager,
     wake_event=withdrawal_wake_event,
     cost_additions_snapshot=cost_additions_snapshot,
-    clear_cost_additions_if_snapshot=clear_cost_additions_if_snapshot,
+    recover_cost_additions_if_snapshot=recover_cost_additions_if_snapshot,
 )
 
 

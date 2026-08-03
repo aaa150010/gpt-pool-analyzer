@@ -232,6 +232,8 @@ export const api = {
     });
   },
   pixelImportJob: (jobId: string) => requestPixelJson<{ job: PixelImportJob }>(`/pixel-manager/import-jobs/${encodeURIComponent(jobId)}`),
+  acceleratePixelImport: (jobId: string) =>
+    requestPixelJson<{ job: PixelImportJob }>(`/pixel-manager/import-jobs/${encodeURIComponent(jobId)}/accelerate`, { method: "POST" }),
   pixelImportRecords: () => requestPixelJson<{ records: PixelImportRecord[] }>("/pixel-manager/import-records"),
   pixelRetryImportShare: (recordId: string, targetId: string, accountIds: number[]) =>
     requestPixelJson<{ record: PixelImportRecord; result: PixelShareResponse }>(

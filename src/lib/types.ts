@@ -302,6 +302,9 @@ export type WithdrawalItem = {
   statusLabel?: string;
   error?: string | null;
   submittedAt?: string | null;
+  costRecoveredAmount?: number;
+  costRecoveredAt?: string | null;
+  remainingCostAfter?: number | null;
 };
 
 export type WithdrawalSettlement = {
@@ -343,7 +346,7 @@ export type WithdrawalJob = WithdrawalPlan & {
   discountedProfit?: number | null;
   costClearedAt?: string | null;
   costClearedAmount?: number;
-  costSettlementStatus?: "pending" | "cleared" | "already_cleared" | "not_recovered" | "not_applicable";
+  costSettlementStatus?: "pending" | "partial" | "cleared" | "already_cleared" | "not_recovered" | "not_applicable";
   createdAt: string;
   updatedAt: string;
 };
@@ -471,6 +474,7 @@ export type PixelImportJob = {
   completedTargets: number;
   totalTargets: number;
   waitSeconds: number;
+  nextRunAt?: string | null;
   results: PixelImportTargetResult[];
   error: string | null;
 };
