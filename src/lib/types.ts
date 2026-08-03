@@ -428,6 +428,7 @@ export type PixelBulkOperationResponse = {
   failed: number;
   successIds?: number[];
   failedIds?: number[];
+  concurrencyById?: Record<string, number>;
   message?: string | null;
 };
 
@@ -448,6 +449,7 @@ export type PixelImportTargetResult = {
   shared: number;
   shareFailed: number;
   failedShareIds: number[];
+  concurrencyById: Record<string, number>;
   importErrors: Array<{ index: string; name: string; message: string }>;
   generatedNames: string[];
   status: "success" | "partial" | "failed";
@@ -563,6 +565,7 @@ export type PixelShareResponse = {
   failed: number;
   successIds: number[];
   failedIds: number[];
+  concurrencyById: Record<string, number>;
 };
 
 export type PixelShareAllTargetResult = {
@@ -572,6 +575,7 @@ export type PixelShareAllTargetResult = {
   shared: number;
   failed: number;
   failedIds: number[];
+  concurrencyById: Record<string, number>;
   status: "success" | "partial" | "failed";
   message: string;
 };

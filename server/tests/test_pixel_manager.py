@@ -527,7 +527,10 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_import_sets_only_new_ids_public_with_random_concurrency(self) -> None:
         account_reads = 0
         captured_import: dict = {}
+        captured_concurrency: list[dict] = []
         captured_shares: list[dict] = []
+        concurrency_by_id: dict[int, int] = {}
+        shared_ids: set[int] = set()
 
         def handler(request: httpx.Request) -> httpx.Response:
             nonlocal account_reads, captured_import
@@ -539,7 +542,12 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
                 if account_reads > 1:
                     imported_accounts = json.loads(captured_import["contents"][0])["accounts"]
                     items.extend(
-                        {"id": index + 2, "name": account["name"]}
+                        {
+                            "id": index + 2,
+                            "name": account["name"],
+                            "share_mode": "public" if index + 2 in shared_ids else "private",
+                            "concurrency": concurrency_by_id.get(index + 2, 3),
+                        }
                         for index, account in enumerate(imported_accounts)
                     )
                 return httpx.Response(
@@ -560,9 +568,28 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
                     200,
                     json={"data": {"total": 2, "created": 2, "updated": 0, "failed": 0, "errors": []}},
                 )
-            if request.url.path == "/api/v1/admin/accounts/bulk-update":
+            if request.url.path == "/api/v1/accounts/bulk-update":
+                body = json.loads(request.content)
+                captured_concurrency.append(body)
+                concurrency_by_id.update(
+                    {account_id: body["concurrency"] for account_id in body["account_ids"]}
+                )
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "success": len(body["account_ids"]),
+                            "failed": 0,
+                            "success_ids": body["account_ids"],
+                            "failed_ids": [],
+                            "results": [],
+                        }
+                    },
+                )
+            if request.url.path == "/api/v1/accounts/external-placement:convert-batch":
                 body = json.loads(request.content)
                 captured_shares.append(body)
+                shared_ids.update(body["account_ids"])
                 return httpx.Response(
                     200,
                     json={
@@ -599,28 +626,39 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(imported_payload["accounts"]), 2)
         self.assertTrue(all(item["credentials"]["plan_type"] == "plus" for item in imported_payload["accounts"]))
         self.assertTrue(all(item["name"].startswith("acct-") for item in imported_payload["accounts"]))
-        self.assertEqual(captured_shares, [
-            {"account_ids": [2], "share_mode": "public", "concurrency": 3},
-            {"account_ids": [3], "share_mode": "public", "concurrency": 10},
+        self.assertEqual(captured_concurrency, [
+            {"account_ids": [2], "concurrency": 3},
+            {"account_ids": [3], "concurrency": 10},
         ])
+        self.assertEqual([item["account_ids"] for item in captured_shares], [[2], [3]])
+        self.assertTrue(all(item["target"] == "public_pool" for item in captured_shares))
+        self.assertTrue(all(item["idempotency_key"] for item in captured_shares))
         self.assertEqual(result["shared"], 2)
         self.assertEqual(result["shareFailed"], 0)
         self.assertEqual(result["failedShareIds"], [])
+        self.assertEqual(result["concurrencyById"], {"2": 3, "3": 10})
         self.assertEqual(result["status"], "success")
         self.assertNotIn("fake-one", json.dumps(response))
 
-    async def test_share_retry_uses_bulk_update_with_random_public_concurrency(self) -> None:
-        captured: dict = {}
+    async def test_share_retry_uses_external_placement_with_random_public_concurrency(self) -> None:
+        captured_concurrency: dict = {}
+        captured_placement: dict = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal captured
+            nonlocal captured_concurrency, captured_placement
             if request.url.path == "/api/v1/auth/login":
                 return login_response()
-            if request.url.path == "/api/v1/admin/accounts/bulk-update":
-                captured = json.loads(request.content)
+            if request.url.path == "/api/v1/accounts/bulk-update":
+                captured_concurrency = json.loads(request.content)
                 return httpx.Response(
                     200,
-                    json={"data": {"success": 2, "failed": 0}},
+                    json={"data": {"success": 2, "failed": 0, "success_ids": [41, 42]}},
+                )
+            if request.url.path == "/api/v1/accounts/external-placement:convert-batch":
+                captured_placement = json.loads(request.content)
+                return httpx.Response(
+                    200,
+                    json={"data": {"success": 2, "failed": 0, "success_ids": [41, 42]}},
                 )
             if request.url.path == "/api/v1/accounts" and request.method == "GET":
                 return httpx.Response(
@@ -644,36 +682,57 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
             result = await manager.share_accounts("pixel-1", [41, 42])
 
         self.assertEqual(
-            captured,
+            captured_concurrency,
             {
                 "account_ids": [41, 42],
-                "share_mode": "public",
                 "concurrency": 10,
             },
         )
+        self.assertEqual(captured_placement["account_ids"], [41, 42])
+        self.assertEqual(captured_placement["target"], "public_pool")
+        self.assertTrue(captured_placement["idempotency_key"])
         self.assertEqual(result["successIds"], [41, 42])
         self.assertEqual(result["failedIds"], [])
+        self.assertEqual(result["concurrencyById"], {"41": 10, "42": 10})
 
     async def test_share_retry_verifies_reported_success_and_randomizes_per_account(self) -> None:
         captured_payloads: list[dict] = []
+        captured_placements: list[dict] = []
         concurrency_by_id: dict[int, int] = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/api/v1/auth/login":
                 return login_response()
-            if request.url.path == "/api/v1/admin/accounts/bulk-update":
+            if request.url.path == "/api/v1/accounts/bulk-update":
                 body = json.loads(request.content)
                 captured_payloads.append(body)
                 for account_id in body["account_ids"]:
                     concurrency_by_id[account_id] = body["concurrency"]
                 return httpx.Response(200, json={"data": {"success": len(body["account_ids"]), "failed": 0}})
+            if request.url.path == "/api/v1/accounts/external-placement:convert-batch":
+                body = json.loads(request.content)
+                captured_placements.append(body)
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "success": len(body["account_ids"]),
+                            "failed": 0,
+                            "success_ids": body["account_ids"],
+                        }
+                    },
+                )
             if request.url.path == "/api/v1/accounts" and request.method == "GET":
                 return httpx.Response(
                     200,
                     json={
                         "data": {
                             "items": [
-                                {"id": account_id, "share_mode": "public", "concurrency": concurrency}
+                                {
+                                    "id": account_id,
+                                    "share_mode": "private" if account_id == 43 else "public",
+                                    "concurrency": concurrency,
+                                }
                                 for account_id, concurrency in sorted(concurrency_by_id.items())
                             ],
                             "page": 1,
@@ -689,14 +748,17 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
             result = await manager.share_accounts("pixel-1", [41, 42, 43])
 
         self.assertEqual(captured_payloads, [
-            {"account_ids": [41], "share_mode": "public", "concurrency": 3},
-            {"account_ids": [42], "share_mode": "public", "concurrency": 4},
-            {"account_ids": [43], "share_mode": "public", "concurrency": 10},
+            {"account_ids": [41], "concurrency": 3},
+            {"account_ids": [42], "concurrency": 4},
+            {"account_ids": [43], "concurrency": 10},
         ])
-        self.assertEqual(result["successIds"], [41, 42, 43])
-        self.assertEqual(result["failedIds"], [])
+        self.assertEqual([item["account_ids"] for item in captured_placements], [[41], [42], [43]])
+        self.assertTrue(all(item["target"] == "public_pool" for item in captured_placements))
+        self.assertEqual(result["successIds"], [41, 42])
+        self.assertEqual(result["failedIds"], [43])
+        self.assertEqual(result["concurrencyById"], {"41": 3, "42": 4})
 
-    async def test_share_retry_falls_back_to_user_bulk_update(self) -> None:
+    async def test_share_retry_falls_back_to_admin_for_concurrency_update(self) -> None:
         paths: list[str] = []
         captured: dict = {}
 
@@ -707,11 +769,32 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
             if request.url.path in {"/api/v1/accounts/bulk-update", "/api/v1/admin/accounts/bulk-update"}:
                 paths.append(request.url.path)
                 captured = json.loads(request.content)
-                if request.url.path == "/api/v1/admin/accounts/bulk-update":
+                if request.url.path == "/api/v1/accounts/bulk-update":
                     return httpx.Response(404, json={"message": "not found"})
                 return httpx.Response(
                     200,
                     json={"data": {"success_ids": [41, 42], "failed_ids": []}},
+                )
+            if request.url.path == "/api/v1/accounts/external-placement:convert-batch":
+                paths.append(request.url.path)
+                return httpx.Response(
+                    200,
+                    json={"data": {"success_ids": [41, 42], "failed_ids": []}},
+                )
+            if request.url.path == "/api/v1/accounts" and request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "items": [
+                                {"id": 41, "share_mode": "public", "concurrency": 10},
+                                {"id": 42, "share_mode": "public", "concurrency": 10},
+                            ],
+                            "page": 1,
+                            "pages": 1,
+                            "total": 2,
+                        }
+                    },
                 )
             raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
@@ -719,22 +802,27 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         with patch("server.pixel_manager.secrets.randbelow", return_value=7):
             result = await manager.share_accounts("pixel-1", [41, 42])
 
-        self.assertEqual(paths, ["/api/v1/admin/accounts/bulk-update", "/api/v1/accounts/bulk-update"])
+        self.assertEqual(paths, [
+            "/api/v1/accounts/bulk-update",
+            "/api/v1/admin/accounts/bulk-update",
+            "/api/v1/accounts/external-placement:convert-batch",
+        ])
         self.assertEqual(
             captured,
             {
                 "account_ids": [41, 42],
-                "share_mode": "public",
                 "concurrency": 10,
             },
         )
         self.assertEqual(result["successIds"], [41, 42])
         self.assertEqual(result["failedIds"], [])
+        self.assertEqual(result["concurrencyById"], {"41": 10, "42": 10})
 
     async def test_share_all_accounts_processes_every_configured_target(self) -> None:
         target_one = target("pixel-1", "https://pixel-one.example")
         target_two = target("pixel-2", "https://pixel-two.example")
         updated_by_host: dict[str, list[int]] = {}
+        shared_by_host: dict[str, list[int]] = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
             host = request.url.host or ""
@@ -753,9 +841,16 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
                         }
                     },
                 )
-            if request.url.path == "/api/v1/admin/accounts/bulk-update":
+            if request.url.path == "/api/v1/accounts/bulk-update":
                 body = json.loads(request.content)
                 updated_by_host[host] = body["account_ids"]
+                return httpx.Response(
+                    200,
+                    json={"data": {"success_ids": body["account_ids"], "failed_ids": []}},
+                )
+            if request.url.path == "/api/v1/accounts/external-placement:convert-batch":
+                body = json.loads(request.content)
+                shared_by_host[host] = body["account_ids"]
                 return httpx.Response(
                     200,
                     json={"data": {"success_ids": body["account_ids"], "failed_ids": []}},
@@ -769,7 +864,12 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["totalTargets"], 2)
         self.assertEqual(result["total"], 3)
         self.assertEqual(result["shared"], 3)
+        self.assertEqual(
+            [item["concurrencyById"] for item in result["results"]],
+            [{"11": 10, "12": 10}, {"21": 10}],
+        )
         self.assertEqual(updated_by_host, {"pixel-one.example": [11, 12], "pixel-two.example": [21]})
+        self.assertEqual(shared_by_host, {"pixel-one.example": [11, 12], "pixel-two.example": [21]})
 
     async def test_share_rejects_empty_ids(self) -> None:
         manager = manager_with_transport(lambda _: login_response())
@@ -971,14 +1071,15 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("999", encoded)
         self.assertNotIn("998", encoded)
 
-    async def test_bulk_update_sends_only_public_mode_and_concurrency(self) -> None:
-        captured_payloads: list[dict] = []
+    async def test_bulk_update_sets_concurrency_then_converts_external_placement(self) -> None:
+        captured_concurrency: list[dict] = []
+        captured_placements: list[dict] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/api/v1/auth/login":
                 return login_response()
-            if request.url.path == "/api/v1/admin/accounts/bulk-update":
-                captured_payloads.append(json.loads(request.content))
+            if request.url.path == "/api/v1/accounts/bulk-update":
+                captured_concurrency.append(json.loads(request.content))
                 return httpx.Response(
                     200,
                     json={
@@ -999,6 +1100,43 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
                         }
                     },
                 )
+            if request.url.path == "/api/v1/accounts/external-placement:convert-batch":
+                captured_placements.append(json.loads(request.content))
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "success": 2,
+                            "failed": 0,
+                            "success_ids": [31, 32, 999],
+                            "failed_ids": [998],
+                            "results": [
+                                {"account_id": 31, "success": True},
+                                {"account_id": 32, "success": True},
+                                {
+                                    "account_id": 999,
+                                    "success": True,
+                                    "credentials": {"access_token": "placement-result-secret"},
+                                },
+                            ],
+                        }
+                    },
+                )
+            if request.url.path == "/api/v1/accounts" and request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "items": [
+                                {"id": 31, "share_mode": "public", "concurrency": 4},
+                                {"id": 32, "share_mode": "public", "concurrency": 4},
+                            ],
+                            "page": 1,
+                            "pages": 1,
+                            "total": 2,
+                        }
+                    },
+                )
             raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
         manager = manager_with_transport(handler)
@@ -1010,15 +1148,20 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(
-            captured_payloads,
-            [{"account_ids": [31, 32], "share_mode": "public", "concurrency": 4}],
+            captured_concurrency,
+            [{"account_ids": [31, 32], "concurrency": 4}],
         )
+        self.assertEqual([item["account_ids"] for item in captured_placements], [[31, 32]])
+        self.assertEqual(captured_placements[0]["target"], "public_pool")
+        self.assertTrue(captured_placements[0]["idempotency_key"])
         self.assertEqual(result["successIds"], [31, 32])
         self.assertEqual(result["failedIds"], [])
         self.assertEqual(result["success"], 2)
         self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["concurrencyById"], {"31": 4, "32": 4})
         encoded = json.dumps(result)
         self.assertNotIn("update-result-secret", encoded)
+        self.assertNotIn("placement-result-secret", encoded)
         self.assertNotIn("999", encoded)
         self.assertNotIn("998", encoded)
 

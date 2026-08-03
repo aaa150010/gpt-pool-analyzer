@@ -784,19 +784,6 @@ def _bulk_operation_result(payload: dict[str, Any], account_ids: list[int]) -> d
     }
 
 
-def _bulk_response_has_account_outcomes(payload: dict[str, Any]) -> bool:
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-    if not isinstance(data, dict):
-        return False
-    return bool(
-        data.get("success_ids")
-        or data.get("successIds")
-        or data.get("failed_ids")
-        or data.get("failedIds")
-        or data.get("results")
-    )
-
-
 def _import_error_details(data: dict[str, Any]) -> list[dict[str, str]]:
     errors: list[dict[str, str]] = []
     for item in data.get("errors") or []:
@@ -1554,6 +1541,7 @@ class PixelManager:
                     "failed": len(ids) - success,
                     "successIds": [item["accountId"] for item in results if item["success"]],
                     "failedIds": [item["accountId"] for item in results if not item["success"]],
+                    "concurrencyById": dict(shared.get("concurrencyById") or {}),
                     "results": results,
                 }
 
@@ -1587,10 +1575,9 @@ class PixelManager:
     async def _public_account_ids(
         self,
         target: PixelTarget,
-        ids: list[int],
-        concurrency: int,
+        concurrency_by_id: dict[int, int],
     ) -> set[int]:
-        requested = set(ids)
+        requested = set(concurrency_by_id)
         for attempt in range(3):
             public_ids: set[int] = set()
             for page in range(1, MAX_ACCOUNT_PAGES + 1):
@@ -1604,7 +1591,7 @@ class PixelManager:
                     if (
                         account_id in requested
                         and share_mode == "public"
-                        and account_concurrency == concurrency
+                        and account_concurrency == concurrency_by_id[account_id]
                     ):
                         public_ids.add(account_id)
                 pages = _positive_int(data.get("pages"), page)
@@ -1629,29 +1616,32 @@ class PixelManager:
             timeout=LONG_OPERATION_TIMEOUT_SECONDS,
             retry_transient=True,
         )
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        requested = set(ids)
-        success_ids = [
-            value
-            for value in dict.fromkeys(_positive_int(item, -1) for item in data.get("success_ids") or [])
-            if value in requested
-        ]
-        failed_ids = [
-            value
-            for value in dict.fromkeys(_positive_int(item, -1) for item in data.get("failed_ids") or [])
-            if value in requested and value not in success_ids
-        ]
-        if not success_ids and not failed_ids:
-            for item in data.get("results") or []:
-                if not isinstance(item, dict):
-                    continue
-                account_id = _positive_int(item.get("account_id"), -1)
-                if account_id not in requested:
-                    continue
-                (success_ids if item.get("success") else failed_ids).append(account_id)
-        accounted = set(success_ids) | set(failed_ids)
-        failed_ids.extend(account_id for account_id in ids if account_id not in accounted)
-        return {"successIds": success_ids, "failedIds": failed_ids}
+        return _bulk_operation_result(payload, ids)
+
+    async def _bulk_update_concurrency_chunk(
+        self,
+        target: PixelTarget,
+        ids: list[int],
+        concurrency: int,
+    ) -> dict[str, Any]:
+        body = {"account_ids": ids, "concurrency": concurrency}
+        last_error: PixelManagerError | None = None
+        for path in ("/api/v1/accounts/bulk-update", "/api/v1/admin/accounts/bulk-update"):
+            try:
+                payload = await self._request(
+                    target,
+                    "POST",
+                    path,
+                    json_body=body,
+                    timeout=LONG_OPERATION_TIMEOUT_SECONDS,
+                    retry_transient=True,
+                )
+                return _bulk_operation_result(payload, ids)
+            except PixelManagerError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise PixelManagerError("并发数更新接口不可用")
 
     async def _share_accounts_unlocked(
         self,
@@ -1671,67 +1661,46 @@ class PixelManager:
             }
         else:
             concurrency_by_id = {account_id: concurrency for account_id in ids}
-        if concurrency_by_id:
-            success_ids: list[int] = []
-            failed_ids: list[int] = []
-            for start in range(0, len(ids), MAX_BULK_ACCOUNTS):
-                chunk = ids[start : start + MAX_BULK_ACCOUNTS]
-                chunk_groups: dict[int, list[int]] = {}
-                for account_id in chunk:
-                    chunk_groups.setdefault(concurrency_by_id[account_id], []).append(account_id)
-                for account_concurrency, group_ids in chunk_groups.items():
-                    verify_after_request = False
+        for start in range(0, len(ids), MAX_BULK_ACCOUNTS):
+            chunk = ids[start : start + MAX_BULK_ACCOUNTS]
+            chunk_groups: dict[int, list[int]] = {}
+            for account_id in chunk:
+                chunk_groups.setdefault(concurrency_by_id[account_id], []).append(account_id)
+            for account_concurrency, group_ids in chunk_groups.items():
+                try:
+                    concurrency_result = await self._bulk_update_concurrency_chunk(
+                        target,
+                        group_ids,
+                        account_concurrency,
+                    )
+                except PixelManagerError:
+                    continue
+                concurrency_success_ids = concurrency_result["successIds"]
+                for share_start in range(0, len(concurrency_success_ids), SHARE_CHUNK_SIZE):
                     try:
-                        result = await self._bulk_update_public_chunk(
+                        await self._share_chunk(
                             target,
-                            group_ids,
-                            account_concurrency,
+                            concurrency_success_ids[share_start : share_start + SHARE_CHUNK_SIZE],
                         )
-                        success_ids.extend(result["successIds"])
-                        failed_ids.extend(result["failedIds"])
-                        verify_after_request = result["verifyAfterRequest"]
                     except PixelManagerError:
-                        failed_ids.extend(group_ids)
-                        verify_after_request = True
-                    if verify_after_request:
-                        try:
-                            verified_ids = await self._public_account_ids(target, group_ids, account_concurrency)
-                        except PixelManagerError:
-                            verified_ids = set()
-                        success_ids = [
-                            account_id
-                            for account_id in success_ids
-                            if account_id not in group_ids or account_id in verified_ids
-                        ]
-                        failed_ids = [
-                            account_id
-                            for account_id in failed_ids
-                            if account_id not in verified_ids
-                        ]
-                        success_ids.extend(account_id for account_id in group_ids if account_id in verified_ids)
-                        failed_ids.extend(account_id for account_id in group_ids if account_id not in verified_ids)
-            success_ids = list(dict.fromkeys(account_id for account_id in ids if account_id in set(success_ids)))
-            failed_ids = [account_id for account_id in ids if account_id not in set(success_ids)]
-            return {
-                "ok": not failed_ids,
-                "success": len(success_ids),
-                "failed": len(failed_ids),
-                "successIds": success_ids,
-                "failedIds": failed_ids,
-            }
+                        pass
 
-        success_ids: list[int] = []
-        failed_ids: list[int] = []
-        for start in range(0, len(ids), SHARE_CHUNK_SIZE):
-            result = await self._share_chunk(target, ids[start : start + SHARE_CHUNK_SIZE])
-            success_ids.extend(result["successIds"])
-            failed_ids.extend(result["failedIds"])
+        try:
+            verified_ids = await self._public_account_ids(target, concurrency_by_id)
+        except PixelManagerError:
+            verified_ids = set()
+        success_ids = [account_id for account_id in ids if account_id in verified_ids]
+        failed_ids = [account_id for account_id in ids if account_id not in verified_ids]
         return {
             "ok": not failed_ids,
             "success": len(success_ids),
             "failed": len(failed_ids),
             "successIds": success_ids,
             "failedIds": failed_ids,
+            "concurrencyById": {
+                str(account_id): concurrency_by_id[account_id]
+                for account_id in success_ids
+            },
         }
 
     async def share_accounts(self, target_id: str, account_ids: Iterable[int]) -> dict[str, Any]:
@@ -1742,39 +1711,6 @@ class PixelManager:
                 target,
                 ids,
             )
-
-    async def _bulk_update_public_chunk(
-        self,
-        target: PixelTarget,
-        ids: list[int],
-        concurrency: int,
-    ) -> dict[str, Any]:
-        body = {
-            "account_ids": ids,
-            "share_mode": "public",
-            "concurrency": concurrency,
-        }
-        last_error: PixelManagerError | None = None
-        for path in ("/api/v1/admin/accounts/bulk-update", "/api/v1/accounts/bulk-update"):
-            try:
-                payload = await self._request(
-                    target,
-                    "POST",
-                    path,
-                    json_body=body,
-                    timeout=LONG_OPERATION_TIMEOUT_SECONDS,
-                    retry_transient=True,
-                )
-                result = _bulk_operation_result(payload, ids)
-                return {
-                    **result,
-                    "verifyAfterRequest": not _bulk_response_has_account_outcomes(payload),
-                }
-            except PixelManagerError as exc:
-                last_error = exc
-        if last_error is not None:
-            raise last_error
-        raise PixelManagerError("公共共享接口不可用")
 
     async def share_all_accounts(
         self,
@@ -1804,6 +1740,7 @@ class PixelManager:
                             "shared": 0,
                             "failed": 0,
                             "failedIds": [],
+                            "concurrencyById": {},
                             "status": "success",
                             "message": "平台没有账号",
                         }
@@ -1817,6 +1754,7 @@ class PixelManager:
                             "shared": _positive_int(share.get("success")),
                             "failed": failed,
                             "failedIds": share.get("failedIds") or [],
+                            "concurrencyById": dict(share.get("concurrencyById") or {}),
                             "status": "success" if failed == 0 else ("failed" if failed == len(ids) else "partial"),
                             "message": "公共共享已全部开启" if failed == 0 else f"仍有 {failed} 个账号共享失败",
                         }
@@ -1836,6 +1774,7 @@ class PixelManager:
                         "shared": 0,
                         "failed": 0,
                         "failedIds": [],
+                        "concurrencyById": {},
                         "status": "failed",
                         "message": exc.public_message,
                     }
@@ -1874,6 +1813,7 @@ class PixelManager:
             "shared": 0,
             "shareFailed": 0,
             "failedShareIds": [],
+            "concurrencyById": {},
             "importErrors": [],
             "generatedNames": [],
         }
@@ -1933,7 +1873,7 @@ class PixelManager:
             )
             generated_names = [after_accounts[account_id] for account_id in imported_ids]
             created = max(created, len(imported_ids))
-            share_result = {"success": 0, "failed": 0, "failedIds": []}
+            share_result = {"success": 0, "failed": 0, "failedIds": [], "concurrencyById": {}}
             if imported_ids:
                 try:
                     share_result = await self._share_accounts_unlocked(
@@ -1945,6 +1885,7 @@ class PixelManager:
                         "success": 0,
                         "failed": len(imported_ids),
                         "failedIds": imported_ids,
+                        "concurrencyById": {},
                     }
                     request_error = request_error or exc.public_message
 
@@ -1963,6 +1904,7 @@ class PixelManager:
                     "shared": _positive_int(share_result.get("success")),
                     "shareFailed": share_failed,
                     "failedShareIds": list(share_result.get("failedIds") or []),
+                    "concurrencyById": dict(share_result.get("concurrencyById") or {}),
                     "generatedNames": generated_names,
                 }
             )
