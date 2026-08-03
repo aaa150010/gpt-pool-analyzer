@@ -10,6 +10,7 @@ import type {
   PixelExportJob,
   PixelImportJob,
   PixelImportRecord,
+  PixelShareAllResponse,
   PixelShareResponse,
   PixelTarget,
   PoolAnalyticsResponse,
@@ -254,6 +255,11 @@ export const api = {
     requestPixelJson<PixelShareResponse>(`/pixel-manager/targets/${encodeURIComponent(targetId)}/share`, {
       method: "POST",
       body: JSON.stringify({ accountIds }),
+    }),
+  pixelShareAll: (targetIds: string[], concurrency?: number) =>
+    requestPixelJson<PixelShareAllResponse>("/pixel-manager/share-all", {
+      method: "POST",
+      body: JSON.stringify({ targetIds, ...(concurrency === undefined ? {} : { concurrency }) }),
     }),
   pixelExport: () => downloadPixelExport(),
   pixelExportJobCreate: (targetIds: string[]) =>

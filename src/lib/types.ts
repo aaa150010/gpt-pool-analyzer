@@ -565,6 +565,28 @@ export type PixelShareResponse = {
   failedIds: number[];
 };
 
+export type PixelShareAllTargetResult = {
+  targetId: string;
+  email: string;
+  total: number;
+  shared: number;
+  failed: number;
+  failedIds: number[];
+  status: "success" | "partial" | "failed";
+  message: string;
+};
+
+export type PixelShareAllResponse = {
+  ok: boolean;
+  status: "success" | "partial" | "failed";
+  totalTargets: number;
+  total: number;
+  shared: number;
+  failed: number;
+  results: PixelShareAllTargetResult[];
+  message: string;
+};
+
 export type PixelExportDownload = {
   blob: Blob;
   fileName: string;

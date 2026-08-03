@@ -524,13 +524,13 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         await manager.list_accounts("one", 1, 20)
         self.assertEqual(logins, ["one.example", "two.example"])
 
-    async def test_import_sets_only_new_ids_public_with_concurrency_ten(self) -> None:
+    async def test_import_sets_only_new_ids_public_with_random_concurrency(self) -> None:
         account_reads = 0
         captured_import: dict = {}
-        captured_share: dict = {}
+        captured_shares: list[dict] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal account_reads, captured_import, captured_share
+            nonlocal account_reads, captured_import
             if request.url.path == "/api/v1/auth/login":
                 return login_response()
             if request.url.path == "/api/v1/accounts" and request.method == "GET":
@@ -560,16 +560,17 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
                     200,
                     json={"data": {"total": 2, "created": 2, "updated": 0, "failed": 0, "errors": []}},
                 )
-            if request.url.path == "/api/v1/accounts/bulk-update":
-                captured_share = json.loads(request.content)
+            if request.url.path == "/api/v1/admin/accounts/bulk-update":
+                body = json.loads(request.content)
+                captured_shares.append(body)
                 return httpx.Response(
                     200,
                     json={
                         "data": {
-                            "success": 1,
-                            "failed": 1,
-                            "success_ids": [2],
-                            "failed_ids": [3],
+                            "success": len(body["account_ids"]),
+                            "failed": 0,
+                            "success_ids": body["account_ids"],
+                            "failed_ids": [],
                             "results": [],
                         }
                     },
@@ -586,7 +587,8 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
                 ]
             ).encode(),
         )
-        response = await manager.import_bundle(bundle, ["pixel-1"])
+        with patch("server.pixel_manager.secrets.randbelow", side_effect=[0, 7]):
+            response = await manager.import_bundle(bundle, ["pixel-1"])
         result = response["results"][0]
 
         self.assertEqual(captured_import["platform"], "openai")
@@ -597,23 +599,24 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(imported_payload["accounts"]), 2)
         self.assertTrue(all(item["credentials"]["plan_type"] == "plus" for item in imported_payload["accounts"]))
         self.assertTrue(all(item["name"].startswith("acct-") for item in imported_payload["accounts"]))
-        self.assertEqual(captured_share["account_ids"], [2, 3])
-        self.assertEqual(captured_share["share_mode"], "public")
-        self.assertEqual(captured_share["concurrency"], 10)
-        self.assertEqual(result["shared"], 1)
-        self.assertEqual(result["shareFailed"], 1)
-        self.assertEqual(result["failedShareIds"], [3])
-        self.assertEqual(result["status"], "partial")
+        self.assertEqual(captured_shares, [
+            {"account_ids": [2], "share_mode": "public", "concurrency": 3},
+            {"account_ids": [3], "share_mode": "public", "concurrency": 10},
+        ])
+        self.assertEqual(result["shared"], 2)
+        self.assertEqual(result["shareFailed"], 0)
+        self.assertEqual(result["failedShareIds"], [])
+        self.assertEqual(result["status"], "success")
         self.assertNotIn("fake-one", json.dumps(response))
 
-    async def test_share_retry_uses_bulk_update_with_public_concurrency_ten(self) -> None:
+    async def test_share_retry_uses_bulk_update_with_random_public_concurrency(self) -> None:
         captured: dict = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
             nonlocal captured
             if request.url.path == "/api/v1/auth/login":
                 return login_response()
-            if request.url.path == "/api/v1/accounts/bulk-update":
+            if request.url.path == "/api/v1/admin/accounts/bulk-update":
                 captured = json.loads(request.content)
                 return httpx.Response(
                     200,
@@ -637,7 +640,8 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
             raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
         manager = manager_with_transport(handler)
-        result = await manager.share_accounts("pixel-1", [41, 42])
+        with patch("server.pixel_manager.secrets.randbelow", return_value=7):
+            result = await manager.share_accounts("pixel-1", [41, 42])
 
         self.assertEqual(
             captured,
@@ -649,6 +653,123 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["successIds"], [41, 42])
         self.assertEqual(result["failedIds"], [])
+
+    async def test_share_retry_verifies_reported_success_and_randomizes_per_account(self) -> None:
+        captured_payloads: list[dict] = []
+        concurrency_by_id: dict[int, int] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v1/auth/login":
+                return login_response()
+            if request.url.path == "/api/v1/admin/accounts/bulk-update":
+                body = json.loads(request.content)
+                captured_payloads.append(body)
+                for account_id in body["account_ids"]:
+                    concurrency_by_id[account_id] = body["concurrency"]
+                return httpx.Response(200, json={"data": {"success": len(body["account_ids"]), "failed": 0}})
+            if request.url.path == "/api/v1/accounts" and request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "items": [
+                                {"id": account_id, "share_mode": "public", "concurrency": concurrency}
+                                for account_id, concurrency in sorted(concurrency_by_id.items())
+                            ],
+                            "page": 1,
+                            "pages": 1,
+                            "total": len(concurrency_by_id),
+                        }
+                    },
+                )
+            raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+        manager = manager_with_transport(handler)
+        with patch("server.pixel_manager.secrets.randbelow", side_effect=[0, 1, 7]):
+            result = await manager.share_accounts("pixel-1", [41, 42, 43])
+
+        self.assertEqual(captured_payloads, [
+            {"account_ids": [41], "share_mode": "public", "concurrency": 3},
+            {"account_ids": [42], "share_mode": "public", "concurrency": 4},
+            {"account_ids": [43], "share_mode": "public", "concurrency": 10},
+        ])
+        self.assertEqual(result["successIds"], [41, 42, 43])
+        self.assertEqual(result["failedIds"], [])
+
+    async def test_share_retry_falls_back_to_user_bulk_update(self) -> None:
+        paths: list[str] = []
+        captured: dict = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal captured
+            if request.url.path == "/api/v1/auth/login":
+                return login_response()
+            if request.url.path in {"/api/v1/accounts/bulk-update", "/api/v1/admin/accounts/bulk-update"}:
+                paths.append(request.url.path)
+                captured = json.loads(request.content)
+                if request.url.path == "/api/v1/admin/accounts/bulk-update":
+                    return httpx.Response(404, json={"message": "not found"})
+                return httpx.Response(
+                    200,
+                    json={"data": {"success_ids": [41, 42], "failed_ids": []}},
+                )
+            raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+        manager = manager_with_transport(handler)
+        with patch("server.pixel_manager.secrets.randbelow", return_value=7):
+            result = await manager.share_accounts("pixel-1", [41, 42])
+
+        self.assertEqual(paths, ["/api/v1/admin/accounts/bulk-update", "/api/v1/accounts/bulk-update"])
+        self.assertEqual(
+            captured,
+            {
+                "account_ids": [41, 42],
+                "share_mode": "public",
+                "concurrency": 10,
+            },
+        )
+        self.assertEqual(result["successIds"], [41, 42])
+        self.assertEqual(result["failedIds"], [])
+
+    async def test_share_all_accounts_processes_every_configured_target(self) -> None:
+        target_one = target("pixel-1", "https://pixel-one.example")
+        target_two = target("pixel-2", "https://pixel-two.example")
+        updated_by_host: dict[str, list[int]] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            host = request.url.host or ""
+            if request.url.path == "/api/v1/auth/login":
+                return login_response(f"access-{host}", f"refresh-{host}")
+            if request.url.path == "/api/v1/accounts" and request.method == "GET":
+                ids = [11, 12] if host == "pixel-one.example" else [21]
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": {
+                            "items": [{"id": account_id, "share_mode": "public", "concurrency": 10} for account_id in ids],
+                            "page": 1,
+                            "pages": 1,
+                            "total": len(ids),
+                        }
+                    },
+                )
+            if request.url.path == "/api/v1/admin/accounts/bulk-update":
+                body = json.loads(request.content)
+                updated_by_host[host] = body["account_ids"]
+                return httpx.Response(
+                    200,
+                    json={"data": {"success_ids": body["account_ids"], "failed_ids": []}},
+                )
+            raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+        manager = manager_with_transport(handler, target_one, target_two)
+        result = await manager.share_all_accounts(concurrency=10)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["totalTargets"], 2)
+        self.assertEqual(result["total"], 3)
+        self.assertEqual(result["shared"], 3)
+        self.assertEqual(updated_by_host, {"pixel-one.example": [11, 12], "pixel-two.example": [21]})
 
     async def test_share_rejects_empty_ids(self) -> None:
         manager = manager_with_transport(lambda _: login_response())
@@ -856,7 +977,7 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/api/v1/auth/login":
                 return login_response()
-            if request.url.path == "/api/v1/accounts/bulk-update":
+            if request.url.path == "/api/v1/admin/accounts/bulk-update":
                 captured_payloads.append(json.loads(request.content))
                 return httpx.Response(
                     200,

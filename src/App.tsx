@@ -22,6 +22,7 @@ import {
   Search,
   Server,
   Settings,
+  Share2,
   Trash2,
   TrendingUp,
   Upload,
@@ -65,6 +66,7 @@ import type {
   PixelImportJob,
   PixelImportRecord,
   PixelImportTargetResult,
+  PixelShareAllResponse,
   PixelTarget,
   ServerStateResponse,
   StoredState,
@@ -1464,6 +1466,8 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   const [exportSelectedTargetIds, setExportSelectedTargetIds] = useState<Set<string>>(new Set());
   const [exportJob, setExportJob] = useState<PixelExportJob | null>(null);
   const [retryingTargetId, setRetryingTargetId] = useState("");
+  const [sharingAll, setSharingAll] = useState(false);
+  const [shareAllResult, setShareAllResult] = useState<PixelShareAllResponse | null>(null);
   const [exporting, setExporting] = useState(false);
   const [importRecords, setImportRecords] = useState<PixelImportRecord[]>([]);
   const [importRecordsOpen, setImportRecordsOpen] = useState(false);
@@ -1912,6 +1916,23 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
     }
   };
 
+  const runShareAll = async () => {
+    if (!targets.length) return;
+    setSharingAll(true);
+    try {
+      const response = await api.pixelShareAll(targets.map((target) => target.id));
+      setShareAllResult(response);
+      const targetList = await loadTargets();
+      await refreshAllTargetCountsRef.current(targetList, { silent: true });
+      await loadAccountsRef.current();
+      onToast(response.failed ? `一键打开共享完成：仍有 ${response.failed} 个账号失败` : `一键打开共享完成：${response.shared} 个账号已公共共享`);
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "一键打开共享失败");
+    } finally {
+      setSharingAll(false);
+    }
+  };
+
   const accelerateImport = async () => {
     if (!importJob || importJob.phase !== "waiting") return;
     setImportAccelerating(true);
@@ -2050,19 +2071,27 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                 setSelectedFiles(files);
               }}
             />
-            <Button variant="outline" disabled={importing} onClick={() => fileInputRef.current?.click()}>
+            <Button variant="outline" disabled={importing || sharingAll} onClick={() => fileInputRef.current?.click()}>
               <FileJson className="h-4 w-4" />
               选择 JSON
             </Button>
-            <Button disabled={importing || !selectedFiles.length || !targets.length} onClick={openImport}>
+            <Button disabled={importing || sharingAll || !selectedFiles.length || !targets.length} onClick={openImport}>
               <Upload className="h-4 w-4" />
               上传到平台
             </Button>
-            <Button variant="outline" disabled={importing || targetsLoading} onClick={() => void openImportRecords()}>
+            <Button
+              variant="outline"
+              disabled={sharingAll || importing || exporting || targetsLoading || !targets.length}
+              onClick={() => void runShareAll()}
+            >
+              {sharingAll ? <Loader2 className="h-4 w-4 animate-spin" /> : <Share2 className="h-4 w-4" />}
+              {sharingAll ? "正在打开共享" : "一键打开共享"}
+            </Button>
+            <Button variant="outline" disabled={importing || sharingAll || targetsLoading} onClick={() => void openImportRecords()}>
               <History className="h-4 w-4" />
               导入记录
             </Button>
-            <Button variant="outline" disabled={exporting || importing || targetsLoading || !targets.length} onClick={openExport}>
+            <Button variant="outline" disabled={exporting || sharingAll || importing || targetsLoading || !targets.length} onClick={openExport}>
               {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
               {exporting ? "正在处理" : "汇总导出"}
             </Button>
@@ -2083,7 +2112,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                 type="button"
                 title="刷新全部账号数量"
                 aria-label="刷新七个平台账号数量"
-                disabled={targetsLoading || targetCountsRefreshing || !targets.length || Boolean(bulkAction)}
+                disabled={targetsLoading || targetCountsRefreshing || sharingAll || !targets.length || Boolean(bulkAction)}
                 className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
                 onClick={() => void refreshAllTargetCounts()}
               >
@@ -2105,7 +2134,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               return (
                 <button
                   key={target.id}
-                  disabled={Boolean(bulkAction)}
+                  disabled={Boolean(bulkAction) || sharingAll}
                   className={cn(
                     "mb-1 flex h-14 w-full items-center gap-2 rounded-md border px-2.5 text-left transition last:mb-0 disabled:cursor-wait disabled:opacity-60",
                     active ? "border-blue-200 bg-blue-50 text-blue-950" : "border-transparent hover:border-border hover:bg-muted",
@@ -2143,7 +2172,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <Button variant="outline" size="icon" title="刷新账号列表" disabled={!activeTargetId || accountsLoading || Boolean(bulkAction)} onClick={() => void loadAccounts()}>
+              <Button variant="outline" size="icon" title="刷新账号列表" disabled={!activeTargetId || accountsLoading || sharingAll || Boolean(bulkAction)} onClick={() => void loadAccounts()}>
                 <RefreshCw className={cn("h-4 w-4", accountsLoading && "animate-spin")} />
               </Button>
             </div>
@@ -2156,7 +2185,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                   aria-label="搜索账号"
                   value={accountSearchInput}
                   placeholder="搜索账号名称"
-                  disabled={!activeTargetId || Boolean(bulkAction)}
+                  disabled={!activeTargetId || sharingAll || Boolean(bulkAction)}
                   onChange={(event) => setAccountSearchInput(event.target.value)}
                   className="h-8 pl-8 pr-8 text-xs font-bold"
                 />
@@ -2165,7 +2194,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                     type="button"
                     title="清空搜索"
                     aria-label="清空搜索"
-                    disabled={Boolean(bulkAction)}
+                    disabled={sharingAll || Boolean(bulkAction)}
                     className="absolute right-1.5 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
                     onClick={() => setAccountSearchInput("")}
                   >
@@ -2176,7 +2205,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               <select
                 aria-label="账号状态筛选"
                 value={accountStatus}
-                disabled={!activeTargetId || accountsLoading || Boolean(bulkAction)}
+                disabled={!activeTargetId || accountsLoading || sharingAll || Boolean(bulkAction)}
                 onChange={(event) => {
                   beginAccountsTransition();
                   setPage(1);
@@ -2192,15 +2221,15 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               </select>
               <span className={cn("mr-auto whitespace-nowrap text-xs font-black", selectedAccountIds.size ? "text-blue-700" : "text-muted-foreground")}>已选 {selectedAccountIds.size}</span>
               <div className="flex shrink-0 items-center gap-2">
-                <Button variant="outline" size="sm" disabled={!selectedAccountIds.size || accountsLoading || Boolean(bulkAction)} onClick={() => void runBulkTest()}>
+                <Button variant="outline" size="sm" disabled={!selectedAccountIds.size || accountsLoading || sharingAll || Boolean(bulkAction)} onClick={() => void runBulkTest()}>
                   {bulkAction === "test" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Activity className="h-3.5 w-3.5" />}
                   批量测试连接
                 </Button>
-                <Button variant="outline" size="sm" disabled={!selectedAccountIds.size || accountsLoading || Boolean(bulkAction)} onClick={openBulkEdit}>
+                <Button variant="outline" size="sm" disabled={!selectedAccountIds.size || accountsLoading || sharingAll || Boolean(bulkAction)} onClick={openBulkEdit}>
                   {bulkAction === "update" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Settings className="h-3.5 w-3.5" />}
                   批量编辑
                 </Button>
-                <Button variant="destructive" size="sm" disabled={!selectedAccountIds.size || accountsLoading || Boolean(bulkAction)} onClick={openBulkDelete}>
+                <Button variant="destructive" size="sm" disabled={!selectedAccountIds.size || accountsLoading || sharingAll || Boolean(bulkAction)} onClick={openBulkDelete}>
                   <Trash2 className="h-3.5 w-3.5" />
                   批量删除
                 </Button>
@@ -2324,6 +2353,46 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               </Button>
             </div>
             <PixelExportResults job={exportJob} retryingTargetId={retryingTargetId} onRetry={retryShare} />
+          </DialogContent>
+        </Dialog>
+      )}
+      {shareAllResult && (
+        <Dialog open onOpenChange={(open) => !open && setShareAllResult(null)}>
+          <DialogContent className="max-h-[min(680px,calc(100vh-48px))] w-[min(calc(100vw-48px),980px)] overflow-auto">
+            <DialogHeader>
+              <DialogTitle>一键打开共享完成</DialogTitle>
+              <DialogDescription>
+                已处理 {shareAllResult.totalTargets} 个平台账号，共 {shareAllResult.total} 个账号，成功 {shareAllResult.shared} 个，失败 {shareAllResult.failed} 个。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="overflow-hidden rounded-md border border-border">
+              <table className="w-full table-fixed text-left text-xs">
+                <thead className="bg-muted text-[11px] font-black text-muted-foreground">
+                  <tr>
+                    <th className="w-[260px] px-3 py-2.5">平台账号</th>
+                    <th className="w-[88px] px-3 py-2.5">总账号</th>
+                    <th className="w-[88px] px-3 py-2.5">已共享</th>
+                    <th className="w-[88px] px-3 py-2.5">失败</th>
+                    <th className="px-3 py-2.5">结果</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {shareAllResult.results.map((result) => (
+                    <tr key={result.targetId} className="border-t border-border">
+                      <td className="truncate px-3 py-2.5 font-black" title={result.email}>{result.email}</td>
+                      <td className="px-3 py-2.5 font-black">{result.total}</td>
+                      <td className="px-3 py-2.5 font-black text-emerald-700">{result.shared}</td>
+                      <td className={cn("px-3 py-2.5 font-black", result.failed ? "text-rose-700" : "text-muted-foreground")}>{result.failed}</td>
+                      <td className="px-3 py-2.5">
+                        <div className={cn("truncate font-bold", result.status === "success" ? "text-emerald-700" : result.status === "partial" ? "text-amber-700" : "text-rose-700")} title={result.message}>
+                          {result.message}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </DialogContent>
         </Dialog>
       )}

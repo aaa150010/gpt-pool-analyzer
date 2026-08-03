@@ -29,6 +29,8 @@ MAX_ACCOUNT_PAGES = 200
 MAX_RETAINED_IMPORT_JOBS = 50
 MAX_RETAINED_EXPORT_JOBS = 20
 PUBLIC_SHARE_CONCURRENCY = 10
+PUBLIC_SHARE_RANDOM_MIN_CONCURRENCY = 3
+PUBLIC_SHARE_RANDOM_MAX_CONCURRENCY = 10
 TOKEN_EXPIRY_SKEW_SECONDS = 60
 DEFAULT_PLATFORM_TIMEOUT_SECONDS = 30.0
 LONG_OPERATION_TIMEOUT_SECONDS = 120.0
@@ -1530,8 +1532,12 @@ class PixelManager:
             raise PixelValidationError("至少选择一项批量编辑内容")
 
         async with self._operation_locks[target.id]:
-            if normalized_share_mode and concurrency is None:
-                shared = await self._share_accounts_unlocked(target, ids)
+            if normalized_share_mode:
+                shared = await self._share_accounts_unlocked(
+                    target,
+                    ids,
+                    concurrency=concurrency,
+                )
                 results = [
                     {
                         "accountId": account_id,
@@ -1552,8 +1558,6 @@ class PixelManager:
                 }
 
             body: dict[str, Any] = {"account_ids": ids}
-            if normalized_share_mode:
-                body["share_mode"] = "public"
             if concurrency is not None:
                 body["concurrency"] = concurrency
             payload = await self._request(
@@ -1656,44 +1660,56 @@ class PixelManager:
         *,
         concurrency: int | None = None,
     ) -> dict[str, Any]:
-        # PixelAPI exposes public sharing through bulk-update; keep the
-        # account concurrency explicit for both import and retry paths.
-        concurrency = PUBLIC_SHARE_CONCURRENCY if concurrency is None else concurrency
         if concurrency is not None:
             if isinstance(concurrency, bool) or not isinstance(concurrency, int) or not 1 <= concurrency <= 50:
                 raise PixelValidationError("公共共享并发数必须是 1-50 的整数")
+        if concurrency is None:
+            concurrency_by_id = {
+                account_id: PUBLIC_SHARE_RANDOM_MIN_CONCURRENCY
+                + secrets.randbelow(PUBLIC_SHARE_RANDOM_MAX_CONCURRENCY - PUBLIC_SHARE_RANDOM_MIN_CONCURRENCY + 1)
+                for account_id in ids
+            }
+        else:
+            concurrency_by_id = {account_id: concurrency for account_id in ids}
+        if concurrency_by_id:
             success_ids: list[int] = []
             failed_ids: list[int] = []
             for start in range(0, len(ids), MAX_BULK_ACCOUNTS):
                 chunk = ids[start : start + MAX_BULK_ACCOUNTS]
-                verify_after_request = False
-                try:
-                    payload = await self._request(
-                        target,
-                        "POST",
-                        "/api/v1/accounts/bulk-update",
-                        json_body={
-                            "account_ids": chunk,
-                            "share_mode": "public",
-                            "concurrency": concurrency,
-                        },
-                        timeout=LONG_OPERATION_TIMEOUT_SECONDS,
-                        retry_transient=True,
-                    )
-                    result = _bulk_operation_result(payload, chunk)
-                    success_ids.extend(result["successIds"])
-                    failed_ids.extend(result["failedIds"])
-                    verify_after_request = not _bulk_response_has_account_outcomes(payload)
-                except PixelManagerError:
-                    failed_ids.extend(chunk)
-                    verify_after_request = True
-                if verify_after_request:
+                chunk_groups: dict[int, list[int]] = {}
+                for account_id in chunk:
+                    chunk_groups.setdefault(concurrency_by_id[account_id], []).append(account_id)
+                for account_concurrency, group_ids in chunk_groups.items():
+                    verify_after_request = False
                     try:
-                        verified_ids = await self._public_account_ids(target, chunk, concurrency)
+                        result = await self._bulk_update_public_chunk(
+                            target,
+                            group_ids,
+                            account_concurrency,
+                        )
+                        success_ids.extend(result["successIds"])
+                        failed_ids.extend(result["failedIds"])
+                        verify_after_request = result["verifyAfterRequest"]
                     except PixelManagerError:
-                        verified_ids = set()
-                    success_ids.extend(account_id for account_id in chunk if account_id in verified_ids)
-                    failed_ids = [account_id for account_id in failed_ids if account_id not in verified_ids]
+                        failed_ids.extend(group_ids)
+                        verify_after_request = True
+                    if verify_after_request:
+                        try:
+                            verified_ids = await self._public_account_ids(target, group_ids, account_concurrency)
+                        except PixelManagerError:
+                            verified_ids = set()
+                        success_ids = [
+                            account_id
+                            for account_id in success_ids
+                            if account_id not in group_ids or account_id in verified_ids
+                        ]
+                        failed_ids = [
+                            account_id
+                            for account_id in failed_ids
+                            if account_id not in verified_ids
+                        ]
+                        success_ids.extend(account_id for account_id in group_ids if account_id in verified_ids)
+                        failed_ids.extend(account_id for account_id in group_ids if account_id not in verified_ids)
             success_ids = list(dict.fromkeys(account_id for account_id in ids if account_id in set(success_ids)))
             failed_ids = [account_id for account_id in ids if account_id not in set(success_ids)]
             return {
@@ -1725,8 +1741,124 @@ class PixelManager:
             return await self._share_accounts_unlocked(
                 target,
                 ids,
-                concurrency=PUBLIC_SHARE_CONCURRENCY,
             )
+
+    async def _bulk_update_public_chunk(
+        self,
+        target: PixelTarget,
+        ids: list[int],
+        concurrency: int,
+    ) -> dict[str, Any]:
+        body = {
+            "account_ids": ids,
+            "share_mode": "public",
+            "concurrency": concurrency,
+        }
+        last_error: PixelManagerError | None = None
+        for path in ("/api/v1/admin/accounts/bulk-update", "/api/v1/accounts/bulk-update"):
+            try:
+                payload = await self._request(
+                    target,
+                    "POST",
+                    path,
+                    json_body=body,
+                    timeout=LONG_OPERATION_TIMEOUT_SECONDS,
+                    retry_transient=True,
+                )
+                result = _bulk_operation_result(payload, ids)
+                return {
+                    **result,
+                    "verifyAfterRequest": not _bulk_response_has_account_outcomes(payload),
+                }
+            except PixelManagerError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise PixelManagerError("公共共享接口不可用")
+
+    async def share_all_accounts(
+        self,
+        target_ids: Iterable[str] | None = None,
+        *,
+        concurrency: int | None = None,
+    ) -> dict[str, Any]:
+        if concurrency is not None and (isinstance(concurrency, bool) or not isinstance(concurrency, int) or not 1 <= concurrency <= 50):
+            raise PixelValidationError("公共共享并发数必须是 1-50 的整数")
+        requested_ids = [str(value).strip() for value in (target_ids or []) if str(value).strip()]
+        targets = [self._target(target_id) for target_id in requested_ids] if requested_ids else list(self.config.targets.values())
+        if not targets:
+            raise PixelValidationError("没有可处理的平台账号")
+        results: list[dict[str, Any]] = []
+        for target in targets:
+            async with self._operation_locks[target.id]:
+                account_count: int | None = None
+                try:
+                    accounts = await self._all_accounts_by_id(target)
+                    account_count = len(accounts)
+                    ids = sorted(accounts)
+                    if not ids:
+                        result = {
+                            "targetId": target.id,
+                            "email": target.email,
+                            "total": 0,
+                            "shared": 0,
+                            "failed": 0,
+                            "failedIds": [],
+                            "status": "success",
+                            "message": "平台没有账号",
+                        }
+                    else:
+                        share = await self._share_accounts_unlocked(target, ids, concurrency=concurrency)
+                        failed = _positive_int(share.get("failed"))
+                        result = {
+                            "targetId": target.id,
+                            "email": target.email,
+                            "total": len(ids),
+                            "shared": _positive_int(share.get("success")),
+                            "failed": failed,
+                            "failedIds": share.get("failedIds") or [],
+                            "status": "success" if failed == 0 else ("failed" if failed == len(ids) else "partial"),
+                            "message": "公共共享已全部开启" if failed == 0 else f"仍有 {failed} 个账号共享失败",
+                        }
+                    self._target_status[target.id].update(
+                        {
+                            "connected": True,
+                            "accountCount": account_count,
+                            "lastCheckedAt": _utc_now(),
+                            "error": None if result["status"] != "failed" else result["message"],
+                        }
+                    )
+                except PixelManagerError as exc:
+                    result = {
+                        "targetId": target.id,
+                        "email": target.email,
+                        "total": 0,
+                        "shared": 0,
+                        "failed": 0,
+                        "failedIds": [],
+                        "status": "failed",
+                        "message": exc.public_message,
+                    }
+                    self._target_status[target.id].update(
+                        {"connected": False, "lastCheckedAt": _utc_now(), "error": exc.public_message}
+                    )
+                results.append(result)
+        total = sum(_positive_int(item.get("total")) for item in results)
+        shared = sum(_positive_int(item.get("shared")) for item in results)
+        failed = sum(_positive_int(item.get("failed")) for item in results)
+        failed_targets = sum(1 for item in results if item.get("status") == "failed")
+        partial_targets = sum(1 for item in results if item.get("status") == "partial")
+        status = "success" if failed_targets == 0 and partial_targets == 0 else ("failed" if failed_targets == len(results) else "partial")
+        return {
+            "ok": status == "success",
+            "status": status,
+            "totalTargets": len(results),
+            "total": total,
+            "shared": shared,
+            "failed": failed,
+            "results": results,
+            "message": "七个平台公共共享已全部开启" if status == "success" else f"公共共享完成，但有 {failed_targets + partial_targets} 个平台存在失败",
+        }
 
     async def _import_target(
         self, target: PixelTarget, bundle: TargetCredentialBundle
@@ -1807,7 +1939,6 @@ class PixelManager:
                     share_result = await self._share_accounts_unlocked(
                         target,
                         imported_ids,
-                        concurrency=PUBLIC_SHARE_CONCURRENCY,
                     )
                 except PixelManagerError as exc:
                     share_result = {

@@ -291,6 +291,20 @@ def create_pixel_router(
         except PixelManagerError as exc:
             raise pixel_http_error(exc) from exc
 
+    @router.post("/pixel-manager/share-all")
+    async def share_all_accounts(
+        payload: dict[str, Any] | None = None,
+        manager: Any = Depends(require_manager),
+    ) -> dict[str, Any]:
+        try:
+            body = payload or {}
+            return await manager.share_all_accounts(
+                body.get("targetIds") or [],
+                concurrency=body.get("concurrency"),
+            )
+        except PixelManagerError as exc:
+            raise pixel_http_error(exc) from exc
+
     @router.get("/pixel-manager/export")
     async def export_accounts(manager: Any = Depends(require_manager)) -> Response:
         try:
