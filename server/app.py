@@ -13,6 +13,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
+    from .account_policy import is_excluded_account
     from .analytics import build_analytics
     from .cost_ledger import CostLedger
     from .pixel_routes import create_pixel_router
@@ -29,6 +30,7 @@ try:
     from .withdrawal_service import WithdrawalService, initialize_withdrawal_schema
     from .withdrawal_routes import create_withdrawal_router
 except ImportError:
+    from account_policy import is_excluded_account
     from analytics import build_analytics
     from cost_ledger import CostLedger
     from pixel_routes import create_pixel_router
@@ -119,6 +121,15 @@ def require_pixel_manager(
     if not pixel_manager.authorized(manager_key):
         raise HTTPException(status_code=401, detail="账号池管理认证失败")
     return pixel_manager
+
+
+def require_sensitive_pixel_manager(
+    manager_key: str | None = Header(default=None, alias="X-91-Manager-Key"),
+) -> PixelManager:
+    manager = require_pixel_manager(manager_key)
+    if not manager.strictly_authorized(manager_key):
+        raise HTTPException(status_code=401, detail="账号池管理认证失败")
+    return manager
 
 
 def pixel_http_error(exc: PixelManagerError) -> HTTPException:
@@ -244,6 +255,36 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_balance_history_date_id ON balance_history(date, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pixel_import_records_created_at ON pixel_import_records(created_at, record_id)")
         conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('initialized', 'false')")
+        row = conn.execute("SELECT value FROM settings WHERE key = 'balance_accounts'").fetchone()
+        accounts = loads(row["value"], []) if row else []
+        if isinstance(accounts, list):
+            filtered = [
+                item for item in accounts
+                if isinstance(item, dict) and not is_excluded_account(item.get("name"))
+            ]
+            if filtered != accounts:
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES('balance_accounts', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (dumps(filtered),),
+                )
+        pool_row = conn.execute("SELECT value FROM settings WHERE key = 'pool_credentials'").fetchone()
+        pool_credentials = loads(pool_row["value"], {}) if pool_row else {}
+        if isinstance(pool_credentials, dict) and is_excluded_account(pool_credentials.get("email")):
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES('pool_credentials', '{}') "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            )
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES('pool_access_token', '\"\"') "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            )
+        conn.execute(
+            """UPDATE withdrawal_items
+               SET status = 'skipped', status_label = '已排除', error = '账号已从 91 永久排除'
+               WHERE lower(email) = ? AND status IN ('queued', 'running')""",
+            ("1745627971@qq.com",),
+        )
 
 
 def _public_import_target(result: dict[str, Any]) -> dict[str, Any]:
@@ -496,6 +537,8 @@ def public_balance_accounts(raw: Any) -> list[dict[str, Any]]:
     for item in raw:
         if not isinstance(item, dict):
             continue
+        if is_excluded_account(item.get("name")):
+            continue
         api_key = str(item.get("apiKey") or item.get("api_key") or "").strip()
         accounts.append(
             {
@@ -641,7 +684,18 @@ def balance_row(row: sqlite3.Row) -> dict[str, Any]:
 def latest_balance_snapshot_for_withdrawal() -> dict[str, Any] | None:
     with connect() as conn:
         row = conn.execute("SELECT * FROM balance_history ORDER BY date DESC, id DESC LIMIT 1").fetchone()
-    return balance_row(row) if row else None
+    if not row:
+        return None
+    snapshot = balance_row(row)
+    kept = [
+        (account, amount)
+        for account, amount in zip(snapshot.get("accounts") or [], snapshot.get("amounts") or [])
+        if not is_excluded_account(account)
+    ]
+    snapshot["accounts"] = [account for account, _ in kept]
+    snapshot["amounts"] = [amount for _, amount in kept]
+    snapshot["total"] = sum(flexible_number(amount) for _, amount in kept)
+    return snapshot
 
 
 def pool_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -778,6 +832,8 @@ async def poll_balances(client: httpx.AsyncClient) -> None:
     amounts: list[float] = []
     names: list[str] = []
     for account in accounts:
+        if is_excluded_account(account.get("name")):
+            continue
         base_url = str(account.get("baseURL") or "").rstrip("/")
         api_key = account.get("apiKey") or ""
         name = account.get("name") or base_url
@@ -804,7 +860,7 @@ async def login_pool(client: httpx.AsyncClient) -> str | None:
     credentials = get_setting("pool_credentials", {})
     email = credentials.get("email") or ""
     password = credentials.get("password") or ""
-    if not email or not password:
+    if not email or not password or is_excluded_account(email):
         return None
     response = await client.post(
         POOL_LOGIN_URL,
@@ -1031,6 +1087,7 @@ accelerate_withdrawal = withdrawal_route_handlers.accelerate
 pixel_router = create_pixel_router(
     api_prefix=API_PREFIX,
     require_manager=require_pixel_manager,
+    require_sensitive_manager=require_sensitive_pixel_manager,
     pixel_http_error=pixel_http_error,
     connect=connect,
     import_records=pixel_import_records,
@@ -1057,8 +1114,19 @@ async def bootstrap(payload: dict[str, Any]) -> dict[str, Any]:
     pool_state = payload.get("poolState") or {}
     set_setting("stored_state", compact_stored_state(stored_state))
     set_setting("pool_state", compact_pool_state(pool_state))
-    set_setting("balance_accounts", payload.get("balanceAccounts") or [])
-    set_setting("pool_credentials", payload.get("poolCredentials") or {})
+    balance_accounts = payload.get("balanceAccounts") or []
+    set_setting(
+        "balance_accounts",
+        [
+            item for item in balance_accounts
+            if isinstance(item, dict) and not is_excluded_account(item.get("name"))
+        ],
+    )
+    pool_credentials = payload.get("poolCredentials") or {}
+    set_setting(
+        "pool_credentials",
+        {} if is_excluded_account(pool_credentials.get("email")) else pool_credentials,
+    )
     set_setting("smtp_settings", payload.get("smtpSettings") or {})
 
     for snapshot in stored_state.get("history") or []:
@@ -1096,6 +1164,8 @@ async def update_balance_accounts(payload: dict[str, Any]) -> dict[str, Any]:
     accounts = payload.get("accounts") or payload.get("balanceAccounts") or []
     if not isinstance(accounts, list) or not accounts:
         raise HTTPException(status_code=400, detail="accounts required")
+    if any(isinstance(item, dict) and is_excluded_account(item.get("name")) for item in accounts):
+        raise HTTPException(status_code=400, detail="该账号已从 91 永久排除")
     existing_accounts = get_setting("balance_accounts", [])
     existing_accounts = existing_accounts if isinstance(existing_accounts, list) else []
     normalized = []
@@ -1141,6 +1211,8 @@ async def update_pool_credentials(payload: dict[str, Any]) -> dict[str, Any]:
     existing = normalize_pool_credentials(get_setting("pool_credentials", {}))
     credentials["email"] = credentials["email"] or existing["email"]
     credentials["password"] = credentials["password"] or existing["password"]
+    if is_excluded_account(credentials["email"]):
+        raise HTTPException(status_code=400, detail="该账号已从 91 永久排除")
     if not credentials["email"] or not credentials["password"]:
         raise HTTPException(status_code=400, detail="credentials required")
     set_setting("pool_credentials", credentials)

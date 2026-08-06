@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import hmac
 import json
 import math
 import re
@@ -16,6 +17,11 @@ from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
 
 import httpx
+
+try:
+    from .account_policy import is_excluded_account
+except ImportError:
+    from account_policy import is_excluded_account
 
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -249,6 +255,8 @@ def load_config(path: str | Path) -> PixelManagerConfig:
             raise PixelConfigError()
         target_id = str(item.get("id") or "").strip()
         email = str(item.get("email") or "").strip()
+        if is_excluded_account(email):
+            continue
         password = str(item.get("password") or "")
         base_url = str(_first(item, "baseUrl", "base_url", default="") or "").strip().rstrip("/")
         parsed_url = urlparse(base_url)
@@ -281,6 +289,8 @@ def load_config(path: str | Path) -> PixelManagerConfig:
                 _first(item, "importDefaults", "import_defaults", default={})
             ),
         )
+    if not targets:
+        raise PixelConfigError()
     return PixelManagerConfig(
         manager_key=manager_key,
         targets=targets,
@@ -836,6 +846,73 @@ class PixelManager:
             return True
         candidate = str(provided_key or "")
         return bool(candidate) and secrets.compare_digest(candidate, self.config.manager_key)
+
+    def strictly_authorized(self, provided_key: str | None) -> bool:
+        candidate = str(provided_key or "")
+        return bool(candidate) and secrets.compare_digest(candidate, self.config.manager_key)
+
+    def local_config_revision(self) -> str:
+        targets = [
+            {
+                "id": target.id,
+                "email": target.email,
+                "password": target.password,
+                "baseUrl": target.base_url,
+                "refreshPath": target.refresh_path,
+                "loginAgreementRevision": target.login_agreement_revision,
+            }
+            for target in self.config.targets.values()
+        ]
+        payload = json.dumps(targets, sort_keys=True, separators=(",", ":")).encode()
+        return hmac.new(self.config.manager_key.encode(), payload, hashlib.sha256).hexdigest()
+
+    async def local_bootstrap(
+        self,
+        revision: str = "",
+        refresh_target_ids: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        current_revision = self.local_config_revision()
+        requested = [
+            str(value).strip()
+            for value in (refresh_target_ids or [])
+            if str(value).strip()
+        ]
+        requested = list(dict.fromkeys(requested))
+        for target_id in requested:
+            self._target(target_id)
+        changed = not revision or not secrets.compare_digest(str(revision), current_revision)
+        selected = list(self.config.targets.values()) if changed else [self._target(value) for value in requested]
+
+        async def session_for(target: PixelTarget) -> dict[str, Any]:
+            try:
+                async with self._client_factory() as client:
+                    token = await self._authenticate(target, client)
+                return {
+                    "targetId": target.id,
+                    "accessToken": token.access_token,
+                    "refreshToken": token.refresh_token,
+                    "expiresIn": max(int(token.expires_at - self._clock()), 1),
+                    "refreshPath": target.refresh_path,
+                    "error": None,
+                }
+            except (PixelManagerError, httpx.HTTPError) as exc:
+                message = exc.public_message if isinstance(exc, PixelManagerError) else "平台连接失败"
+                return {
+                    "targetId": target.id,
+                    "accessToken": "",
+                    "refreshToken": "",
+                    "expiresIn": 0,
+                    "refreshPath": target.refresh_path,
+                    "error": _safe_text(message),
+                }
+
+        sessions = await asyncio.gather(*(session_for(target) for target in selected))
+        return {
+            "revision": current_revision,
+            "changed": changed,
+            "targets": [self._public_target(target) for target in self.config.targets.values()],
+            "sessions": sessions,
+        }
 
     def _target(self, target_id: str) -> PixelTarget:
         target = self.config.targets.get(target_id)
@@ -1796,7 +1873,7 @@ class PixelManager:
             "shared": shared,
             "failed": failed,
             "results": results,
-            "message": "七个平台公共共享已全部开启" if status == "success" else f"公共共享完成，但有 {failed_targets + partial_targets} 个平台存在失败",
+            "message": "全部平台公共共享已全部开启" if status == "success" else f"公共共享完成，但有 {failed_targets + partial_targets} 个平台存在失败",
         }
 
     async def _import_target(

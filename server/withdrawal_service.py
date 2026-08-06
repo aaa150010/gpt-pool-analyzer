@@ -11,6 +11,7 @@ from email.utils import formataddr
 from typing import Any, Callable
 
 try:
+    from .account_policy import is_excluded_account
     from .withdrawal_email import render_withdrawal_email_html
     from .withdrawals import (
         NOTIFICATION_RECIPIENTS,
@@ -19,6 +20,7 @@ try:
         settlement_for,
     )
 except ImportError:
+    from account_policy import is_excluded_account
     from withdrawal_email import render_withdrawal_email_html
     from withdrawals import (
         NOTIFICATION_RECIPIENTS,
@@ -236,6 +238,7 @@ class WithdrawalService:
         balances = [
             {"email": email, "balance": amount}
             for email, amount in zip(snapshot.get("accounts") or [], snapshot.get("amounts") or [])
+            if not is_excluded_account(email)
         ]
         plan = plan_withdrawal(
             mode,
@@ -259,7 +262,7 @@ class WithdrawalService:
         return {
             str(target.email).strip().lower(): target.id
             for target in manager.config.targets.values()
-            if str(target.email).strip()
+            if str(target.email).strip() and not is_excluded_account(target.email)
         }
 
     @staticmethod
@@ -397,7 +400,8 @@ class WithdrawalService:
                 ),
             )
             for sequence, item in enumerate(plan["items"], start=1):
-                status = item["status"]
+                excluded = is_excluded_account(item.get("email"))
+                status = "skipped" if excluded else item["status"]
                 conn.execute(
                     """INSERT INTO withdrawal_items(
                         job_id, sequence, email, target_id, owner, owner_label, payment_method,
@@ -407,7 +411,7 @@ class WithdrawalService:
                         job_id,
                         sequence,
                         item["email"],
-                        target_ids.get(item["email"].lower(), ""),
+                        "" if excluded else target_ids.get(item["email"].lower(), ""),
                         item["owner"],
                         item["ownerLabel"],
                         item["paymentMethod"],
@@ -415,7 +419,7 @@ class WithdrawalService:
                         item["amount"],
                         status,
                         self.item_label(status),
-                        item.get("error"),
+                        "账号已从 91 永久排除" if excluded else item.get("error"),
                     ),
                 )
         return self.job_detail(job_id) or {}
@@ -767,6 +771,28 @@ class WithdrawalService:
                 return False
             return True
 
+    def _skip_excluded_item(self, job_id: str, item: dict[str, Any]) -> bool:
+        now = self._utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, email FROM withdrawal_items WHERE item_id = ? AND job_id = ?",
+                (item["itemId"], job_id),
+            ).fetchone()
+            if not row or row["status"] not in {"queued", "running"} or not is_excluded_account(row["email"]):
+                return False
+            conn.execute(
+                "UPDATE withdrawal_items SET status = 'skipped', status_label = '已排除', error = ? WHERE item_id = ?",
+                ("账号已从 91 永久排除", item["itemId"]),
+            )
+            if row["status"] == "running":
+                conn.execute(
+                    "UPDATE withdrawal_jobs SET status = 'queued', next_run_at = NULL, updated_at = ? "
+                    "WHERE job_id = ? AND status = 'running'",
+                    (now, job_id),
+                )
+        return True
+
     def send_notification(self, job_id: str, status: str) -> None:
         job = self.job_detail(job_id)
         if not job:
@@ -822,6 +848,9 @@ class WithdrawalService:
             return 1.0
         next_item = next((item for item in job["items"] if item["status"] == "queued"), None)
         running_item = next((item for item in job["items"] if item["status"] == "running"), None)
+        if running_item and is_excluded_account(running_item.get("email")):
+            self._skip_excluded_item(job["jobId"], running_item)
+            return 0.5
         if running_item:
             updated_at = self._parse_time(job.get("updatedAt"))
             if updated_at and (datetime.now(timezone.utc) - updated_at).total_seconds() < RUNNING_STALE_SECONDS:
@@ -837,6 +866,9 @@ class WithdrawalService:
             if self._complete_job_without_queued_items(job["jobId"]):
                 await asyncio.to_thread(self.send_notification, job["jobId"], "已完成")
             return 1.0
+        if is_excluded_account(next_item.get("email")):
+            self._skip_excluded_item(job["jobId"], next_item)
+            return 0.5
         if job["status"] == "waiting" and job.get("nextRunAt"):
             next_time = self._parse_time(job["nextRunAt"])
             if next_time and next_time > datetime.now(timezone.utc):

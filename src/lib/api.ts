@@ -28,13 +28,23 @@ import type {
 } from "./types";
 
 const API_BASE = import.meta.env.DEV ? "/gpt-api" : "https://lynote.xyz/gpt-api";
+const PIXEL_FALLBACK_EVENT = "pixel-manager-server-fallback";
+
+type PixelCommandEnvelope<T> = {
+  data: T;
+  connectionMode: "direct" | "server";
+  node: string | null;
+  latencyMs: number | null;
+};
+
+const isTauriRuntime = "__TAURI_INTERNALS__" in globalThis || "__TAURI__" in globalThis;
+let pixelFallbackActive = false;
 
 let pixelManagerKeyPromise: Promise<string> | null = null;
 
 async function pixelManagerKey(): Promise<string> {
   const previewKey = import.meta.env.DEV ? import.meta.env.VITE_PIXEL_MANAGER_API_KEY : "";
   if (previewKey) return previewKey;
-  const isTauriRuntime = "__TAURI_INTERNALS__" in globalThis || "__TAURI__" in globalThis;
   if (!isTauriRuntime) return "";
   if (!pixelManagerKeyPromise) {
     pixelManagerKeyPromise = import("@tauri-apps/api/core")
@@ -46,6 +56,26 @@ async function pixelManagerKey(): Promise<string> {
       });
   }
   return pixelManagerKeyPromise;
+}
+
+async function requestLocalPixel<T>(operation: string, targetId?: string, payload?: unknown, signal?: AbortSignal): Promise<T> {
+  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+  const { invoke } = await import("@tauri-apps/api/core");
+  const response = await invoke<PixelCommandEnvelope<T>>("pixel_manager_request", {
+    operation,
+    targetId: targetId || null,
+    payload: payload ?? {},
+  });
+  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+  if (response.connectionMode === "server") {
+    if (!pixelFallbackActive && typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent(PIXEL_FALLBACK_EVENT));
+    }
+    pixelFallbackActive = true;
+  } else {
+    pixelFallbackActive = false;
+  }
+  return response.data;
 }
 
 async function requestPixelJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -188,33 +218,40 @@ export const api = {
   withdrawal: (jobId: string) => requestPixelJson<{ job: WithdrawalJob }>(`/withdrawals/${encodeURIComponent(jobId)}`),
   accelerateWithdrawal: (jobId: string) =>
     requestPixelJson<{ job: WithdrawalJob }>(`/withdrawals/${encodeURIComponent(jobId)}/accelerate`, { method: "POST" }),
-  pixelTargets: () => requestPixelJson<{ targets: PixelTarget[] }>("/pixel-manager/targets"),
-  pixelAccounts: (targetId: string, page = 1, pageSize = 50, status = "", search = "") => {
+  pixelTargets: () => isTauriRuntime
+    ? requestLocalPixel<{ targets: PixelTarget[] }>("targets")
+    : requestPixelJson<{ targets: PixelTarget[] }>("/pixel-manager/targets"),
+  pixelAccounts: (targetId: string, page = 1, pageSize = 100, status = "", search = "") => {
+    if (isTauriRuntime) return requestLocalPixel<PixelAccountPage>("accounts", targetId, { page, pageSize, status, search });
     const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
     if (status) params.set("status", status);
     if (search.trim()) params.set("search", search.trim());
     return requestPixelJson<PixelAccountPage>(`/pixel-manager/targets/${encodeURIComponent(targetId)}/accounts?${params.toString()}`);
   },
-  pixelAccountUsage: (targetId: string, accountId: number, signal?: AbortSignal) =>
-    requestPixelJson<PixelAccountUsage>(
-      `/pixel-manager/targets/${encodeURIComponent(targetId)}/accounts/${accountId}/usage?source=local`,
-      { signal },
-    ),
-  pixelBulkTest: (targetId: string, accountIds: number[]) =>
-    requestPixelJson<PixelBulkOperationResponse>(`/pixel-manager/targets/${encodeURIComponent(targetId)}/accounts/bulk-test`, {
-      method: "POST",
-      body: JSON.stringify({ accountIds }),
-    }),
-  pixelBulkDelete: (targetId: string, accountIds: number[]) =>
-    requestPixelJson<PixelBulkOperationResponse>(`/pixel-manager/targets/${encodeURIComponent(targetId)}/accounts/bulk-delete`, {
-      method: "POST",
-      body: JSON.stringify({ accountIds }),
-    }),
-  pixelBulkUpdate: (targetId: string, payload: PixelBulkUpdateRequest) =>
-    requestPixelJson<PixelBulkOperationResponse>(`/pixel-manager/targets/${encodeURIComponent(targetId)}/accounts/bulk-update`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-    }),
+  pixelAccountUsage: (targetId: string, accountId: number, signal?: AbortSignal) => isTauriRuntime
+    ? requestLocalPixel<PixelAccountUsage>("accountUsage", targetId, { accountId }, signal)
+    : requestPixelJson<PixelAccountUsage>(
+        `/pixel-manager/targets/${encodeURIComponent(targetId)}/accounts/${accountId}/usage?source=local`,
+        { signal },
+      ),
+  pixelBulkTest: (targetId: string, accountIds: number[]) => isTauriRuntime
+    ? requestLocalPixel<PixelBulkOperationResponse>("bulkTest", targetId, { accountIds })
+    : requestPixelJson<PixelBulkOperationResponse>(`/pixel-manager/targets/${encodeURIComponent(targetId)}/accounts/bulk-test`, {
+        method: "POST",
+        body: JSON.stringify({ accountIds }),
+      }),
+  pixelBulkDelete: (targetId: string, accountIds: number[]) => isTauriRuntime
+    ? requestLocalPixel<PixelBulkOperationResponse>("bulkDelete", targetId, { accountIds })
+    : requestPixelJson<PixelBulkOperationResponse>(`/pixel-manager/targets/${encodeURIComponent(targetId)}/accounts/bulk-delete`, {
+        method: "POST",
+        body: JSON.stringify({ accountIds }),
+      }),
+  pixelBulkUpdate: (targetId: string, payload: PixelBulkUpdateRequest) => isTauriRuntime
+    ? requestLocalPixel<PixelBulkOperationResponse>("bulkUpdate", targetId, payload)
+    : requestPixelJson<PixelBulkOperationResponse>(`/pixel-manager/targets/${encodeURIComponent(targetId)}/accounts/bulk-update`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }),
   pixelImport: (file: File, targetIds: string[]) => {
     const params = new URLSearchParams({ targetIds: JSON.stringify(targetIds), fileName: file.name });
     return requestPixelJson<{ job: PixelImportJob }>(`/pixel-manager/import?${params.toString()}`, {
@@ -256,11 +293,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ accountIds }),
     }),
-  pixelShareAll: (targetIds: string[], concurrency?: number) =>
-    requestPixelJson<PixelShareAllResponse>("/pixel-manager/share-all", {
-      method: "POST",
-      body: JSON.stringify({ targetIds, ...(concurrency === undefined ? {} : { concurrency }) }),
-    }),
+  pixelShareAll: (targetIds: string[], concurrency?: number) => isTauriRuntime
+    ? requestLocalPixel<PixelShareAllResponse>("shareAll", undefined, { targetIds, ...(concurrency === undefined ? {} : { concurrency }) })
+    : requestPixelJson<PixelShareAllResponse>("/pixel-manager/share-all", {
+        method: "POST",
+        body: JSON.stringify({ targetIds, ...(concurrency === undefined ? {} : { concurrency }) }),
+      }),
   pixelExport: () => downloadPixelExport(),
   pixelExportJobCreate: (targetIds: string[]) =>
     requestPixelJson<{ job: PixelExportJob }>("/pixel-manager/export-jobs", {

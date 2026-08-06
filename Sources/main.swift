@@ -234,7 +234,7 @@ struct SMTPSettings: Codable {
         port: 465,
         username: "",
         password: "",
-        recipient: "1745627971@qq.com,252715669@qq.com"
+        recipient: "252715669@qq.com"
     )
 }
 

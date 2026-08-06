@@ -47,6 +47,7 @@ import {
   YAxis,
 } from "recharts";
 import { api } from "./lib/api";
+import { cleanupPixelAccounts } from "./lib/pixel-cleanup";
 import type {
   BalanceAccount,
   CostAddition,
@@ -62,6 +63,9 @@ import type {
   PixelAccount,
   PixelAccountPage,
   PixelAccountUsage,
+  PixelCleanupKind,
+  PixelCleanupProgress,
+  PixelCleanupResult,
   PixelExportJob,
   PixelImportJob,
   PixelImportRecord,
@@ -1450,7 +1454,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   const [accountsLoading, setAccountsLoading] = useState(false);
   const [accountsError, setAccountsError] = useState("");
   const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(50);
+  const [pageSize, setPageSize] = useState(100);
   const [accountSearchInput, setAccountSearchInput] = useState("");
   const [accountSearch, setAccountSearch] = useState("");
   const [accountStatus, setAccountStatus] = useState("");
@@ -1485,8 +1489,12 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   const [bulkMakePublic, setBulkMakePublic] = useState(false);
   const [bulkConcurrency, setBulkConcurrency] = useState("");
   const [targetCountsRefreshing, setTargetCountsRefreshing] = useState(false);
+  const [cleanupKind, setCleanupKind] = useState<PixelCleanupKind | null>(null);
+  const [cleanupProgress, setCleanupProgress] = useState<PixelCleanupProgress | null>(null);
+  const [cleanupResult, setCleanupResult] = useState<PixelCleanupResult | null>(null);
   const loadAccountsRef = useRef<() => Promise<void>>(async () => undefined);
   const refreshAllTargetCountsRef = useRef<(targetList?: PixelTarget[], options?: { silent?: boolean }) => Promise<void>>(async () => undefined);
+  const cleanupRunning = cleanupProgress !== null;
 
   const beginAccountsTransition = useCallback(() => {
     accountsRequestSequence.current += 1;
@@ -1554,7 +1562,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
       }
       const succeeded = results.filter((result) => result.response).length;
       const failed = results.length - succeeded;
-      if (!options.silent) onToast(`七个平台数量刷新完成：成功 ${succeeded} 个${failed ? `，失败 ${failed} 个` : ""}`);
+      if (!options.silent) onToast(`全部平台数量刷新完成：成功 ${succeeded} 个${failed ? `，失败 ${failed} 个` : ""}`);
     } finally {
       setTargetCountsRefreshing(false);
     }
@@ -1614,6 +1622,12 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   useEffect(() => {
     void loadTargets();
   }, [loadTargets]);
+
+  useEffect(() => {
+    const handleFallback = () => onToast("Pixel 本机直连失败，本次已自动切换服务器链路");
+    window.addEventListener("pixel-manager-server-fallback", handleFallback);
+    return () => window.removeEventListener("pixel-manager-server-fallback", handleFallback);
+  }, [onToast]);
 
   useEffect(() => {
     const jobId = window.localStorage.getItem("pixelImportJobId");
@@ -2034,6 +2048,32 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
     setBulkDeleteOpen(true);
   };
 
+  const runCleanup = async () => {
+    if (!cleanupKind || cleanupRunning) return;
+    try {
+      const requestedKind = cleanupKind;
+      const cleanupSummary = await cleanupPixelAccounts({
+        kind: cleanupKind,
+        targets,
+        operations: {
+          listAccounts: (targetId, scanPage, scanPageSize, status) => api.pixelAccounts(targetId, scanPage, scanPageSize, status),
+          deleteAccounts: api.pixelBulkDelete,
+        },
+        onProgress: setCleanupProgress,
+      });
+      setCleanupResult(cleanupSummary);
+      setCleanupKind(null);
+      const refreshedTargets = await loadTargets();
+      await refreshAllTargetCountsRef.current(refreshedTargets, { silent: true });
+      await loadAccountsRef.current();
+      onToast(`${requestedKind === "limited" ? "限流/保护" : "错误账号"}清理完成：删除 ${cleanupSummary.deleted} 个${cleanupSummary.failed ? `，失败 ${cleanupSummary.failed} 个` : ""}${cleanupSummary.skippedTargets ? `，跳过 ${cleanupSummary.skippedTargets} 个平台` : ""}`);
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "账号清理失败");
+    } finally {
+      setCleanupProgress(null);
+    }
+  };
+
   const activeTarget = targets.find((target) => target.id === activeTargetId);
   const bulkConcurrencyValue = bulkConcurrency.trim() ? Number(bulkConcurrency) : undefined;
   const bulkConcurrencyValid = bulkConcurrencyValue === undefined
@@ -2071,29 +2111,45 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                 setSelectedFiles(files);
               }}
             />
-            <Button variant="outline" disabled={importing || sharingAll} onClick={() => fileInputRef.current?.click()}>
+            <Button variant="outline" disabled={importing || sharingAll || cleanupRunning} onClick={() => fileInputRef.current?.click()}>
               <FileJson className="h-4 w-4" />
               选择 JSON
             </Button>
-            <Button disabled={importing || sharingAll || !selectedFiles.length || !targets.length} onClick={openImport}>
+            <Button disabled={importing || sharingAll || cleanupRunning || !selectedFiles.length || !targets.length} onClick={openImport}>
               <Upload className="h-4 w-4" />
               上传到平台
             </Button>
             <Button
               variant="outline"
-              disabled={sharingAll || importing || exporting || targetsLoading || !targets.length}
+              disabled={sharingAll || importing || exporting || cleanupRunning || targetsLoading || !targets.length}
               onClick={() => void runShareAll()}
             >
               {sharingAll ? <Loader2 className="h-4 w-4 animate-spin" /> : <Share2 className="h-4 w-4" />}
               {sharingAll ? "正在打开共享" : "一键打开共享"}
             </Button>
-            <Button variant="outline" disabled={importing || sharingAll || targetsLoading} onClick={() => void openImportRecords()}>
+            <Button variant="outline" disabled={importing || sharingAll || cleanupRunning || targetsLoading} onClick={() => void openImportRecords()}>
               <History className="h-4 w-4" />
               导入记录
             </Button>
-            <Button variant="outline" disabled={exporting || sharingAll || importing || targetsLoading || !targets.length} onClick={openExport}>
+            <Button variant="outline" disabled={exporting || sharingAll || importing || cleanupRunning || targetsLoading || !targets.length} onClick={openExport}>
               {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
               {exporting ? "正在处理" : "汇总导出"}
+            </Button>
+            <Button
+              variant="outline"
+              disabled={exporting || sharingAll || importing || cleanupRunning || targetsLoading || !targets.length}
+              onClick={() => setCleanupKind("limited")}
+            >
+              <AlertTriangle className="h-4 w-4" />
+              清理限流/保护
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={exporting || sharingAll || importing || cleanupRunning || targetsLoading || !targets.length}
+              onClick={() => setCleanupKind("error")}
+            >
+              <Trash2 className="h-4 w-4" />
+              清理错误账号
             </Button>
           </div>
         </CardContent>
@@ -2107,12 +2163,12 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               平台账号
             </CardTitle>
             <div className="flex items-center gap-1.5">
-              <span className="text-xs font-black text-muted-foreground">{targets.length || 7} 个</span>
+              <span className="text-xs font-black text-muted-foreground">{targets.length} 个</span>
               <button
                 type="button"
                 title="刷新全部账号数量"
-                aria-label="刷新七个平台账号数量"
-                disabled={targetsLoading || targetCountsRefreshing || sharingAll || !targets.length || Boolean(bulkAction)}
+                aria-label="刷新全部平台账号数量"
+                disabled={targetsLoading || targetCountsRefreshing || sharingAll || cleanupRunning || !targets.length || Boolean(bulkAction)}
                 className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
                 onClick={() => void refreshAllTargetCounts()}
               >
@@ -2134,7 +2190,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               return (
                 <button
                   key={target.id}
-                  disabled={Boolean(bulkAction) || sharingAll}
+                  disabled={Boolean(bulkAction) || sharingAll || cleanupRunning}
                   className={cn(
                     "mb-1 flex h-14 w-full items-center gap-2 rounded-md border px-2.5 text-left transition last:mb-0 disabled:cursor-wait disabled:opacity-60",
                     active ? "border-blue-200 bg-blue-50 text-blue-950" : "border-transparent hover:border-border hover:bg-muted",
@@ -2172,7 +2228,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <Button variant="outline" size="icon" title="刷新账号列表" disabled={!activeTargetId || accountsLoading || sharingAll || Boolean(bulkAction)} onClick={() => void loadAccounts()}>
+              <Button variant="outline" size="icon" title="刷新账号列表" disabled={!activeTargetId || accountsLoading || sharingAll || cleanupRunning || Boolean(bulkAction)} onClick={() => void loadAccounts()}>
                 <RefreshCw className={cn("h-4 w-4", accountsLoading && "animate-spin")} />
               </Button>
             </div>
@@ -2185,7 +2241,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                   aria-label="搜索账号"
                   value={accountSearchInput}
                   placeholder="搜索账号名称"
-                  disabled={!activeTargetId || sharingAll || Boolean(bulkAction)}
+                  disabled={!activeTargetId || sharingAll || cleanupRunning || Boolean(bulkAction)}
                   onChange={(event) => setAccountSearchInput(event.target.value)}
                   className="h-8 pl-8 pr-8 text-xs font-bold"
                 />
@@ -2194,7 +2250,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                     type="button"
                     title="清空搜索"
                     aria-label="清空搜索"
-                    disabled={sharingAll || Boolean(bulkAction)}
+                    disabled={sharingAll || cleanupRunning || Boolean(bulkAction)}
                     className="absolute right-1.5 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
                     onClick={() => setAccountSearchInput("")}
                   >
@@ -2205,7 +2261,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               <select
                 aria-label="账号状态筛选"
                 value={accountStatus}
-                disabled={!activeTargetId || accountsLoading || sharingAll || Boolean(bulkAction)}
+                disabled={!activeTargetId || accountsLoading || sharingAll || cleanupRunning || Boolean(bulkAction)}
                 onChange={(event) => {
                   beginAccountsTransition();
                   setPage(1);
@@ -2221,15 +2277,15 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               </select>
               <span className={cn("mr-auto whitespace-nowrap text-xs font-black", selectedAccountIds.size ? "text-blue-700" : "text-muted-foreground")}>已选 {selectedAccountIds.size}</span>
               <div className="flex shrink-0 items-center gap-2">
-                <Button variant="outline" size="sm" disabled={!selectedAccountIds.size || accountsLoading || sharingAll || Boolean(bulkAction)} onClick={() => void runBulkTest()}>
+                <Button variant="outline" size="sm" disabled={!selectedAccountIds.size || accountsLoading || sharingAll || cleanupRunning || Boolean(bulkAction)} onClick={() => void runBulkTest()}>
                   {bulkAction === "test" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Activity className="h-3.5 w-3.5" />}
                   批量测试连接
                 </Button>
-                <Button variant="outline" size="sm" disabled={!selectedAccountIds.size || accountsLoading || sharingAll || Boolean(bulkAction)} onClick={openBulkEdit}>
+                <Button variant="outline" size="sm" disabled={!selectedAccountIds.size || accountsLoading || sharingAll || cleanupRunning || Boolean(bulkAction)} onClick={openBulkEdit}>
                   {bulkAction === "update" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Settings className="h-3.5 w-3.5" />}
                   批量编辑
                 </Button>
-                <Button variant="destructive" size="sm" disabled={!selectedAccountIds.size || accountsLoading || sharingAll || Boolean(bulkAction)} onClick={openBulkDelete}>
+                <Button variant="destructive" size="sm" disabled={!selectedAccountIds.size || accountsLoading || sharingAll || cleanupRunning || Boolean(bulkAction)} onClick={openBulkDelete}>
                   <Trash2 className="h-3.5 w-3.5" />
                   批量删除
                 </Button>
@@ -2265,7 +2321,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                 <select
                   aria-label="每页数量"
                   value={pageSize}
-                  disabled={accountsLoading || Boolean(bulkAction)}
+                  disabled={accountsLoading || cleanupRunning || Boolean(bulkAction)}
                   onChange={(event) => {
                     beginAccountsTransition();
                     setPage(1);
@@ -2279,7 +2335,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                   variant="outline"
                   size="icon"
                   title="上一页"
-                  disabled={!accounts || page <= 1 || accountsLoading || Boolean(bulkAction)}
+                  disabled={!accounts || page <= 1 || accountsLoading || cleanupRunning || Boolean(bulkAction)}
                   onClick={() => {
                     beginAccountsTransition();
                     setPage((value) => Math.max(value - 1, 1));
@@ -2291,7 +2347,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                   variant="outline"
                   size="icon"
                   title="下一页"
-                  disabled={!accounts || page >= accounts.pages || accountsLoading || Boolean(bulkAction)}
+                  disabled={!accounts || page >= accounts.pages || accountsLoading || cleanupRunning || Boolean(bulkAction)}
                   onClick={() => {
                     beginAccountsTransition();
                     setPage((value) => value + 1);
@@ -2332,7 +2388,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
             <DialogHeader>
               <DialogTitle>汇总整理完成</DialogTitle>
               <DialogDescription>
-                已先保存备份 {exportJob.backupFileName || "JSON"}，再删除七个平台账号，并按选择的平台重新导入。
+                已先保存备份 {exportJob.backupFileName || "JSON"}，再删除全部平台账号，并按选择的平台重新导入。
               </DialogDescription>
             </DialogHeader>
             <div className="flex justify-end">
@@ -2385,6 +2441,110 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                       <td className={cn("px-3 py-2.5 font-black", result.failed ? "text-rose-700" : "text-muted-foreground")}>{result.failed}</td>
                       <td className="px-3 py-2.5">
                         <div className={cn("truncate font-bold", result.status === "success" ? "text-emerald-700" : result.status === "partial" ? "text-amber-700" : "text-rose-700")} title={result.message}>
+                          {result.message}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      <Dialog
+        open={cleanupKind !== null}
+        onOpenChange={(open) => {
+          if (!open && !cleanupRunning) setCleanupKind(null);
+        }}
+      >
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{cleanupKind === "limited" ? "清理限流和保护账号" : "清理错误账号"}</DialogTitle>
+            <DialogDescription>
+              将扫描全部 {targets.length} 个平台，并永久删除所有匹配账号。删除后无法撤销。
+            </DialogDescription>
+          </DialogHeader>
+          {cleanupProgress ? (
+            <div className="space-y-4">
+              <div className="rounded-md border border-blue-200 bg-blue-50 px-4 py-3">
+                <div className="flex items-center justify-between gap-3 text-sm font-black text-blue-800">
+                  <span>{cleanupProgress.phase === "scanning" ? "正在完整扫描" : "正在分批删除"}</span>
+                  <span>{cleanupProgress.completedTargets} / {cleanupProgress.totalTargets}</span>
+                </div>
+                <div className="mt-1 truncate text-xs font-bold text-blue-700" title={cleanupProgress.targetEmail}>
+                  {cleanupProgress.targetEmail || "准备处理平台账号"}
+                </div>
+                <div className="mt-3 h-2 overflow-hidden rounded-full bg-blue-100">
+                  <div
+                    className="h-full rounded-full bg-blue-600 transition-all duration-300"
+                    style={{ width: `${cleanupProgress.totalTargets ? Math.round((cleanupProgress.completedTargets / cleanupProgress.totalTargets) * 100) : 0}%` }}
+                  />
+                </div>
+                <div className="mt-3 flex gap-5 text-xs font-black text-blue-800">
+                  <span>已发现 {cleanupProgress.found}</span>
+                  <span>已删除 {cleanupProgress.deleted}</span>
+                </div>
+              </div>
+              <div className="flex justify-end">
+                <Button disabled>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  清理进行中
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="rounded-md border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">
+                {cleanupKind === "limited"
+                  ? "匹配状态：限流中、限额保护中。每个平台必须完整扫描成功后才会开始删除。"
+                  : "匹配状态：错误。每个平台必须完整扫描成功后才会开始删除。"}
+              </div>
+              <div className="mt-5 flex justify-end gap-2">
+                <Button variant="outline" onClick={() => setCleanupKind(null)}>取消</Button>
+                <Button variant="destructive" onClick={() => void runCleanup()}>
+                  <Trash2 className="h-4 w-4" />
+                  确认永久删除
+                </Button>
+              </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {cleanupResult && (
+        <Dialog open onOpenChange={(open) => !open && setCleanupResult(null)}>
+          <DialogContent className="max-h-[min(720px,calc(100vh-48px))] w-[min(calc(100vw-48px),980px)] overflow-auto">
+            <DialogHeader>
+              <DialogTitle>{cleanupResult.kind === "limited" ? "限流/保护账号清理完成" : "错误账号清理完成"}</DialogTitle>
+              <DialogDescription>
+                共发现 {cleanupResult.found} 个，删除 {cleanupResult.deleted} 个，失败 {cleanupResult.failed} 个，跳过 {cleanupResult.skippedTargets} 个平台。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="overflow-hidden rounded-md border border-border">
+              <table className="w-full table-fixed text-left text-xs">
+                <thead className="bg-muted text-[11px] font-black text-muted-foreground">
+                  <tr>
+                    <th className="w-[240px] px-3 py-2.5">平台账号</th>
+                    <th className="w-[72px] px-3 py-2.5">发现</th>
+                    <th className="w-[72px] px-3 py-2.5">删除</th>
+                    <th className="w-[72px] px-3 py-2.5">失败</th>
+                    <th className="px-3 py-2.5">结果</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {cleanupResult.results.map((result) => (
+                    <tr key={result.targetId} className="border-t border-border">
+                      <td className="truncate px-3 py-2.5 font-black" title={result.email}>{result.email}</td>
+                      <td className="px-3 py-2.5 font-black">{result.found}</td>
+                      <td className="px-3 py-2.5 font-black text-emerald-700">{result.deleted}</td>
+                      <td className={cn("px-3 py-2.5 font-black", result.failed ? "text-rose-700" : "text-muted-foreground")}>{result.failed}</td>
+                      <td className="px-3 py-2.5">
+                        <div
+                          className={cn("truncate font-bold", result.status === "success" ? "text-emerald-700" : result.status === "partial" ? "text-amber-700" : "text-rose-700")}
+                          title={result.message}
+                        >
                           {result.message}
                         </div>
                       </td>
@@ -2457,7 +2617,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
             )}>
               <Checkbox checked={exportDeleteAndReimport} onCheckedChange={(checked) => setExportDeleteAndReimport(checked === true)} />
               <span>
-                <span className="block font-black">删除七个平台全部账号，并用本次汇总重新导入</span>
+                <span className="block font-black">删除全部平台账号，并用本次汇总重新导入</span>
                 <span className="mt-1 block text-xs font-bold text-muted-foreground">
                   服务器会先完整导出、去重、保存 600 权限备份；任一导出或备份失败都会停止，不会删除。
                 </span>
@@ -2740,8 +2900,10 @@ function PixelAccountRow({
 }) {
   const rowRef = useRef<HTMLTableRowElement>(null);
   const effectiveStatus = pixelEffectiveStatus(account);
+  const usageExhausted = effectiveStatus === "rate_limited" || effectiveStatus === "codex_quota_protected";
 
   useEffect(() => {
+    if (usageExhausted) return;
     const row = rowRef.current;
     if (!row) return;
     const observer = new IntersectionObserver((entries) => {
@@ -2751,7 +2913,7 @@ function PixelAccountRow({
     }, { rootMargin: "80px 0px" });
     observer.observe(row);
     return () => observer.disconnect();
-  }, [account.id, onVisible]);
+  }, [account.id, onVisible, usageExhausted]);
 
   return (
     <tr ref={rowRef} className={cn("border-t border-border align-middle hover:bg-muted/50", selected && "bg-blue-50/70")}>
@@ -2770,15 +2932,18 @@ function PixelAccountRow({
       </td>
       <td className="px-3 py-2.5"><StatusPill tone={account.schedulable ? "green" : "amber"}>{account.schedulable ? "可调度" : "不可调度"}</StatusPill></td>
       <td className="px-3 py-2.5"><StatusPill tone={account.shareMode === "public" && ["approved", "active", ""].includes(account.shareStatus || "") ? "green" : account.shareMode === "public" ? "amber" : "gray"}>{pixelShareLabel(account)}</StatusPill></td>
-      <td className="px-3 py-2.5"><PixelUsageValue state={usageState} window="5h" /></td>
-      <td className="px-3 py-2.5"><PixelUsageValue state={usageState} window="7d" /></td>
+      <td className="px-3 py-2.5"><PixelUsageValue state={usageState} window="5h" exhausted={usageExhausted} /></td>
+      <td className="px-3 py-2.5"><PixelUsageValue state={usageState} window="7d" exhausted={usageExhausted} /></td>
       <td className="px-3 py-2.5 font-black">{account.currentConcurrency} / {account.concurrency}</td>
       <td className="px-3 py-2.5"><div className={cn("truncate font-semibold", account.errorMessage ? "text-rose-600" : "text-muted-foreground")} title={account.errorMessage}>{account.errorMessage || "-"}</div></td>
     </tr>
   );
 }
 
-function PixelUsageValue({ state, window }: { state?: PixelUsageLoadState; window: "5h" | "7d" }) {
+function PixelUsageValue({ state, window, exhausted = false }: { state?: PixelUsageLoadState; window: "5h" | "7d"; exhausted?: boolean }) {
+  if (exhausted) {
+    return <span className="font-black text-rose-700" title="限流或限额保护，无需再次读取额度">100%</span>;
+  }
   if (!state || state.status === "loading") {
     return <Loader2 className={cn("h-3.5 w-3.5 animate-spin", window === "5h" ? "text-emerald-600" : "text-violet-600")} />;
   }
@@ -2987,7 +3152,7 @@ function PixelExportProgress({ job, targets }: { job: PixelExportJob; targets: P
   const percent = job.totalTargets ? Math.round((completed / job.totalTargets) * 100) : 0;
   const phaseLabel = {
     queued: "准备汇总整理",
-    exporting: "正在导出七个平台账号",
+    exporting: "正在导出全部平台账号",
     backing_up: "正在保存服务器备份",
     deleting: `正在清空 ${currentTarget?.email || "平台账号"}`,
     importing: `正在重新导入 ${currentTarget?.email || "平台账号"}`,
@@ -3044,7 +3209,7 @@ function PixelExportResults({
       <Card>
         <CardHeader className="border-b border-border">
           <CardTitle>删除结果</CardTitle>
-          <span className="text-xs font-black text-muted-foreground">七个平台账号</span>
+          <span className="text-xs font-black text-muted-foreground">{job.deleteResults.length} 个平台账号</span>
         </CardHeader>
         <CardContent className="p-0">
           <div className="overflow-auto">

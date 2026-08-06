@@ -84,6 +84,22 @@ class DatabaseTests(unittest.TestCase):
         self.assertTrue({"capacity_5h", "capacity_7d", "remaining_capacity_5h", "remaining_capacity_7d"} <= columns)
         self.assertIn("idx_pool_history_group_date_id", indexes)
 
+    def test_init_removes_retired_account_from_live_settings(self) -> None:
+        app.init_db()
+        app.set_setting(
+            "balance_accounts",
+            [
+                {"name": "1745627971@QQ.COM", "baseURL": "https://old.example", "apiKey": "old-secret"},
+                {"name": "active@example.com", "baseURL": "https://active.example", "apiKey": "active-secret"},
+            ],
+        )
+        app.set_setting("pool_credentials", {"email": "1745627971@qq.com", "password": "pool-secret"})
+
+        app.init_db()
+
+        self.assertEqual([item["name"] for item in app.get_setting("balance_accounts", [])], ["active@example.com"])
+        self.assertEqual(app.get_setting("pool_credentials", {}), {})
+
     def test_import_records_are_persistent_and_secret_free(self) -> None:
         app.init_db()
         app.save_pixel_import_record(
@@ -201,6 +217,27 @@ class DatabaseTests(unittest.TestCase):
         self.assertTrue(smtp_response["settings"]["hasUsername"])
         self.assertTrue(smtp_response["settings"]["hasPassword"])
         self.assertTrue(smtp_response["settings"]["hasRecipient"])
+
+    def test_balance_settings_reject_retired_account_restore(self) -> None:
+        app.init_db()
+        app.set_meta("initialized", "true")
+        client = TestClient(app.app)
+
+        response = client.put(
+            "/gpt-api/balance-accounts",
+            json={
+                "accounts": [
+                    {
+                        "name": "1745627971@QQ.COM",
+                        "baseURL": "https://billing.example",
+                        "apiKey": "must-not-be-stored",
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(app.get_setting("balance_accounts", []), [])
 
     def test_blank_secret_updates_preserve_existing_values(self) -> None:
         app.init_db()

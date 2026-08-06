@@ -32,6 +32,7 @@ def create_pixel_router(
     *,
     api_prefix: str,
     require_manager: Callable[..., Any],
+    require_sensitive_manager: Callable[..., Any],
     pixel_http_error: Callable[[PixelManagerError], HTTPException],
     connect: Callable[..., Any],
     import_records: Callable[[], list[dict[str, Any]]],
@@ -52,11 +53,27 @@ def create_pixel_router(
     async def get_targets(manager: Any = Depends(require_manager)) -> dict[str, Any]:
         return {"targets": manager.targets()}
 
+    @router.post("/pixel-manager/local-bootstrap")
+    async def local_bootstrap(
+        response: Response,
+        payload: dict[str, Any] | None = None,
+        manager: Any = Depends(require_sensitive_manager),
+    ) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        body = payload or {}
+        try:
+            return await manager.local_bootstrap(
+                str(body.get("revision") or ""),
+                body.get("refreshTargetIds") or [],
+            )
+        except PixelManagerError as exc:
+            raise pixel_http_error(exc) from exc
+
     @router.get("/pixel-manager/targets/{target_id}/accounts")
     async def get_accounts(
         target_id: str,
         page: int = Query(default=1, ge=1),
-        page_size: int = Query(default=50, alias="pageSize", ge=1, le=100),
+        page_size: int = Query(default=100, alias="pageSize", ge=1, le=100),
         search: str = Query(default="", max_length=120),
         status: str = Query(default="", max_length=40),
         manager: Any = Depends(require_manager),

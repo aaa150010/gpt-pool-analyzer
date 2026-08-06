@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "test:cleanup": "node --experimental-strip-types --test src/lib/pixel-cleanup.test.ts",
     "build:web": "tsc && vite build",
     "build": "npm run build:web",
     "tauri": "CARGO_HOME=$PWD/.cargo tauri"

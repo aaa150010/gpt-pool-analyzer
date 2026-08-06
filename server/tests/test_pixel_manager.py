@@ -141,6 +141,35 @@ class PixelConfigAndTransformTests(unittest.TestCase):
 
         self.assertFalse(config.allow_open_access)
 
+    def test_config_excludes_retired_account_case_insensitively(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pixel-secret.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "managerKey": MANAGER_KEY,
+                        "targets": [
+                            {
+                                "id": "retired",
+                                "email": " 1745627971@QQ.COM ",
+                                "password": "retired-secret",
+                                "baseUrl": "https://retired.example",
+                            },
+                            {
+                                "id": "active",
+                                "email": "active@example.com",
+                                "password": "active-secret",
+                                "baseUrl": "https://active.example",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = load_config(path)
+
+        self.assertEqual(list(config.targets), ["active"])
+
     def test_json_array_is_parsed_without_mutating_source(self) -> None:
         bundle = parse_credential_bundle(
             "../batch.json",
@@ -1534,6 +1563,31 @@ class PixelManagerEndpointTests(unittest.TestCase):
         response = self.client.get("/gpt-api/pixel-manager/targets")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.json()["targets"]), 1)
+
+    def test_local_bootstrap_always_requires_exact_key_and_never_returns_password(self) -> None:
+        for headers in ({}, self._headers("wrong-manager-key")):
+            response = self.client.post("/gpt-api/pixel-manager/local-bootstrap", headers=headers, json={})
+            self.assertEqual(response.status_code, 401)
+
+        response = self.client.post(
+            "/gpt-api/pixel-manager/local-bootstrap",
+            headers=self._headers(),
+            json={},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(payload["sessions"][0]["accessToken"], "endpoint-access-secret")
+        self.assertNotIn("fake-password", response.text)
+        self.assertNotIn("pixel-one.example", response.text)
+
+        unchanged = self.client.post(
+            "/gpt-api/pixel-manager/local-bootstrap",
+            headers=self._headers(),
+            json={"revision": payload["revision"]},
+        )
+        self.assertFalse(unchanged.json()["changed"])
+        self.assertEqual(unchanged.json()["sessions"], [])
 
     def test_manager_endpoints_reject_missing_and_wrong_keys_when_open_access_disabled(self) -> None:
         self.manager.config = PixelManagerConfig(

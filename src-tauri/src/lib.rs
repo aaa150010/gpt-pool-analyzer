@@ -1,3 +1,5 @@
+mod pixel_client;
+
 use tauri::Manager;
 
 #[tauri::command]
@@ -12,7 +14,11 @@ fn pixel_manager_api_key() -> Result<String, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![pixel_manager_api_key])
+        .manage(pixel_client::PixelClientState::default())
+        .invoke_handler(tauri::generate_handler![
+            pixel_manager_api_key,
+            pixel_client::pixel_manager_request,
+        ])
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();

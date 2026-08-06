@@ -48,26 +48,26 @@ class WithdrawalPlanningTests(unittest.TestCase):
         self.assertEqual(message.get_body(preferencelist=("html",)).get_content_type(), "text/html")
 
     def test_cost_allocation_prefers_five_multiples_then_fills_remainder(self) -> None:
-        plan = plan_withdrawal("cost", 324.5, balances([20, 80, 65, 60, 100, 0, 0]), 320)
-        self.assertEqual([item["amount"] for item in plan["items"]], [20, 80, 65, 60, 95, 0, 0])
+        plan = plan_withdrawal("cost", 324.5, balances([20, 80, 65, 60, 100, 0]), 320)
+        self.assertEqual([item["amount"] for item in plan["items"]], [20, 80, 65, 60, 95, 0])
 
-        rounded = plan_withdrawal("cost", 324.5, balances([20, 80, 65, 60, 100, 0, 0]))
-        self.assertEqual([item["amount"] for item in rounded["items"]], [20, 80, 65, 60, 100, 0, 0])
+        rounded = plan_withdrawal("cost", 324.5, balances([20, 80, 65, 60, 100, 0]))
+        self.assertEqual([item["amount"] for item in rounded["items"]], [20, 80, 65, 60, 100, 0])
 
     def test_full_allocation_truncates_each_balance_to_integer(self) -> None:
-        plan = plan_withdrawal("full", 324.5, balances([20.9, 81.5, 65.9, 62.8, 105.7, 1.9, 86.2]))
-        self.assertEqual([item["amount"] for item in plan["items"]], [20, 81, 65, 62, 105, 1, 86])
+        plan = plan_withdrawal("full", 324.5, balances([81.5, 65.9, 62.8, 105.7, 1.9, 86.2]))
+        self.assertEqual([item["amount"] for item in plan["items"]], [81, 65, 62, 105, 1, 86])
         self.assertEqual(plan["items"][-1]["paymentMethod"], "alipay")
 
     def test_preview_items_have_sequence_chinese_status_and_updated_labels(self) -> None:
-        plan = plan_withdrawal("full", 324.5, balances([20, 81, 65, 62, 105, 0.4, 86]))
-        self.assertEqual([item["sequence"] for item in plan["items"]], list(range(1, 8)))
-        self.assertEqual([item["statusLabel"] for item in plan["items"]], ["待执行"] * 5 + ["已跳过", "待执行"])
+        plan = plan_withdrawal("full", 324.5, balances([81, 65, 62, 105, 0.4, 86]))
+        self.assertEqual([item["sequence"] for item in plan["items"]], list(range(1, 7)))
+        self.assertEqual([item["statusLabel"] for item in plan["items"]], ["待执行"] * 4 + ["已跳过", "待执行"])
         self.assertEqual(
             [item["ownerLabel"] for item in plan["items"]],
-            ["自己微信", "自己支付宝", "老弟微信", "老弟支付宝", "老弟支付宝", "社会哥微信", "社会哥支付宝"],
+            ["自己支付宝", "老弟微信", "老弟支付宝", "老弟支付宝", "社会哥微信", "社会哥支付宝"],
         )
-        self.assertEqual([item["owner"] for item in plan["items"][2:5]], ["owner", "owner", "owner"])
+        self.assertEqual([item["owner"] for item in plan["items"][:4]], ["owner"] * 4)
 
     def test_cost_plan_rejects_insufficient_integer_balance(self) -> None:
         with self.assertRaisesRegex(ValueError, "最多 8 元"):
@@ -94,13 +94,13 @@ class WithdrawalPlanningTests(unittest.TestCase):
         self.assertEqual(settlement["roundingRemainder"], 0.5)
 
     def test_full_settlement_uses_sixty_forty_profit_split(self) -> None:
-        plan = plan_withdrawal("full", 324.5, balances([20, 81, 65, 62, 105, 1, 86]))
+        plan = plan_withdrawal("full", 324.5, balances([81, 65, 62, 105, 1, 86]))
         settlement = settlement_for(plan)
-        self.assertEqual(settlement["gross"], 420.0)
-        self.assertEqual(settlement["profit"], 95.5)
-        self.assertEqual(settlement["ownerExpected"], 381.8)
-        self.assertEqual(settlement["partnerExpected"], 38.2)
-        self.assertEqual(settlement["partnerToOwner"], 48.8)
+        self.assertEqual(settlement["gross"], 400.0)
+        self.assertEqual(settlement["profit"], 75.5)
+        self.assertEqual(settlement["ownerExpected"], 369.8)
+        self.assertEqual(settlement["partnerExpected"], 30.2)
+        self.assertEqual(settlement["partnerToOwner"], 56.8)
 
     def test_cost_settlement_exposes_unrecovered_manual_amount(self) -> None:
         plan = plan_withdrawal("cost", 324.5, balances([20, 80, 65, 60, 95, 0, 0]), 320)
@@ -109,7 +109,7 @@ class WithdrawalPlanningTests(unittest.TestCase):
         self.assertEqual(settlement["unrecoveredCost"], 4.5)
 
     def test_email_templates_name_both_fixed_recipients_and_formula(self) -> None:
-        plan = plan_withdrawal("full", 324.5, balances([20, 81, 65, 62, 105, 1, 86]))
+        plan = plan_withdrawal("full", 324.5, balances([81, 65, 62, 105, 1, 86]))
         plan["jobId"] = "20260802-001"
         plan["balanceSnapshotTotal"] = 423.33
         plan["postWithdrawalCost"] = 0
@@ -129,10 +129,10 @@ class WithdrawalPlanningTests(unittest.TestCase):
         plan["costClearedAmount"] = 324.5
         plan["settlement"] = settlement_for(plan)
         subject, body = render_withdrawal_email(plan)
-        self.assertEqual(NOTIFICATION_RECIPIENTS, ("1745627971@qq.com", "252715669@qq.com"))
+        self.assertEqual(NOTIFICATION_RECIPIENTS, ("252715669@qq.com",))
         self.assertIn("[91] 全部提现任务 #20260802-001", subject)
-        self.assertIn("星星应得 = 324.50 + 95.50 × 60% = 381.80 元", body)
-        self.assertIn("社会哥需要转给星星：48.80 元", body)
+        self.assertIn("星星应得 = 324.50 + 75.50 × 60% = 369.80 元", body)
+        self.assertIn("社会哥需要转给星星：56.80 元", body)
         self.assertIn("成本日期：2026-07-31 00:00:00", body)
         self.assertIn("金额：324.50 元 | 备注：测试成本", body)
         self.assertIn("录入时间：2026-07-31 10:35:25", body)
@@ -296,7 +296,7 @@ class WithdrawalServiceConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         history = self.service.job_history(limit=10, offset=0)
         self.assertEqual(history["total"], 1)
         self.assertEqual(history["jobs"][0]["jobId"], created["jobId"])
-        self.assertEqual(len(history["jobs"][0]["items"]), 7)
+        self.assertEqual(len(history["jobs"][0]["items"]), len(WITHDRAWAL_ACCOUNTS))
         self.assertEqual(history["jobs"][0]["items"][0]["statusLabel"], "待执行")
         self.assertNotIn("response", history["jobs"][0]["items"][0])
 
@@ -321,7 +321,7 @@ class WithdrawalServiceConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.max_in_flight, 1)
         with self.connect() as connection:
             emails = connection.execute("SELECT recipient, status FROM withdrawal_emails ORDER BY email_id").fetchall()
-        self.assertEqual(len(emails), 2)
+        self.assertEqual(len(emails), len(NOTIFICATION_RECIPIENTS))
         self.assertEqual({row["recipient"] for row in emails}, set(NOTIFICATION_RECIPIENTS))
 
     async def test_accounts_wait_then_accelerate_without_parallel_submission(self) -> None:
@@ -454,6 +454,26 @@ class WithdrawalServiceConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(delay, 60 * 60)
         self.assertEqual(recovered["status"], "waiting")
         self.assertEqual(self.manager.calls, 0)
+
+    async def test_worker_skips_retired_legacy_item_before_submit(self) -> None:
+        plan = self.service.latest_plan("cost", 1)
+        job = self.service.create_job(plan, self.target_ids)
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE withdrawal_items SET email = ?, target_id = ? WHERE job_id = ? AND sequence = 1",
+                ("1745627971@QQ.COM", "retired-target", job["jobId"]),
+            )
+
+        delay = await self.service.process_once()
+        current = self.service.job_detail(job["jobId"])
+
+        self.assertEqual(delay, 0.5)
+        self.assertEqual(self.manager.calls, 0)
+        self.assertEqual(current["items"][0]["status"], "skipped")
+        self.assertIn("永久排除", current["items"][0]["error"])
+
+        await self.service.process_once()
+        self.assertEqual(self.service.job_detail(job["jobId"])["status"], "completed")
 
 
 if __name__ == "__main__":

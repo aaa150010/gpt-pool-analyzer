@@ -16,7 +16,6 @@ class WithdrawalAccount:
 
 
 WITHDRAWAL_ACCOUNTS = (
-    WithdrawalAccount("1745627971@qq.com", "owner", "wechat", "自己微信"),
     WithdrawalAccount("2108462529@qq.com", "owner", "alipay", "自己支付宝"),
     WithdrawalAccount("2328406178@qq.com", "owner", "wechat", "老弟微信"),
     WithdrawalAccount("3595633153@qq.com", "owner", "alipay", "老弟支付宝"),
@@ -25,7 +24,7 @@ WITHDRAWAL_ACCOUNTS = (
     WithdrawalAccount("2209245787@qq.com", "partner", "alipay", "社会哥支付宝"),
 )
 ACCOUNT_BY_EMAIL = {item.email: item for item in WITHDRAWAL_ACCOUNTS}
-NOTIFICATION_RECIPIENTS = ("1745627971@qq.com", "252715669@qq.com")
+NOTIFICATION_RECIPIENTS = ("252715669@qq.com",)
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
@@ -105,7 +104,7 @@ def plan_withdrawal(
             raise ValueError("提现金额必须大于 0")
         available = sum(_integer_balance(item["balance"]) for item in normalized)
         if target > available:
-            raise ValueError(f"提现金额超过七个账号可提现整数余额（最多 {available} 元）")
+            raise ValueError(f"提现金额超过全部账号可提现整数余额（最多 {available} 元）")
         amounts = _allocate_cost(normalized, target)
         requested = float(target)
     elif mode == "full":

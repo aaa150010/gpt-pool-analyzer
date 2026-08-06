@@ -591,6 +591,38 @@ export type PixelShareAllResponse = {
   message: string;
 };
 
+export type PixelCleanupKind = "limited" | "error";
+
+export type PixelCleanupTargetResult = {
+  targetId: string;
+  email: string;
+  found: number;
+  deleted: number;
+  failed: number;
+  failedIds: number[];
+  status: "success" | "partial" | "skipped";
+  message: string;
+};
+
+export type PixelCleanupResult = {
+  kind: PixelCleanupKind;
+  totalTargets: number;
+  found: number;
+  deleted: number;
+  failed: number;
+  skippedTargets: number;
+  results: PixelCleanupTargetResult[];
+};
+
+export type PixelCleanupProgress = {
+  phase: "scanning" | "deleting";
+  completedTargets: number;
+  totalTargets: number;
+  targetEmail: string;
+  found: number;
+  deleted: number;
+};
+
 export type PixelExportDownload = {
   blob: Blob;
   fileName: string;
