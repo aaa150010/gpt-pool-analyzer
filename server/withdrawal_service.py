@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formataddr
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 try:
     from .account_policy import is_excluded_account
@@ -32,6 +33,33 @@ except ImportError:
 
 RUNNING_STALE_SECONDS = 5 * 60
 RUNNING_RECHECK_SECONDS = 5.0
+WITHDRAWAL_MIN_DELAY_SECONDS = 20 * 60
+WITHDRAWAL_MAX_DELAY_SECONDS = 60 * 60
+WITHDRAWAL_FINISH_BUFFER_SECONDS = 5 * 60
+WITHDRAWAL_ITEM_RESERVE_SECONDS = 2 * 60
+WITHDRAWAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+def withdrawal_delay_seconds(
+    now: datetime,
+    remaining_items: int,
+    randint: Callable[[int, int], int] = random.randint,
+) -> float:
+    """Keep randomized serial withdrawals inside the current Shanghai day."""
+    remaining = max(int(remaining_items), 0)
+    if remaining == 0:
+        return 0.0
+    aware_now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    local_now = aware_now.astimezone(WITHDRAWAL_TIMEZONE)
+    midnight = (local_now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    seconds_left = max(int((midnight - local_now).total_seconds()), 0)
+    reserved = WITHDRAWAL_FINISH_BUFFER_SECONDS + remaining * WITHDRAWAL_ITEM_RESERVE_SECONDS
+    per_gap_budget = max(seconds_left - reserved, 0) // remaining
+    upper = min(WITHDRAWAL_MAX_DELAY_SECONDS, per_gap_budget)
+    if upper <= 0:
+        return 0.0
+    lower = WITHDRAWAL_MIN_DELAY_SECONDS if upper >= WITHDRAWAL_MIN_DELAY_SECONDS else max(1, upper // 2)
+    return float(randint(lower, upper))
 
 
 def build_notification_message(
@@ -646,13 +674,14 @@ class WithdrawalService:
                 (self.item_label("submitted"), now, self._dumps(response), item_id),
             )
             self._apply_item_cost_recovery(conn, job, item, now)
-            remaining = conn.execute(
-                "SELECT 1 FROM withdrawal_items WHERE job_id = ? AND status = 'queued' LIMIT 1",
+            remaining_count = int(conn.execute(
+                "SELECT COUNT(*) AS count FROM withdrawal_items WHERE job_id = ? AND status = 'queued'",
                 (job_id,),
-            ).fetchone()
-            if remaining:
-                delay = float(random.randint(20 * 60, 60 * 60))
-                next_run_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+            ).fetchone()["count"])
+            if remaining_count:
+                schedule_now = datetime.now(timezone.utc)
+                delay = withdrawal_delay_seconds(schedule_now, remaining_count)
+                next_run_at = (schedule_now + timedelta(seconds=delay)).isoformat()
                 conn.execute(
                     "UPDATE withdrawal_jobs SET status = 'waiting', next_run_at = ?, error = NULL, updated_at = ? "
                     "WHERE job_id = ?",
@@ -696,8 +725,6 @@ class WithdrawalService:
         return True
 
     def _recover_submitted_transition(self, job_id: str) -> float:
-        delay = float(random.randint(20 * 60, 60 * 60))
-        next_run_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
         now = self._utc_now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -705,12 +732,16 @@ class WithdrawalService:
                 "SELECT 1 FROM withdrawal_items WHERE job_id = ? AND status = 'running' LIMIT 1",
                 (job_id,),
             ).fetchone()
-            queued = conn.execute(
-                "SELECT 1 FROM withdrawal_items WHERE job_id = ? AND status = 'queued' LIMIT 1",
+            queued_count = int(conn.execute(
+                "SELECT COUNT(*) AS count FROM withdrawal_items WHERE job_id = ? AND status = 'queued'",
                 (job_id,),
-            ).fetchone()
+            ).fetchone()["count"])
             updated = 0
-            if not running and queued:
+            delay = RUNNING_RECHECK_SECONDS
+            if not running and queued_count:
+                schedule_now = datetime.now(timezone.utc)
+                delay = withdrawal_delay_seconds(schedule_now, queued_count)
+                next_run_at = (schedule_now + timedelta(seconds=delay)).isoformat()
                 updated = conn.execute(
                     "UPDATE withdrawal_jobs SET status = 'waiting', next_run_at = ?, updated_at = ? "
                     "WHERE job_id = ? AND status = 'running'",

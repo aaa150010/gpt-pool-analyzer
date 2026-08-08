@@ -667,6 +667,7 @@ cost_ledger = CostLedger(
     number=flexible_number,
 )
 insert_cost_addition = cost_ledger.insert
+delete_cost_addition = cost_ledger.delete
 clear_cost_additions = cost_ledger.clear_all
 cost_additions_snapshot = cost_ledger.list
 recover_cost_additions_if_snapshot = cost_ledger.recover_snapshot
@@ -1278,3 +1279,14 @@ async def delete_cost_additions() -> dict[str, Any]:
     total = clear_cost_additions()
     update_stored_cost(-total)
     return {"ok": True, "state": current_state()}
+
+
+@app.delete(f"{API_PREFIX}/cost-additions/{{item_id}}")
+async def delete_cost_addition_item(item_id: str) -> dict[str, Any]:
+    if not initialized():
+        raise HTTPException(status_code=409, detail="Not initialized")
+    amount = delete_cost_addition(item_id)
+    if amount is None:
+        raise HTTPException(status_code=404, detail="累加成本记录不存在")
+    update_stored_cost(-amount)
+    return {"ok": True, "deletedAmount": amount, "state": current_state()}

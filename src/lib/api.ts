@@ -189,6 +189,8 @@ export const api = {
       method: "POST",
       body: JSON.stringify(addition),
     }),
+  deleteCost: (additionId: string) =>
+    requestJson<ServerRefreshResponse>(`/cost-additions/${encodeURIComponent(additionId)}`, { method: "DELETE" }),
   clearCosts: () => requestJson<ServerRefreshResponse>("/cost-additions", { method: "DELETE" }),
   balanceAccounts: () => requestJson<{ accounts: BalanceAccount[] }>("/balance-accounts"),
   updateBalanceAccounts: (accounts: BalanceAccount[]) =>

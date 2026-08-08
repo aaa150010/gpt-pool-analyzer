@@ -62,6 +62,21 @@ class CostLedger:
             conn.execute("DELETE FROM cost_additions")
         return total
 
+    def delete(self, item_id: str) -> float | None:
+        normalized_id = str(item_id or "").strip()
+        if not normalized_id:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT amount FROM cost_additions WHERE id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if not row:
+                return None
+            amount = self._number(row["amount"], 0)
+            conn.execute("DELETE FROM cost_additions WHERE id = ?", (normalized_id,))
+        return amount
+
     def clear_snapshot(self, conn: Any, snapshot: list[dict[str, Any]]) -> dict[str, Any]:
         """Clear only rows frozen by one withdrawal, inside its transaction."""
         ids = [

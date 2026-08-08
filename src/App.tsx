@@ -444,6 +444,11 @@ export function App() {
         open={dialog === "costHistory"}
         additions={stored.costAdditions ?? []}
         onOpenChange={(open) => setDialog(open ? "costHistory" : null)}
+        onDelete={async (addition) => {
+          const response = await api.deleteCost(addition.id);
+          if (response.state) applyState(response.state);
+          setToast(`已删除 ${formatSignedMoney(addition.amount)} 元的累加成本`);
+        }}
         onClear={async () => {
           const response = await api.clearCosts();
           if (response.state) applyState(response.state);
@@ -2980,7 +2985,7 @@ function PixelImportProgress({
         : `正在处理 ${currentTarget?.email || "平台账号"}`;
   return (
     <Card className={cn(failed ? "border-rose-200" : finished ? "border-emerald-200" : waiting ? "border-amber-200" : "border-blue-200")}>
-      <CardContent className="flex min-h-20 items-center gap-4 p-4">
+      <CardContent className="flex min-h-20 flex-wrap items-center gap-4 p-4 sm:flex-nowrap">
         <div className={cn(
           "flex h-10 w-10 shrink-0 items-center justify-center rounded-md",
           failed ? "bg-rose-50 text-rose-600" : finished ? "bg-emerald-50 text-emerald-600" : waiting ? "bg-amber-50 text-amber-600" : "bg-blue-50 text-blue-600",
@@ -2999,10 +3004,15 @@ function PixelImportProgress({
             />
           </div>
         </div>
-        {waiting && (
-          <Button size="sm" className="shrink-0 bg-amber-600 text-white hover:bg-amber-700" disabled={accelerating} onClick={() => void onAccelerate()}>
+        {!failed && !finished && (
+          <Button
+            size="sm"
+            className={cn("ml-auto shrink-0", waiting && "bg-amber-600 text-white hover:bg-amber-700")}
+            disabled={!waiting || accelerating}
+            onClick={() => void onAccelerate()}
+          >
             {accelerating ? <Loader2 className="h-4 w-4 animate-spin" /> : <FastForward className="h-4 w-4" />}
-            加速下一步
+            {accelerating ? "正在加速" : waiting ? "加速下一步" : "处理后可加速"}
           </Button>
         )}
       </CardContent>
@@ -3653,7 +3663,7 @@ function WithdrawalDialog({
       <DialogContent className="!w-[min(calc(100vw-32px),1040px)] max-w-none max-h-[min(860px,calc(100vh-36px))] overflow-auto">
         <DialogHeader>
           <DialogTitle>{showingJob ? "提现进度" : "快捷提现"}</DialogTitle>
-          <DialogDescription>{showingJob ? "这里显示当前账号、已完成数量、等待倒计时和每笔提交结果。" : "每次只提交一个账号。提交成功后随机等待 20-60 分钟，再执行下一个账号。"}</DialogDescription>
+          <DialogDescription>{showingJob ? "这里显示当前账号、已完成数量、等待倒计时和每笔提交结果。" : "每次只提交一个账号。平时随机等待 20-60 分钟；当天剩余时间不足时会自动压缩间隔，保证在 24:00 前完成。"}</DialogDescription>
         </DialogHeader>
 
         {showingJob && (
@@ -3954,62 +3964,137 @@ function CostHistoryDialog({
   open,
   additions,
   onOpenChange,
+  onDelete,
   onClear,
 }: {
   open: boolean;
   additions: CostAddition[];
   onOpenChange: (open: boolean) => void;
+  onDelete: (addition: CostAddition) => Promise<void>;
   onClear: () => Promise<void>;
 }) {
   const [clearing, setClearing] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<CostAddition | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState("");
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>累加成本历史</DialogTitle>
-          <DialogDescription>合计 {formatSignedMoney(additions.reduce((sum, item) => sum + item.amount, 0))} 元</DialogDescription>
-        </DialogHeader>
-        <div className="max-h-[360px] overflow-auto rounded-md border border-border">
-          <table className="w-full text-left text-sm">
-            <thead className="sticky top-0 bg-muted text-xs font-black text-muted-foreground">
-              <tr>
-                <th className="px-3 py-2">日期</th>
-                <th className="px-3 py-2">金额</th>
-                <th className="px-3 py-2">备注</th>
-                <th className="px-3 py-2">创建时间</th>
-              </tr>
-            </thead>
-            <tbody>
-              {additions.map((item) => (
-                <tr key={item.id} className="border-t border-border">
-                  <td className="px-3 py-2 font-semibold">{formatDateTime(item.date)}</td>
-                  <td className="px-3 py-2 font-black">{formatSignedMoney(item.amount)}</td>
-                  <td className="px-3 py-2">{item.note || "-"}</td>
-                  <td className="px-3 py-2 text-muted-foreground">{formatDateTime(item.createdAt)}</td>
+    <>
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent className="!w-[min(calc(100vw-32px),860px)] max-w-none">
+          <DialogHeader>
+            <DialogTitle>累加成本历史</DialogTitle>
+            <DialogDescription>合计 {formatSignedMoney(additions.reduce((sum, item) => sum + item.amount, 0))} 元</DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[360px] overflow-auto rounded-md border border-border">
+            <table className="w-full min-w-[720px] table-fixed text-left text-sm">
+              <thead className="sticky top-0 bg-muted text-xs font-black text-muted-foreground">
+                <tr>
+                  <th className="w-[150px] px-3 py-2">日期</th>
+                  <th className="w-[110px] px-3 py-2">金额</th>
+                  <th className="px-3 py-2">备注</th>
+                  <th className="w-[170px] px-3 py-2">创建时间</th>
+                  <th className="w-14 px-3 py-2 text-center">操作</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <div className="mt-5 flex justify-end gap-2">
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            关闭
-          </Button>
-          <Button
-            variant="destructive"
-            disabled={!additions.length || clearing}
-            onClick={async () => {
-              setClearing(true);
-              await onClear();
-              setClearing(false);
-            }}
-          >
-            <Trash2 className="h-4 w-4" />
-            一键清空
-          </Button>
-        </div>
-      </DialogContent>
-    </Dialog>
+              </thead>
+              <tbody>
+                {additions.map((item) => (
+                  <tr key={item.id} className="border-t border-border">
+                    <td className="px-3 py-2 font-semibold">{formatDateTime(item.date)}</td>
+                    <td className="px-3 py-2 font-black">{formatSignedMoney(item.amount)}</td>
+                    <td className="truncate px-3 py-2" title={item.note || "-"}>{item.note || "-"}</td>
+                    <td className="px-3 py-2 text-muted-foreground">{formatDateTime(item.createdAt)}</td>
+                    <td className="px-3 py-2 text-center">
+                      <Button
+                        type="button"
+                        size="icon"
+                        variant="ghost"
+                        className="h-8 w-8 text-rose-600 hover:bg-rose-50 hover:text-rose-700"
+                        title="删除这条累加成本"
+                        aria-label="删除这条累加成本"
+                        disabled={Boolean(deletingId) || clearing}
+                        onClick={() => {
+                          setDeleteError("");
+                          setPendingDelete(item);
+                        }}
+                      >
+                        {deletingId === item.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-5 flex justify-end gap-2">
+            <Button variant="outline" onClick={() => onOpenChange(false)}>
+              关闭
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={!additions.length || clearing || Boolean(deletingId)}
+              onClick={async () => {
+                setClearing(true);
+                try {
+                  await onClear();
+                } finally {
+                  setClearing(false);
+                }
+              }}
+            >
+              {clearing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+              一键清空
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(pendingDelete)}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen && !deletingId) setPendingDelete(null);
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>删除这条累加成本？</DialogTitle>
+            <DialogDescription>
+              删除后会从星星出资中同步扣回 {formatSignedMoney(pendingDelete?.amount ?? 0)} 元，且无法撤销。
+            </DialogDescription>
+          </DialogHeader>
+          {pendingDelete && (
+            <div className="rounded-md border border-border bg-muted/40 px-3 py-3 text-sm">
+              <div className="font-black">{formatDateTime(pendingDelete.date)} · {formatSignedMoney(pendingDelete.amount)} 元</div>
+              <div className="mt-1 text-muted-foreground">{pendingDelete.note || "无备注"}</div>
+            </div>
+          )}
+          {deleteError && <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-bold text-rose-700">{deleteError}</div>}
+          <div className="mt-5 flex justify-end gap-2">
+            <Button variant="outline" disabled={Boolean(deletingId)} onClick={() => setPendingDelete(null)}>取消</Button>
+            <Button
+              variant="destructive"
+              disabled={!pendingDelete || Boolean(deletingId)}
+              onClick={async () => {
+                if (!pendingDelete) return;
+                const item = pendingDelete;
+                setDeletingId(item.id);
+                setDeleteError("");
+                try {
+                  await onDelete(item);
+                  setPendingDelete(null);
+                } catch (error) {
+                  setDeleteError(error instanceof Error ? error.message : "删除累加成本失败");
+                } finally {
+                  setDeletingId(null);
+                }
+              }}
+            >
+              {deletingId ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+              {deletingId ? "正在删除" : "确认删除"}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
 

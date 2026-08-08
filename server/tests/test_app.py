@@ -133,6 +133,41 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(rows[0]["capacity5h"], 100)
         self.assertEqual(rows[0]["remainingCapacity5h"], 98.75)
 
+    def test_single_cost_addition_delete_updates_cost_and_preserves_other_rows(self) -> None:
+        app.init_db()
+        app.set_meta("initialized", "true")
+        app.set_setting("stored_state", {"cost": 35})
+        app.insert_cost_addition(
+            {
+                "id": "cost-delete",
+                "date": "2026-08-07T00:00:00Z",
+                "note": "要删除",
+                "amount": 10,
+                "createdAt": "2026-08-07T00:01:00Z",
+            }
+        )
+        app.insert_cost_addition(
+            {
+                "id": "cost-keep",
+                "date": "2026-08-07T00:02:00Z",
+                "note": "要保留",
+                "amount": 25,
+                "createdAt": "2026-08-07T00:03:00Z",
+            }
+        )
+        client = TestClient(app.app)
+
+        deleted = client.delete("/gpt-api/cost-additions/cost-delete")
+
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(deleted.json()["deletedAmount"], 10)
+        self.assertEqual(deleted.json()["state"]["storedState"]["cost"], 25)
+        self.assertEqual([item["id"] for item in app.cost_additions()], ["cost-keep"])
+
+        missing = client.delete("/gpt-api/cost-additions/cost-delete")
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(app.get_setting("stored_state", {})["cost"], 25)
+
     def test_cursor_pages_keep_old_history_available(self) -> None:
         app.init_db()
         app.insert_pool_snapshot(pool_snapshot("2024-01-01T00:00:00Z", 100))

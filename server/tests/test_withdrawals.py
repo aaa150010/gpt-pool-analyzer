@@ -4,15 +4,18 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from server.cost_ledger import CostLedger
 from server.withdrawal_email import render_withdrawal_email_html
 from server.withdrawal_service import (
+    WITHDRAWAL_FINISH_BUFFER_SECONDS,
+    WITHDRAWAL_ITEM_RESERVE_SECONDS,
     WithdrawalService,
     build_notification_message,
     initialize_withdrawal_schema,
+    withdrawal_delay_seconds,
 )
 from server.withdrawals import (
     NOTIFICATION_RECIPIENTS,
@@ -31,6 +34,30 @@ def balances(values: list[float]) -> list[dict[str, float | str]]:
 
 
 class WithdrawalPlanningTests(unittest.TestCase):
+    def test_random_wait_compresses_to_finish_before_shanghai_midnight(self) -> None:
+        now = datetime(2026, 8, 7, 15, 30, tzinfo=timezone.utc)
+        remaining = 6
+        delay = withdrawal_delay_seconds(now, remaining, randint=lambda _low, high: high)
+        midnight = datetime(2026, 8, 7, 16, 0, tzinfo=timezone.utc)
+
+        self.assertLess(delay, 20 * 60)
+        projected_finish = now + timedelta(
+            seconds=(delay + WITHDRAWAL_ITEM_RESERVE_SECONDS) * remaining
+            + WITHDRAWAL_FINISH_BUFFER_SECONDS
+        )
+        self.assertLessEqual(projected_finish, midnight)
+
+    def test_random_wait_becomes_immediate_when_only_submission_time_remains(self) -> None:
+        now = datetime(2026, 8, 7, 15, 50, tzinfo=timezone.utc)
+
+        self.assertEqual(withdrawal_delay_seconds(now, 6), 0)
+
+    def test_random_wait_keeps_normal_range_when_day_has_enough_time(self) -> None:
+        now = datetime(2026, 8, 7, 4, 0, tzinfo=timezone.utc)
+        delay = withdrawal_delay_seconds(now, 6, randint=lambda low, _high: low)
+
+        self.assertEqual(delay, 20 * 60)
+
     def test_notification_headers_suppress_automatic_replies(self) -> None:
         message = build_notification_message(
             subject="[91] test",
