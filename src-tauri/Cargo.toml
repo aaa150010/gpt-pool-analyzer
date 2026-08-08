@@ -1,6 +1,6 @@
 [package]
 name = "gpt-analyzer"
-version = "2.2.10"
+version = "2.2.11"
 description = "91"
 authors = ["lwh"]
 edition = "2021"
