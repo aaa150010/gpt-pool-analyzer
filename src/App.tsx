@@ -48,6 +48,7 @@ import {
 } from "recharts";
 import { api } from "./lib/api";
 import { cleanupPixelAccounts } from "./lib/pixel-cleanup";
+import { recoverPixelAccounts } from "./lib/pixel-recovery";
 import type {
   BalanceAccount,
   CostAddition,
@@ -78,6 +79,7 @@ import type {
   WithdrawalPlan,
   WithdrawalMode,
 } from "./lib/types";
+import type { PixelRecoveryProgress, PixelRecoveryResult } from "./lib/pixel-recovery";
 import {
   cn,
   formatDateInput,
@@ -157,6 +159,7 @@ const tooltipItemStyle = { fontSize: 12, fontWeight: 600, lineHeight: "16px", pa
 
 export function App() {
   const [view, setView] = useState<ViewKey>("trends");
+  const [managerVisited, setManagerVisited] = useState(false);
   const [serverState, setServerState] = useState<ServerStateResponse>({ initialized: false });
   const [stored, setStored] = useState<StoredState>(defaultStored);
   const [pool, setPool] = useState<PoolAnalyzerState>(defaultPool);
@@ -207,6 +210,10 @@ export function App() {
     const timer = window.setTimeout(() => setToast(""), 2600);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  useEffect(() => {
+    if (view === "manager") setManagerVisited(true);
+  }, [view]);
 
   const loadWithdrawalJob = useCallback(async () => {
     try {
@@ -374,7 +381,7 @@ export function App() {
           <AnimatePresence mode="wait">
             <motion.div
               key={view}
-              className={cn(view === "manager" && "h-full min-h-0")}
+              className={cn(view === "manager" && "hidden")}
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -6 }}
@@ -400,7 +407,6 @@ export function App() {
                   onOpenDialog={setDialog}
                 />
               )}
-              {!loading && view === "manager" && <PixelManagerView onToast={setToast} />}
               {!loading && view === "cost" && (
                 <CostView
                   latestBalance={latestBalance}
@@ -422,6 +428,11 @@ export function App() {
               )}
             </motion.div>
           </AnimatePresence>
+          {!loading && managerVisited && (
+            <div className={cn("h-full min-h-0", view !== "manager" && "hidden")}>
+              <PixelManagerView onToast={setToast} />
+            </div>
+          )}
         </section>
       </main>
 
@@ -1477,6 +1488,8 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   const [retryingTargetId, setRetryingTargetId] = useState("");
   const [sharingAll, setSharingAll] = useState(false);
   const [shareAllResult, setShareAllResult] = useState<PixelShareAllResponse | null>(null);
+  const [recoveryProgress, setRecoveryProgress] = useState<PixelRecoveryProgress | null>(null);
+  const [recoveryResult, setRecoveryResult] = useState<PixelRecoveryResult | null>(null);
   const [exporting, setExporting] = useState(false);
   const [importRecords, setImportRecords] = useState<PixelImportRecord[]>([]);
   const [importRecordsOpen, setImportRecordsOpen] = useState(false);
@@ -1500,6 +1513,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   const loadAccountsRef = useRef<() => Promise<void>>(async () => undefined);
   const refreshAllTargetCountsRef = useRef<(targetList?: PixelTarget[], options?: { silent?: boolean }) => Promise<void>>(async () => undefined);
   const cleanupRunning = cleanupProgress !== null;
+  const recoveryRunning = recoveryProgress !== null;
 
   const beginAccountsTransition = useCallback(() => {
     accountsRequestSequence.current += 1;
@@ -1648,7 +1662,9 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
         void loadTargets().then((targetList) => refreshAllTargetCountsRef.current(targetList, { silent: true }));
         void loadAccountsRef.current();
       }
-    }).catch(() => window.localStorage.removeItem("pixelImportJobId"));
+    }).catch(() => {
+      // Keep the job id so a temporary server or network failure cannot orphan a running import.
+    });
   }, [loadTargets]);
 
   useEffect(() => {
@@ -1841,6 +1857,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   };
 
   const runExportAction = async () => {
+    if (recoveryRunning) return;
     if (!exportDeleteAndReimport) {
       setExportOpen(false);
       await exportAllAccounts();
@@ -1936,7 +1953,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   };
 
   const runShareAll = async () => {
-    if (!targets.length) return;
+    if (!targets.length || recoveryRunning) return;
     setSharingAll(true);
     try {
       const response = await api.pixelShareAll(targets.map((target) => target.id));
@@ -1949,6 +1966,46 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
       onToast(error instanceof Error ? error.message : "一键打开共享失败");
     } finally {
       setSharingAll(false);
+    }
+  };
+
+  const runFullPoolRecovery = async () => {
+    if (!targets.length || importing || exporting || sharingAll || cleanupRunning || recoveryRunning) return;
+    setRecoveryResult(null);
+    setRecoveryProgress({
+      phase: "scanning",
+      completedTargets: 0,
+      totalTargets: targets.length,
+      targetEmail: targets[0]?.email ?? "",
+      scannedAccounts: 0,
+      testedAccounts: 0,
+      testSuccess: 0,
+      testFailed: 0,
+    });
+    try {
+      const summary = await recoverPixelAccounts({
+        targets,
+        operations: {
+          listAccounts: (targetId, scanPage, scanPageSize) => api.pixelAccounts(targetId, scanPage, scanPageSize),
+          bulkTest: api.pixelBulkTest,
+          shareAll: (targetIds) => api.pixelShareAll(targetIds),
+        },
+        onProgress: setRecoveryProgress,
+      });
+      setExportOpen(false);
+      setRecoveryResult(summary);
+      const targetList = await loadTargets();
+      await refreshAllTargetCountsRef.current(targetList, { silent: true });
+      await loadAccountsRef.current();
+      if (summary.shareError) {
+        onToast(`全池测试完成：成功 ${summary.testSuccess} 个，失败 ${summary.testFailed} 个；打开共享失败：${summary.shareError}`);
+      } else {
+        onToast(`全池测试完成：成功 ${summary.testSuccess} 个，失败 ${summary.testFailed} 个；公共共享成功 ${summary.shareAll?.shared ?? 0} 个${summary.shareAll?.failed ? `，失败 ${summary.shareAll.failed} 个` : ""}`);
+      }
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "全池批量测试失败");
+    } finally {
+      setRecoveryProgress(null);
     }
   };
 
@@ -1983,7 +2040,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   };
 
   const runBulkTest = async () => {
-    if (!activeTargetId || !selectedAccountIds.size) return;
+    if (!activeTargetId || !selectedAccountIds.size || recoveryRunning) return;
     const accountIds = [...selectedAccountIds];
     setBulkAction("test");
     try {
@@ -2005,7 +2062,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   };
 
   const runBulkUpdate = async () => {
-    if (!activeTargetId || !selectedAccountIds.size) return;
+    if (!activeTargetId || !selectedAccountIds.size || recoveryRunning) return;
     const concurrency = bulkConcurrency.trim() ? Number(bulkConcurrency) : undefined;
     if (concurrency !== undefined && (!Number.isInteger(concurrency) || concurrency < 3 || concurrency > 50)) {
       onToast("并发数必须是 3 到 50 的整数");
@@ -2031,7 +2088,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   };
 
   const runBulkDelete = async () => {
-    if (!activeTargetId || !bulkDeleteAccountIds.length) return;
+    if (!activeTargetId || !bulkDeleteAccountIds.length || recoveryRunning) return;
     const accountIds = [...bulkDeleteAccountIds];
     setBulkAction("delete");
     try {
@@ -2054,7 +2111,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   };
 
   const runCleanup = async () => {
-    if (!cleanupKind || cleanupRunning) return;
+    if (!cleanupKind || cleanupRunning || recoveryRunning) return;
     try {
       const requestedKind = cleanupKind;
       const cleanupSummary = await cleanupPixelAccounts({
@@ -2084,6 +2141,11 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   const bulkConcurrencyValid = bulkConcurrencyValue === undefined
     || (Number.isInteger(bulkConcurrencyValue) && bulkConcurrencyValue >= 3 && bulkConcurrencyValue <= 50);
   const bulkEditReady = bulkMakePublic || bulkConcurrencyValue !== undefined;
+  const recoveryPhaseLabel = recoveryProgress ? {
+    scanning: `正在扫描 ${recoveryProgress.targetEmail || "平台账号"}`,
+    testing: `正在测试 ${recoveryProgress.targetEmail || "平台账号"}`,
+    sharing: "正在为全部账号重新打开公共共享",
+  }[recoveryProgress.phase] : "";
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
@@ -2104,7 +2166,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               </div>
             </div>
           </div>
-          <div className="flex shrink-0 items-center gap-2">
+          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
             <input
               ref={fileInputRef}
               type="file"
@@ -2116,33 +2178,74 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                 setSelectedFiles(files);
               }}
             />
-            <Button variant="outline" disabled={importing || sharingAll || cleanupRunning} onClick={() => fileInputRef.current?.click()}>
+            <Button variant="outline" disabled={importing || sharingAll || cleanupRunning || recoveryRunning} onClick={() => fileInputRef.current?.click()}>
               <FileJson className="h-4 w-4" />
               选择 JSON
             </Button>
-            <Button disabled={importing || sharingAll || cleanupRunning || !selectedFiles.length || !targets.length} onClick={openImport}>
+            <Button disabled={importing || sharingAll || cleanupRunning || recoveryRunning || !selectedFiles.length || !targets.length} onClick={openImport}>
               <Upload className="h-4 w-4" />
               上传到平台
             </Button>
             <Button
               variant="outline"
-              disabled={sharingAll || importing || exporting || cleanupRunning || targetsLoading || !targets.length}
+              disabled={sharingAll || importing || exporting || cleanupRunning || recoveryRunning || targetsLoading || !targets.length}
               onClick={() => void runShareAll()}
             >
               {sharingAll ? <Loader2 className="h-4 w-4 animate-spin" /> : <Share2 className="h-4 w-4" />}
               {sharingAll ? "正在打开共享" : "一键打开共享"}
             </Button>
-            <Button variant="outline" disabled={importing || sharingAll || cleanupRunning || targetsLoading} onClick={() => void openImportRecords()}>
+            <Button variant="outline" disabled={importing || sharingAll || cleanupRunning || recoveryRunning || targetsLoading} onClick={() => void openImportRecords()}>
               <History className="h-4 w-4" />
               导入记录
             </Button>
-            <Button variant="outline" disabled={exporting || sharingAll || importing || cleanupRunning || targetsLoading || !targets.length} onClick={openExport}>
+            <Button variant="outline" disabled={exporting || sharingAll || importing || cleanupRunning || recoveryRunning || targetsLoading || !targets.length} onClick={openExport}>
               {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
               {exporting ? "正在处理" : "汇总导出"}
             </Button>
+            <TooltipPrimitive.Provider delayDuration={180}>
+              <TooltipPrimitive.Root>
+                <TooltipPrimitive.Trigger asChild>
+                  <span className="inline-flex">
+                    <Button
+                      variant="outline"
+                      disabled={exporting || sharingAll || importing || cleanupRunning || recoveryRunning || targetsLoading || !targets.length}
+                      onClick={() => void runFullPoolRecovery()}
+                    >
+                      {recoveryRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Activity className="h-4 w-4" />}
+                      {recoveryRunning ? "正在恢复" : "批量测试并打开共享"}
+                    </Button>
+                  </span>
+                </TooltipPrimitive.Trigger>
+                <TooltipPrimitive.Portal>
+                  <TooltipPrimitive.Content
+                    side="bottom"
+                    sideOffset={7}
+                    collisionPadding={12}
+                    className="z-50 max-w-80 rounded-md border border-slate-700 bg-slate-950 px-3 py-2.5 text-xs font-semibold leading-5 text-slate-100 shadow-xl"
+                  >
+                    {recoveryProgress ? (
+                      <>
+                        <div className="font-black text-white">{recoveryPhaseLabel}</div>
+                        <div className="mt-1 text-slate-300">
+                          平台 {recoveryProgress.completedTargets}/{recoveryProgress.totalTargets} · 已扫描 {recoveryProgress.scannedAccounts} · 已测试 {recoveryProgress.testedAccounts}
+                        </div>
+                        <div className="text-slate-300">成功 {recoveryProgress.testSuccess} · 失败 {recoveryProgress.testFailed}</div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="font-black text-white">全池批量测试</div>
+                        <div className="mt-1 text-slate-300">扫描全部 {targets.length} 个平台的所有账号并分批测试。</div>
+                        <div className="font-bold text-amber-300">测试结束后无论成功或失败，都会为全部账号重新打开公共共享。</div>
+                      </>
+                    )}
+                    <TooltipPrimitive.Arrow className="fill-slate-950" />
+                  </TooltipPrimitive.Content>
+                </TooltipPrimitive.Portal>
+              </TooltipPrimitive.Root>
+            </TooltipPrimitive.Provider>
             <Button
               variant="outline"
-              disabled={exporting || sharingAll || importing || cleanupRunning || targetsLoading || !targets.length}
+              disabled={exporting || sharingAll || importing || cleanupRunning || recoveryRunning || targetsLoading || !targets.length}
               onClick={() => setCleanupKind("limited")}
             >
               <AlertTriangle className="h-4 w-4" />
@@ -2150,7 +2253,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
             </Button>
             <Button
               variant="destructive"
-              disabled={exporting || sharingAll || importing || cleanupRunning || targetsLoading || !targets.length}
+              disabled={exporting || sharingAll || importing || cleanupRunning || recoveryRunning || targetsLoading || !targets.length}
               onClick={() => setCleanupKind("error")}
             >
               <Trash2 className="h-4 w-4" />
@@ -2173,7 +2276,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                 type="button"
                 title="刷新全部账号数量"
                 aria-label="刷新全部平台账号数量"
-                disabled={targetsLoading || targetCountsRefreshing || sharingAll || cleanupRunning || !targets.length || Boolean(bulkAction)}
+                disabled={targetsLoading || targetCountsRefreshing || sharingAll || cleanupRunning || recoveryRunning || !targets.length || Boolean(bulkAction)}
                 className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
                 onClick={() => void refreshAllTargetCounts()}
               >
@@ -2195,7 +2298,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               return (
                 <button
                   key={target.id}
-                  disabled={Boolean(bulkAction) || sharingAll || cleanupRunning}
+                  disabled={Boolean(bulkAction) || sharingAll || cleanupRunning || recoveryRunning}
                   className={cn(
                     "mb-1 flex h-14 w-full items-center gap-2 rounded-md border px-2.5 text-left transition last:mb-0 disabled:cursor-wait disabled:opacity-60",
                     active ? "border-blue-200 bg-blue-50 text-blue-950" : "border-transparent hover:border-border hover:bg-muted",
@@ -2233,7 +2336,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <Button variant="outline" size="icon" title="刷新账号列表" disabled={!activeTargetId || accountsLoading || sharingAll || cleanupRunning || Boolean(bulkAction)} onClick={() => void loadAccounts()}>
+              <Button variant="outline" size="icon" title="刷新账号列表" disabled={!activeTargetId || accountsLoading || sharingAll || cleanupRunning || recoveryRunning || Boolean(bulkAction)} onClick={() => void loadAccounts()}>
                 <RefreshCw className={cn("h-4 w-4", accountsLoading && "animate-spin")} />
               </Button>
             </div>
@@ -2246,7 +2349,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                   aria-label="搜索账号"
                   value={accountSearchInput}
                   placeholder="搜索账号名称"
-                  disabled={!activeTargetId || sharingAll || cleanupRunning || Boolean(bulkAction)}
+                  disabled={!activeTargetId || sharingAll || cleanupRunning || recoveryRunning || Boolean(bulkAction)}
                   onChange={(event) => setAccountSearchInput(event.target.value)}
                   className="h-8 pl-8 pr-8 text-xs font-bold"
                 />
@@ -2255,7 +2358,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                     type="button"
                     title="清空搜索"
                     aria-label="清空搜索"
-                    disabled={sharingAll || cleanupRunning || Boolean(bulkAction)}
+                    disabled={sharingAll || cleanupRunning || recoveryRunning || Boolean(bulkAction)}
                     className="absolute right-1.5 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
                     onClick={() => setAccountSearchInput("")}
                   >
@@ -2266,7 +2369,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               <select
                 aria-label="账号状态筛选"
                 value={accountStatus}
-                disabled={!activeTargetId || accountsLoading || sharingAll || cleanupRunning || Boolean(bulkAction)}
+                disabled={!activeTargetId || accountsLoading || sharingAll || cleanupRunning || recoveryRunning || Boolean(bulkAction)}
                 onChange={(event) => {
                   beginAccountsTransition();
                   setPage(1);
@@ -2282,15 +2385,15 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               </select>
               <span className={cn("mr-auto whitespace-nowrap text-xs font-black", selectedAccountIds.size ? "text-blue-700" : "text-muted-foreground")}>已选 {selectedAccountIds.size}</span>
               <div className="flex shrink-0 items-center gap-2">
-                <Button variant="outline" size="sm" disabled={!selectedAccountIds.size || accountsLoading || sharingAll || cleanupRunning || Boolean(bulkAction)} onClick={() => void runBulkTest()}>
+                <Button variant="outline" size="sm" disabled={!selectedAccountIds.size || accountsLoading || sharingAll || cleanupRunning || recoveryRunning || Boolean(bulkAction)} onClick={() => void runBulkTest()}>
                   {bulkAction === "test" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Activity className="h-3.5 w-3.5" />}
                   批量测试连接
                 </Button>
-                <Button variant="outline" size="sm" disabled={!selectedAccountIds.size || accountsLoading || sharingAll || cleanupRunning || Boolean(bulkAction)} onClick={openBulkEdit}>
+                <Button variant="outline" size="sm" disabled={!selectedAccountIds.size || accountsLoading || sharingAll || cleanupRunning || recoveryRunning || Boolean(bulkAction)} onClick={openBulkEdit}>
                   {bulkAction === "update" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Settings className="h-3.5 w-3.5" />}
                   批量编辑
                 </Button>
-                <Button variant="destructive" size="sm" disabled={!selectedAccountIds.size || accountsLoading || sharingAll || cleanupRunning || Boolean(bulkAction)} onClick={openBulkDelete}>
+                <Button variant="destructive" size="sm" disabled={!selectedAccountIds.size || accountsLoading || sharingAll || cleanupRunning || recoveryRunning || Boolean(bulkAction)} onClick={openBulkDelete}>
                   <Trash2 className="h-3.5 w-3.5" />
                   批量删除
                 </Button>
@@ -2326,7 +2429,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                 <select
                   aria-label="每页数量"
                   value={pageSize}
-                  disabled={accountsLoading || cleanupRunning || Boolean(bulkAction)}
+                  disabled={accountsLoading || cleanupRunning || recoveryRunning || Boolean(bulkAction)}
                   onChange={(event) => {
                     beginAccountsTransition();
                     setPage(1);
@@ -2340,7 +2443,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                   variant="outline"
                   size="icon"
                   title="上一页"
-                  disabled={!accounts || page <= 1 || accountsLoading || cleanupRunning || Boolean(bulkAction)}
+                  disabled={!accounts || page <= 1 || accountsLoading || cleanupRunning || recoveryRunning || Boolean(bulkAction)}
                   onClick={() => {
                     beginAccountsTransition();
                     setPage((value) => Math.max(value - 1, 1));
@@ -2352,7 +2455,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                   variant="outline"
                   size="icon"
                   title="下一页"
-                  disabled={!accounts || page >= accounts.pages || accountsLoading || cleanupRunning || Boolean(bulkAction)}
+                  disabled={!accounts || page >= accounts.pages || accountsLoading || cleanupRunning || recoveryRunning || Boolean(bulkAction)}
                   onClick={() => {
                     beginAccountsTransition();
                     setPage((value) => value + 1);
@@ -2449,6 +2552,61 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                           {result.message}
                         </div>
                       </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {recoveryResult && (
+        <Dialog open onOpenChange={(open) => !open && setRecoveryResult(null)}>
+          <DialogContent className="max-h-[min(720px,calc(100vh-48px))] w-[min(calc(100vw-48px),980px)] overflow-auto">
+            <DialogHeader>
+              <DialogTitle>全池测试与共享恢复完成</DialogTitle>
+              <DialogDescription>
+                已扫描 {recoveryResult.totalTargets} 个平台的 {recoveryResult.scannedAccounts} 个账号，并在测试后对全部平台重新打开公共共享。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              <div className="rounded-md border border-border px-3 py-2.5"><div className="text-[11px] font-bold text-muted-foreground">已测试</div><div className="mt-0.5 text-lg font-black">{recoveryResult.testedAccounts}</div></div>
+              <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2.5"><div className="text-[11px] font-bold text-emerald-700">测试成功</div><div className="mt-0.5 text-lg font-black text-emerald-700">{recoveryResult.testSuccess}</div></div>
+              <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2.5"><div className="text-[11px] font-bold text-rose-700">测试失败</div><div className="mt-0.5 text-lg font-black text-rose-700">{recoveryResult.testFailed}</div></div>
+              <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2.5"><div className="text-[11px] font-bold text-blue-700">共享成功</div><div className="mt-0.5 text-lg font-black text-blue-700">{recoveryResult.shareAll?.shared ?? 0}</div></div>
+            </div>
+            {recoveryResult.shareError ? (
+              <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-3 text-sm font-bold text-rose-700">
+                重新打开共享失败：{recoveryResult.shareError}
+              </div>
+            ) : (
+              <div className={cn(
+                "rounded-md border px-3 py-3 text-sm font-bold",
+                recoveryResult.shareAll?.failed ? "border-amber-200 bg-amber-50 text-amber-800" : "border-emerald-200 bg-emerald-50 text-emerald-800",
+              )}>
+                公共共享已处理 {recoveryResult.shareAll?.total ?? 0} 个账号，成功 {recoveryResult.shareAll?.shared ?? 0} 个，失败 {recoveryResult.shareAll?.failed ?? 0} 个。
+              </div>
+            )}
+            <div className="overflow-hidden rounded-md border border-border">
+              <table className="w-full table-fixed text-left text-xs">
+                <thead className="bg-muted text-[11px] font-black text-muted-foreground">
+                  <tr>
+                    <th className="w-[260px] px-3 py-2.5">平台账号</th>
+                    <th className="w-[80px] px-3 py-2.5">扫描</th>
+                    <th className="w-[80px] px-3 py-2.5">成功</th>
+                    <th className="w-[80px] px-3 py-2.5">失败</th>
+                    <th className="px-3 py-2.5">说明</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {recoveryResult.results.map((result) => (
+                    <tr key={result.targetId} className="border-t border-border">
+                      <td className="truncate px-3 py-2.5 font-black" title={result.email}>{result.email}</td>
+                      <td className="px-3 py-2.5 font-black">{result.scanned}</td>
+                      <td className="px-3 py-2.5 font-black text-emerald-700">{result.success}</td>
+                      <td className={cn("px-3 py-2.5 font-black", result.failed ? "text-rose-700" : "text-muted-foreground")}>{result.failed}</td>
+                      <td className={cn("truncate px-3 py-2.5 font-bold", result.error ? "text-rose-700" : "text-muted-foreground")} title={result.error ?? "测试完成"}>{result.error ?? "测试完成"}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -2609,7 +2767,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={exportOpen} onOpenChange={(open) => !exporting && setExportOpen(open)}>
+      <Dialog open={exportOpen} onOpenChange={(open) => !exporting && !recoveryRunning && setExportOpen(open)}>
         <DialogContent className="max-w-2xl">
           <DialogHeader>
             <DialogTitle>汇总导出</DialogTitle>
@@ -2620,7 +2778,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               "flex items-start gap-3 rounded-md border px-3 py-3 text-sm font-bold",
               exportDeleteAndReimport ? "border-rose-200 bg-rose-50 text-rose-800" : "border-border bg-background",
             )}>
-              <Checkbox checked={exportDeleteAndReimport} onCheckedChange={(checked) => setExportDeleteAndReimport(checked === true)} />
+              <Checkbox disabled={recoveryRunning} checked={exportDeleteAndReimport} onCheckedChange={(checked) => setExportDeleteAndReimport(checked === true)} />
               <span>
                 <span className="block font-black">删除全部平台账号，并用本次汇总重新导入</span>
                 <span className="mt-1 block text-xs font-bold text-muted-foreground">
@@ -2634,7 +2792,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                 <div className="grid max-h-[300px] grid-cols-2 gap-2 overflow-auto">
                   {targets.map((target, index) => (
                     <label key={target.id} className="flex h-12 items-center gap-2.5 rounded-md border border-border bg-background px-3 text-sm font-bold">
-                      <Checkbox checked={exportSelectedTargetIds.has(target.id)} onCheckedChange={() => toggleExportTarget(target.id)} />
+                      <Checkbox disabled={recoveryRunning} checked={exportSelectedTargetIds.has(target.id)} onCheckedChange={() => toggleExportTarget(target.id)} />
                       <span className="flex h-6 w-6 items-center justify-center rounded bg-slate-100 text-[11px] font-black text-slate-600">{index + 1}</span>
                       <span className="truncate">{target.email}</span>
                     </label>
@@ -2646,6 +2804,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
           <div className="mt-5 flex items-center justify-between">
             {exportDeleteAndReimport ? (
               <button
+                disabled={recoveryRunning}
                 className="text-xs font-black text-blue-600 hover:text-blue-700"
                 onClick={() => setExportSelectedTargetIds((current) => current.size === targets.length ? new Set() : new Set(targets.map((target) => target.id)))}
               >
@@ -2653,10 +2812,10 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
               </button>
             ) : <span />}
             <div className="flex gap-2">
-              <Button variant="outline" disabled={exporting} onClick={() => setExportOpen(false)}>取消</Button>
+              <Button variant="outline" disabled={exporting || recoveryRunning} onClick={() => setExportOpen(false)}>取消</Button>
               <Button
                 variant={exportDeleteAndReimport ? "destructive" : "default"}
-                disabled={exporting || (exportDeleteAndReimport && !exportSelectedTargetIds.size)}
+                disabled={exporting || recoveryRunning || (exportDeleteAndReimport && !exportSelectedTargetIds.size)}
                 onClick={() => void runExportAction()}
               >
                 {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : exportDeleteAndReimport ? <Trash2 className="h-4 w-4" /> : <Download className="h-4 w-4" />}

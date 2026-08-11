@@ -1935,19 +1935,34 @@ class PixelManager:
                     request_error = exc.public_message
                     break
 
-            try:
-                after_accounts = await self._all_accounts_by_id(target)
-            except PixelManagerError as exc:
-                base_result.update({"created": created, "updated": updated, "failed": failed})
-                return {**base_result, "status": "failed", "message": exc.public_message}
-
             before_ids = set(before_accounts)
-            generated_names = set(bundle.generated_names)
-            imported_ids = sorted(
-                account_id
-                for account_id, name in after_accounts.items()
-                if account_id not in before_ids and name in generated_names
-            )
+            expected_names = set(bundle.generated_names)
+            after_accounts: dict[int, str] = {}
+            imported_ids: list[int] = []
+            discovery_error: PixelManagerError | None = None
+            for attempt in range(3):
+                try:
+                    after_accounts = await self._all_accounts_by_id(target)
+                    discovery_error = None
+                except PixelManagerError as exc:
+                    discovery_error = exc
+                    if attempt == 2:
+                        break
+                else:
+                    new_ids = set(after_accounts) - before_ids
+                    matching_ids = {
+                        account_id
+                        for account_id, name in after_accounts.items()
+                        if name in expected_names
+                    }
+                    imported_ids = sorted(new_ids | matching_ids)
+                    if imported_ids or created == 0:
+                        break
+                await asyncio.sleep(0.3)
+            if discovery_error is not None:
+                base_result.update({"created": created, "updated": updated, "failed": failed})
+                return {**base_result, "status": "failed", "message": discovery_error.public_message}
+
             generated_names = [after_accounts[account_id] for account_id in imported_ids]
             created = max(created, len(imported_ids))
             share_result = {"success": 0, "failed": 0, "failedIds": [], "concurrencyById": {}}

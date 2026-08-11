@@ -112,12 +112,9 @@ pub struct CommandEnvelope {
     latency_ms: Option<u64>,
 }
 
-fn manager_key() -> Result<&'static str, String> {
+fn manager_key() -> Option<&'static str> {
     let key = option_env!("PIXEL_MANAGER_API_KEY").unwrap_or("").trim();
-    if key.is_empty() {
-        return Err("账号池管理密钥未配置".to_string());
-    }
-    Ok(key)
+    (!key.is_empty()).then_some(key)
 }
 
 async fn server_json(
@@ -130,8 +127,10 @@ async fn server_json(
     let mut request = state
         .client
         .request(method, format!("{SERVER_BASE}{path}"))
-        .header("Accept", "application/json")
-        .header("X-91-Manager-Key", manager_key()?);
+        .header("Accept", "application/json");
+    if let Some(key) = manager_key() {
+        request = request.header("X-91-Manager-Key", key);
+    }
     if !query.is_empty() {
         request = request.query(query);
     }

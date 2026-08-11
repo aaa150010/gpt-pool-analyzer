@@ -669,6 +669,59 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "success")
         self.assertNotIn("fake-one", json.dumps(response))
 
+    async def test_import_retries_discovery_and_shares_new_id_when_platform_normalizes_name(self) -> None:
+        account_reads = 0
+        shared_ids: set[int] = set()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal account_reads
+            if request.url.path == "/api/v1/auth/login":
+                return login_response()
+            if request.url.path == "/api/v1/accounts" and request.method == "GET":
+                account_reads += 1
+                items = [{"id": 1, "name": "existing@example.com"}]
+                if account_reads >= 3:
+                    items.append(
+                        {
+                            "id": 2,
+                            "name": "platform-normalized@example.com",
+                            "share_mode": "public" if 2 in shared_ids else "private",
+                            "concurrency": 3,
+                        }
+                    )
+                return httpx.Response(
+                    200,
+                    json={"data": {"items": items, "page": 1, "page_size": 100, "pages": 1, "total": len(items)}},
+                )
+            if request.url.path == "/api/v1/accounts/import-credentials":
+                return httpx.Response(200, json={"data": {"total": 1, "created": 1, "updated": 0, "failed": 0}})
+            if request.url.path == "/api/v1/accounts/bulk-update":
+                body = json.loads(request.content)
+                return httpx.Response(200, json={"data": {"success_ids": body["account_ids"], "failed_ids": []}})
+            if request.url.path == "/api/v1/accounts/external-placement:convert-batch":
+                body = json.loads(request.content)
+                shared_ids.update(body["account_ids"])
+                return httpx.Response(200, json={"data": {"success_ids": body["account_ids"], "failed_ids": []}})
+            raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+        manager = manager_with_transport(handler)
+        bundle = parse_credential_bundle(
+            "source.json",
+            json.dumps([{"credentials": {"access_token": "fake-one"}}]).encode(),
+        )
+        with (
+            patch("server.pixel_manager.asyncio.sleep", new=AsyncMock()),
+            patch("server.pixel_manager.secrets.randbelow", return_value=0),
+        ):
+            response = await manager.import_bundle(bundle, ["pixel-1"])
+
+        result = response["results"][0]
+        self.assertGreaterEqual(account_reads, 3)
+        self.assertEqual(result["shared"], 1)
+        self.assertEqual(result["shareFailed"], 0)
+        self.assertEqual(result["generatedNames"], ["platform-normalized@example.com"])
+        self.assertEqual(result["status"], "success")
+
     async def test_share_retry_uses_external_placement_with_random_public_concurrency(self) -> None:
         captured_concurrency: dict = {}
         captured_placement: dict = {}
