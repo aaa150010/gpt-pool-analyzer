@@ -1,7 +1,7 @@
 {
   "name": "gpt-pool-analyzer",
   "private": true,
-  "version": "2.2.11",
+  "version": "2.2.12",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
