@@ -22,6 +22,7 @@ try:
         PixelConfigError,
         PixelExportJobs,
         PixelImportJobs,
+        PixelJobCoordinator,
         PixelManager,
         PixelManagerError,
         _safe_text,
@@ -39,6 +40,7 @@ except ImportError:
         PixelConfigError,
         PixelExportJobs,
         PixelImportJobs,
+        PixelJobCoordinator,
         PixelManager,
         PixelManagerError,
         _safe_text,
@@ -67,12 +69,14 @@ PIXEL_HTTP_PROXY = str(os.getenv("PIXEL_HTTP_PROXY", "")).strip()
 pixel_manager: PixelManager | None = None
 pixel_import_jobs: PixelImportJobs | None = None
 pixel_export_jobs: PixelExportJobs | None = None
+pixel_job_coordinator = PixelJobCoordinator()
 withdrawal_worker_task: asyncio.Task[Any] | None = None
 withdrawal_wake_event = asyncio.Event()
 
 
 def initialize_pixel_manager() -> None:
-    global pixel_manager, pixel_import_jobs, pixel_export_jobs
+    global pixel_manager, pixel_import_jobs, pixel_export_jobs, pixel_job_coordinator
+    pixel_job_coordinator = PixelJobCoordinator()
     try:
         config = load_pixel_manager_config(PIXEL_MANAGER_CONFIG_PATH)
     except PixelConfigError:
@@ -334,7 +338,10 @@ def save_pixel_import_record(record: dict[str, Any]) -> None:
                 source_file_name = excluded.source_file_name,
                 source_file_names = excluded.source_file_names,
                 source_count = excluded.source_count,
-                targets = excluded.targets
+                targets = excluded.targets,
+                delete_status = 'active',
+                deleted_at = NULL,
+                last_delete_results = '[]'
             """,
             (
                 str(record.get("recordId") or ""),
@@ -1100,6 +1107,7 @@ pixel_router = create_pixel_router(
     set_import_jobs=set_pixel_import_jobs,
     get_export_jobs=lambda: pixel_export_jobs,
     set_export_jobs=set_pixel_export_jobs,
+    get_job_coordinator=lambda: pixel_job_coordinator,
     get_data_dir=lambda: DATA_DIR,
     get_max_upload_bytes=lambda: MAX_UPLOAD_BYTES,
 )

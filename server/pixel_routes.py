@@ -12,6 +12,7 @@ try:
     from .pixel_manager import (
         PixelExportJobs,
         PixelImportJobs,
+        PixelJobCoordinator,
         PixelManagerError,
         PixelValidationError,
         merge_credential_bundles,
@@ -21,6 +22,7 @@ except ImportError:
     from pixel_manager import (
         PixelExportJobs,
         PixelImportJobs,
+        PixelJobCoordinator,
         PixelManagerError,
         PixelValidationError,
         merge_credential_bundles,
@@ -44,6 +46,7 @@ def create_pixel_router(
     set_import_jobs: Callable[[PixelImportJobs], None],
     get_export_jobs: Callable[[], PixelExportJobs | None],
     set_export_jobs: Callable[[PixelExportJobs], None],
+    get_job_coordinator: Callable[[], PixelJobCoordinator],
     get_data_dir: Callable[[], Path],
     get_max_upload_bytes: Callable[[], int],
 ) -> APIRouter:
@@ -215,23 +218,28 @@ def create_pixel_router(
         file_name: str | None = Query(default=None, alias="fileName"),
         manager: Any = Depends(require_manager),
     ) -> dict[str, Any]:
-        target_ids = _target_ids(target_ids_json)
-        max_upload_bytes = get_max_upload_bytes()
-        content_length = request.headers.get("content-length")
-        if content_length and content_length.isdigit() and int(content_length) > max_upload_bytes:
-            raise HTTPException(status_code=413, detail="JSON 文件不能超过 50 MB")
-        payload_buffer = bytearray()
-        async for chunk in request.stream():
-            if len(payload_buffer) + len(chunk) > max_upload_bytes:
-                raise HTTPException(status_code=413, detail="JSON 文件不能超过 50 MB")
-            payload_buffer.extend(chunk)
         try:
-            bundle = parse_credential_bundle(file_name or "accounts.json", bytes(payload_buffer))
-            jobs = get_import_jobs()
-            if jobs is None or jobs.manager is not manager:
-                jobs = PixelImportJobs(manager, record_callback=save_import_record)
-                set_import_jobs(jobs)
-            return {"job": await jobs.create(bundle, target_ids)}
+            async with get_job_coordinator().hold():
+                if _has_active_jobs(get_export_jobs(), manager):
+                    raise HTTPException(status_code=409, detail="汇总整理任务运行中，暂不能开始导入")
+                if _has_active_jobs(get_import_jobs(), manager):
+                    raise HTTPException(status_code=409, detail="已有导入任务正在运行，请等待完成")
+                target_ids = _target_ids(target_ids_json)
+                max_upload_bytes = get_max_upload_bytes()
+                content_length = request.headers.get("content-length")
+                if content_length and content_length.isdigit() and int(content_length) > max_upload_bytes:
+                    raise HTTPException(status_code=413, detail="JSON 文件不能超过 50 MB")
+                payload_buffer = bytearray()
+                async for chunk in request.stream():
+                    if len(payload_buffer) + len(chunk) > max_upload_bytes:
+                        raise HTTPException(status_code=413, detail="JSON 文件不能超过 50 MB")
+                    payload_buffer.extend(chunk)
+                bundle = parse_credential_bundle(file_name or "accounts.json", bytes(payload_buffer))
+                jobs = get_import_jobs()
+                if jobs is None or jobs.manager is not manager:
+                    jobs = PixelImportJobs(manager, record_callback=save_import_record)
+                    set_import_jobs(jobs)
+                return {"job": await jobs.create(bundle, target_ids)}
         except PixelManagerError as exc:
             raise pixel_http_error(exc) from exc
 
@@ -241,30 +249,35 @@ def create_pixel_router(
         target_ids_json: str = Query(alias="targetIds"),
         manager: Any = Depends(require_manager),
     ) -> dict[str, Any]:
-        target_ids = _target_ids(target_ids_json)
-        max_upload_bytes = get_max_upload_bytes()
         uploads: list[UploadFile] = []
         try:
-            form = await request.form()
-            uploads = [item for item in form.getlist("files") if isinstance(item, UploadFile)]
-            if not uploads:
-                raise PixelValidationError("至少选择一个 JSON 文件")
-            if len(uploads) > 100:
-                raise PixelValidationError("一次最多选择 100 个 JSON 文件")
-            total_bytes = 0
-            bundles = []
-            for upload in uploads:
-                content = await upload.read(max_upload_bytes + 1)
-                total_bytes += len(content)
-                if total_bytes > max_upload_bytes:
-                    raise PixelManagerError("批量 JSON 文件合计不能超过 50 MB", 413)
-                bundles.append(parse_credential_bundle(upload.filename or "accounts.json", content))
-            bundle = merge_credential_bundles(bundles)
-            jobs = get_import_jobs()
-            if jobs is None or jobs.manager is not manager:
-                jobs = PixelImportJobs(manager, record_callback=save_import_record)
-                set_import_jobs(jobs)
-            return {"job": await jobs.create(bundle, target_ids)}
+            async with get_job_coordinator().hold():
+                if _has_active_jobs(get_export_jobs(), manager):
+                    raise HTTPException(status_code=409, detail="汇总整理任务运行中，暂不能开始导入")
+                if _has_active_jobs(get_import_jobs(), manager):
+                    raise HTTPException(status_code=409, detail="已有导入任务正在运行，请等待完成")
+                target_ids = _target_ids(target_ids_json)
+                max_upload_bytes = get_max_upload_bytes()
+                form = await request.form()
+                uploads = [item for item in form.getlist("files") if isinstance(item, UploadFile)]
+                if not uploads:
+                    raise PixelValidationError("至少选择一个 JSON 文件")
+                if len(uploads) > 100:
+                    raise PixelValidationError("一次最多选择 100 个 JSON 文件")
+                total_bytes = 0
+                bundles = []
+                for upload in uploads:
+                    content = await upload.read(max_upload_bytes + 1)
+                    total_bytes += len(content)
+                    if total_bytes > max_upload_bytes:
+                        raise PixelManagerError("批量 JSON 文件合计不能超过 50 MB", 413)
+                    bundles.append(parse_credential_bundle(upload.filename or "accounts.json", content))
+                bundle = merge_credential_bundles(bundles)
+                jobs = get_import_jobs()
+                if jobs is None or jobs.manager is not manager:
+                    jobs = PixelImportJobs(manager, record_callback=save_import_record)
+                    set_import_jobs(jobs)
+                return {"job": await jobs.create(bundle, target_ids)}
         except PixelManagerError as exc:
             raise pixel_http_error(exc) from exc
         finally:
@@ -294,6 +307,22 @@ def create_pixel_router(
             raise HTTPException(status_code=404, detail="导入任务不存在")
         try:
             return {"job": await jobs.accelerate(job_id)}
+        except PixelManagerError as exc:
+            raise pixel_http_error(exc) from exc
+
+    @router.post("/pixel-manager/import-jobs/{job_id}/retry", status_code=202)
+    async def retry_import_job(
+        job_id: str,
+        manager: Any = Depends(require_manager),
+    ) -> dict[str, Any]:
+        try:
+            async with get_job_coordinator().hold():
+                if _has_active_jobs(get_export_jobs(), manager):
+                    raise HTTPException(status_code=409, detail="汇总整理任务运行中，暂不能重试导入")
+                jobs = get_import_jobs()
+                if jobs is None or jobs.manager is not manager:
+                    raise HTTPException(status_code=404, detail="导入任务不存在")
+                return {"job": await jobs.retry(job_id)}
         except PixelManagerError as exc:
             raise pixel_http_error(exc) from exc
 
@@ -348,14 +377,19 @@ def create_pixel_router(
         payload: dict[str, Any],
         manager: Any = Depends(require_manager),
     ) -> dict[str, Any]:
-        jobs = get_export_jobs()
-        if jobs is None or jobs.manager is not manager:
-            jobs = PixelExportJobs(manager, get_data_dir() / "pixel_exports")
-            set_export_jobs(jobs)
         if not payload.get("deleteAllAndReimport"):
             raise HTTPException(status_code=400, detail="汇总整理任务必须确认删除并重新导入")
         try:
-            return {"job": await jobs.create_rebuild(payload.get("targetIds") or [])}
+            async with get_job_coordinator().hold():
+                if _has_active_jobs(get_import_jobs(), manager):
+                    raise HTTPException(status_code=409, detail="导入任务运行中，暂不能开始汇总整理")
+                if _has_active_jobs(get_export_jobs(), manager):
+                    raise HTTPException(status_code=409, detail="已有汇总整理任务正在运行，请等待完成")
+                jobs = get_export_jobs()
+                if jobs is None or jobs.manager is not manager:
+                    jobs = PixelExportJobs(manager, get_data_dir() / "pixel_exports")
+                    set_export_jobs(jobs)
+                return {"job": await jobs.create_rebuild(payload.get("targetIds") or [])}
         except PixelManagerError as exc:
             raise pixel_http_error(exc) from exc
 
@@ -395,6 +429,13 @@ def create_pixel_router(
         )
 
     return router
+
+
+def _has_active_jobs(jobs: Any, manager: Any) -> bool:
+    if jobs is None or getattr(jobs, "manager", None) is not manager:
+        return False
+    checker = getattr(jobs, "has_active_job", None)
+    return bool(checker and checker())
 
 
 def _target_ids(value: str) -> list[str]:

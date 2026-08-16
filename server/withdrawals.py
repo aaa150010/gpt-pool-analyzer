@@ -26,6 +26,7 @@ WITHDRAWAL_ACCOUNTS = (
 ACCOUNT_BY_EMAIL = {item.email: item for item in WITHDRAWAL_ACCOUNTS}
 NOTIFICATION_RECIPIENTS = ("252715669@qq.com",)
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+WITHDRAWAL_FIRST_FEE = 0.10
 
 
 def _money(value: Any) -> float:
@@ -38,6 +39,43 @@ def _money(value: Any) -> float:
 
 def _integer_balance(value: Any) -> int:
     return max(int(math.floor(_money(value) + 1e-9)), 0)
+
+
+def _integer_capacity(value: Any, fee_amount: Any = 0) -> int:
+    balance = _money(value)
+    try:
+        fee = float(fee_amount or 0)
+    except (TypeError, ValueError):
+        fee = 0.0
+    if not math.isfinite(fee) or fee < 0:
+        fee = 0.0
+    return max(int(math.floor(max(balance - fee, 0) + 1e-9)), 0)
+
+
+def normalize_account_amounts(mode: str, account_amounts: Any | None) -> dict[str, int]:
+    if account_amounts in (None, {}):
+        return {}
+    if mode != "full":
+        raise ValueError("只有全部提现可以修改逐账号金额")
+    if not isinstance(account_amounts, dict):
+        raise ValueError("逐账号提现金额格式无效")
+
+    known = {account.email.lower() for account in WITHDRAWAL_ACCOUNTS}
+    normalized: dict[str, int] = {}
+    for raw_email, raw_amount in account_amounts.items():
+        email = str(raw_email or "").strip().lower()
+        if email not in known:
+            raise ValueError(f"提现账号不存在：{raw_email}")
+        if isinstance(raw_amount, bool):
+            raise ValueError(f"{email} 的提现金额必须为非负整数")
+        try:
+            number = float(raw_amount)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{email} 的提现金额必须为非负整数") from exc
+        if not math.isfinite(number) or not number.is_integer() or number < 0:
+            raise ValueError(f"{email} 的提现金额必须为非负整数")
+        normalized[email] = int(number)
+    return normalized
 
 
 def _display_time(value: Any) -> str:
@@ -56,7 +94,7 @@ def _allocate_cost(accounts: list[dict[str, Any]], target: int) -> list[int]:
     amounts = [0] * len(accounts)
     remaining = max(int(target), 0)
     for index, account in enumerate(accounts):
-        capacity = _integer_balance(account.get("balance"))
+        capacity = _integer_capacity(account.get("balance"), account.get("feeAmount"))
         amount = min((capacity // 5) * 5, (remaining // 5) * 5)
         amounts[index] = amount
         remaining -= amount
@@ -64,7 +102,7 @@ def _allocate_cost(accounts: list[dict[str, Any]], target: int) -> list[int]:
             break
     if remaining:
         for index, account in enumerate(accounts):
-            capacity = _integer_balance(account.get("balance"))
+            capacity = _integer_capacity(account.get("balance"), account.get("feeAmount"))
             available = capacity - amounts[index]
             amount = min(available, remaining)
             amounts[index] += amount
@@ -79,12 +117,21 @@ def plan_withdrawal(
     cost: float,
     balances: list[dict[str, Any]],
     requested_amount: float | None = None,
+    account_amounts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    overrides = normalize_account_amounts(mode, account_amounts)
     normalized: list[dict[str, Any]] = []
     by_email = {str(item.get("email") or item.get("name") or "").strip().lower(): item for item in balances}
     for account in WITHDRAWAL_ACCOUNTS:
         source = by_email.get(account.email.lower(), {})
-        normalized.append({"email": account.email, "balance": _money(source.get("balance", source.get("amount")))})
+        normalized.append(
+            {
+                "email": account.email,
+                "balance": _money(source.get("balance", source.get("amount"))),
+                "feeAmount": round(_money(source.get("feeAmount")), 2),
+                "eligibility": source.get("eligibility") if isinstance(source.get("eligibility"), dict) else {},
+            }
+        )
 
     total_cost = round(max(_money(cost), 0.0), 2)
     if mode == "cost":
@@ -102,13 +149,21 @@ def plan_withdrawal(
             target = int(requested_number)
         if target <= 0:
             raise ValueError("提现金额必须大于 0")
-        available = sum(_integer_balance(item["balance"]) for item in normalized)
+        available = sum(_integer_capacity(item["balance"], item.get("feeAmount")) for item in normalized)
         if target > available:
             raise ValueError(f"提现金额超过全部账号可提现整数余额（最多 {available} 元）")
         amounts = _allocate_cost(normalized, target)
         requested = float(target)
     elif mode == "full":
-        amounts = [_integer_balance(item["balance"]) for item in normalized]
+        amounts = []
+        for item in normalized:
+            email = str(item["email"]).lower()
+            capacity = _integer_capacity(item["balance"], item.get("feeAmount"))
+            amount = overrides.get(email, capacity)
+            if amount > capacity:
+                fee_note = "（首次提现需额外扣除 0.10 元）" if item.get("feeAmount") else ""
+                raise ValueError(f"{item['email']} 提现金额超过可提现整数余额（最多 {capacity} 元）{fee_note}")
+            amounts.append(amount)
         requested = float(sum(amounts))
     else:
         raise ValueError("提现模式无效")
@@ -116,6 +171,11 @@ def plan_withdrawal(
     items: list[dict[str, Any]] = []
     for sequence, (account, source, amount) in enumerate(zip(WITHDRAWAL_ACCOUNTS, normalized, amounts), start=1):
         status = "skipped" if amount <= 0 else "queued"
+        manually_skipped = account.email.lower() in overrides and amount == 0
+        error = None
+        if status == "skipped":
+            error = "已手动设为 0 元" if manually_skipped else "可提现整数金额不足 1 元"
+        fee_amount = round(float(source.get("feeAmount") or 0), 2) if amount > 0 else 0.0
         items.append(
             {
                 "sequence": sequence,
@@ -125,16 +185,19 @@ def plan_withdrawal(
                 "paymentMethod": account.payment_method,
                 "balance": round(source["balance"], 2),
                 "amount": amount,
+                "feeAmount": fee_amount,
+                "totalDeducted": round(amount + fee_amount, 2),
+                "eligibility": source.get("eligibility") or {},
                 "status": status,
                 "statusLabel": "已跳过" if status == "skipped" else "待执行",
-                "error": "余额不足 1 元" if amount <= 0 and mode == "full" else None,
+                "error": error,
             }
         )
     return {
         "mode": mode,
         "cost": total_cost,
         "requestedAmount": requested,
-        "totalAmount": float(sum(amounts)),
+        "totalAmount": float(sum(item["amount"] for item in items if item["status"] != "skipped")),
         "items": items,
         "balanceSnapshotAt": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
@@ -144,6 +207,8 @@ def settlement_for(plan: dict[str, Any]) -> dict[str, Any]:
     finalized = plan.get("status") in {"completed", "failed"}
 
     def effective_amount(item: dict[str, Any]) -> float:
+        if item.get("status") == "skipped":
+            return 0.0
         if finalized and item.get("status") != "submitted":
             return 0.0
         return float(item.get("amount") or 0)
@@ -195,13 +260,21 @@ def render_withdrawal_email(job: dict[str, Any], status: str = "已完成") -> t
         else (job.get("settlement") or settlement_for(job))
     )
     actual_amount = float(settlement.get("gross") or 0)
+    actual_deducted = round(
+        sum(
+            float(item.get("totalDeducted") or item.get("amount") or 0)
+            for item in job.get("items", [])
+            if item.get("status") == "submitted"
+        ),
+        2,
+    )
     post_cost = job.get("postWithdrawalCost")
     post_balance = job.get("postWithdrawalBalance")
     discounted_profit = job.get("discountedProfit")
     if post_cost is None:
         post_cost = float(settlement.get("cost") or 0)
     if post_balance is None and job.get("balanceSnapshotTotal") is not None:
-        post_balance = round(max(float(job.get("balanceSnapshotTotal") or 0) - actual_amount, 0), 2)
+        post_balance = round(max(float(job.get("balanceSnapshotTotal") or 0) - actual_deducted, 0), 2)
     if discounted_profit is None and post_balance is not None:
         discounted_profit = round(float(post_balance) - float(post_cost), 2)
 

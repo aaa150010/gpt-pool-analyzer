@@ -126,6 +126,38 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(records[0]["targets"][0]["generatedNames"], ["acct-one@example.com", "acct-two@example.com"])
         self.assertNotIn("should-not-be-stored", json.dumps(records))
 
+    def test_reused_import_record_resets_previous_delete_audit(self) -> None:
+        app.init_db()
+        record = {
+            "recordId": "import-retry",
+            "createdAt": "2026-08-16T08:00:00Z",
+            "sourceFileName": "accounts.json",
+            "sourceCount": 1,
+            "targets": [{"targetId": "pixel-1", "generatedNames": ["first@example.com"]}],
+        }
+        app.save_pixel_import_record(record)
+        deleted = app.update_pixel_import_record_delete(
+            "import-retry",
+            {"status": "success", "results": [{"targetId": "pixel-1", "deleted": 1}]},
+        )
+        self.assertEqual(deleted["deleteStatus"], "deleted")
+        self.assertIsNotNone(deleted["deletedAt"])
+        self.assertTrue(deleted["lastDeleteResults"])
+
+        app.save_pixel_import_record(
+            {
+                **record,
+                "targets": [{"targetId": "pixel-1", "generatedNames": ["retry@example.com"]}],
+            }
+        )
+
+        reused = app.pixel_import_record("import-retry")
+        self.assertIsNotNone(reused)
+        self.assertEqual(reused["deleteStatus"], "active")
+        self.assertIsNone(reused["deletedAt"])
+        self.assertEqual(reused["lastDeleteResults"], [])
+        self.assertEqual(reused["targets"][0]["generatedNames"], ["retry@example.com"])
+
     def test_raw_capacity_is_persisted_and_returned(self) -> None:
         app.init_db()
         app.insert_pool_snapshot(pool_snapshot("2026-07-28T08:00:00Z", 100))

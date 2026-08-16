@@ -21,10 +21,10 @@ import type {
   ServerStateResponse,
   Snapshot,
   StoredState,
+  WithdrawalDraft,
   WithdrawalHistoryResponse,
   WithdrawalJob,
   WithdrawalPlan,
-  WithdrawalMode,
 } from "./types";
 
 const API_BASE = import.meta.env.DEV ? "/gpt-api" : "https://lynote.xyz/gpt-api";
@@ -204,22 +204,24 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ credentials }),
     }),
-  withdrawalPreview: (mode: WithdrawalMode, amount?: number) => {
-    const params = new URLSearchParams({ mode });
-    if (amount !== undefined) params.set("amount", String(amount));
-    return requestPixelJson<WithdrawalPlan>(`/withdrawals/preview?${params.toString()}`);
-  },
+  withdrawalPreview: (draft: WithdrawalDraft) =>
+    requestPixelJson<WithdrawalPlan>("/withdrawals/preview", {
+      method: "POST",
+      body: JSON.stringify(draft),
+    }),
   withdrawals: () => requestPixelJson<{ job: WithdrawalJob | null }>("/withdrawals"),
   withdrawalHistory: (limit = 20, offset = 0) =>
     requestPixelJson<WithdrawalHistoryResponse>(`/withdrawals/history?limit=${limit}&offset=${offset}`),
-  createWithdrawal: (mode: WithdrawalMode, amount?: number) =>
+  createWithdrawal: (draft: WithdrawalDraft) =>
     requestPixelJson<{ job: WithdrawalJob }>("/withdrawals", {
       method: "POST",
-      body: JSON.stringify({ mode, ...(amount === undefined ? {} : { amount }) }),
+      body: JSON.stringify(draft),
     }),
   withdrawal: (jobId: string) => requestPixelJson<{ job: WithdrawalJob }>(`/withdrawals/${encodeURIComponent(jobId)}`),
   accelerateWithdrawal: (jobId: string) =>
     requestPixelJson<{ job: WithdrawalJob }>(`/withdrawals/${encodeURIComponent(jobId)}/accelerate`, { method: "POST" }),
+  retryWithdrawal: (jobId: string) =>
+    requestPixelJson<{ job: WithdrawalJob }>(`/withdrawals/${encodeURIComponent(jobId)}/retry`, { method: "POST" }),
   pixelTargets: () => isTauriRuntime
     ? requestLocalPixel<{ targets: PixelTarget[] }>("targets")
     : requestPixelJson<{ targets: PixelTarget[] }>("/pixel-manager/targets"),
@@ -274,6 +276,8 @@ export const api = {
   pixelImportJob: (jobId: string) => requestPixelJson<{ job: PixelImportJob }>(`/pixel-manager/import-jobs/${encodeURIComponent(jobId)}`),
   acceleratePixelImport: (jobId: string) =>
     requestPixelJson<{ job: PixelImportJob }>(`/pixel-manager/import-jobs/${encodeURIComponent(jobId)}/accelerate`, { method: "POST" }),
+  retryPixelImport: (jobId: string) =>
+    requestPixelJson<{ job: PixelImportJob }>(`/pixel-manager/import-jobs/${encodeURIComponent(jobId)}/retry`, { method: "POST" }),
   pixelImportRecords: () => requestPixelJson<{ records: PixelImportRecord[] }>("/pixel-manager/import-records"),
   pixelRetryImportShare: (recordId: string, targetId: string, accountIds: number[]) =>
     requestPixelJson<{ record: PixelImportRecord; result: PixelShareResponse }>(

@@ -17,6 +17,7 @@ from server.pixel_manager import (
     PixelManagerConfig,
     PixelExportJobs,
     PixelImportJobs,
+    PixelJobCoordinator,
     PixelTarget,
     PixelManagerError,
     PixelValidationError,
@@ -356,6 +357,163 @@ class PixelConfigAndTransformTests(unittest.TestCase):
 
 
 class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_withdrawal_endpoints_return_unwrapped_data(self) -> None:
+        requests: list[tuple[str, str, dict[str, str], dict | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v1/auth/login":
+                return login_response()
+            body = json.loads(request.content) if request.content else None
+            requests.append((request.method, request.url.path, dict(request.url.params), body))
+            if request.url.path == "/api/v1/settings/public":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "withdrawal_rate_limit_window_days": 7,
+                            "withdrawal_rate_limit_max": 3,
+                            "withdrawal_rate_limit_exempt_amount": 499.99,
+                        },
+                    },
+                )
+            if request.url.path == "/api/v1/user/profile":
+                return httpx.Response(200, json={"code": 0, "data": {"balance": 123.45}})
+            if request.url.path == "/api/v1/user/withdrawals" and request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "items": [{"id": 9, "status": "SETTLED", "amount": 12}],
+                            "total": 1,
+                            "page": 2,
+                            "page_size": 1000,
+                            "pages": 2,
+                        },
+                    },
+                )
+            if request.url.path == "/api/v1/user/withdrawals" and request.method == "POST":
+                return httpx.Response(
+                    201,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "id": 10,
+                            "amount": 12.34,
+                            "fee_amount": 0.1,
+                            "total_deducted": 12.44,
+                            "status": "PENDING",
+                        },
+                    },
+                )
+            raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+        manager = manager_with_transport(handler)
+
+        settings = await manager.withdrawal_settings("pixel-1")
+        profile = await manager.withdrawal_profile("pixel-1")
+        history = await manager.withdrawal_history("pixel-1", page=2, page_size=5000)
+        submitted = await manager.submit_withdrawal("pixel-1", 12.34, "alipay")
+
+        self.assertEqual(settings["withdrawal_rate_limit_max"], 3)
+        self.assertEqual(profile, {"balance": 123.45})
+        self.assertEqual(history["items"][0]["id"], 9)
+        self.assertEqual(submitted["id"], 10)
+        self.assertEqual(requests[2][2], {"page": "2", "page_size": "1000"})
+        self.assertEqual(requests[3][3], {"amount": 12.34, "payment_method": "alipay"})
+
+    async def test_pixel_error_preserves_upstream_envelope(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v1/auth/login":
+                return login_response()
+            if request.url.path == "/api/v1/user/withdrawals":
+                return httpx.Response(
+                    429,
+                    json={
+                        "code": 429,
+                        "message": "withdrawal request rate limit exceeded",
+                        "reason": "WITHDRAWAL_RATE_LIMIT_EXCEEDED",
+                        "metadata": {"window_days": "7", "max": "3"},
+                    },
+                )
+            raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+        manager = manager_with_transport(handler)
+
+        with self.assertRaises(PixelManagerError) as raised:
+            await manager.withdrawal_history("pixel-1")
+
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertEqual(raised.exception.reason, "WITHDRAWAL_RATE_LIMIT_EXCEEDED")
+        self.assertEqual(raised.exception.metadata, {"window_days": "7", "max": "3"})
+        self.assertFalse(raised.exception.outcome_unknown)
+        self.assertEqual(
+            raised.exception.public_message,
+            "withdrawal request rate limit exceeded",
+        )
+
+    async def test_withdrawal_server_error_marks_submit_outcome_unknown(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v1/auth/login":
+                return login_response()
+            if request.url.path == "/api/v1/user/withdrawals":
+                return httpx.Response(
+                    500,
+                    json={
+                        "code": 500,
+                        "message": "internal error",
+                        "reason": "INTERNAL_ERROR",
+                    },
+                )
+            raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+        manager = manager_with_transport(handler)
+
+        with self.assertRaises(PixelManagerError) as raised:
+            await manager.submit_withdrawal("pixel-1", 12, "alipay")
+
+        self.assertEqual(raised.exception.status_code, 500)
+        self.assertEqual(raised.exception.reason, "INTERNAL_ERROR")
+        self.assertTrue(raised.exception.outcome_unknown)
+
+    async def test_withdrawal_network_error_does_not_repeat_post_via_fallback(self) -> None:
+        primary_posts = 0
+        fallback_posts = 0
+
+        def primary_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal primary_posts
+            if request.url.path == "/api/v1/auth/login":
+                return login_response()
+            primary_posts += 1
+            raise httpx.ReadTimeout("response timed out", request=request)
+
+        def fallback_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal fallback_posts
+            if request.url.path == "/api/v1/auth/login":
+                return login_response()
+            fallback_posts += 1
+            return httpx.Response(201, json={"data": {"id": 99}})
+
+        primary_transport = httpx.MockTransport(primary_handler)
+        fallback_transport = httpx.MockTransport(fallback_handler)
+        manager = PixelManager(
+            PixelManagerConfig(
+                manager_key=MANAGER_KEY,
+                targets={"pixel-1": target()},
+            ),
+            client_factory=lambda: httpx.AsyncClient(transport=primary_transport),
+            fallback_client_factory=lambda: httpx.AsyncClient(transport=fallback_transport),
+            inter_target_delay_seconds=0,
+        )
+
+        with self.assertRaises(PixelManagerError) as raised:
+            await manager.submit_withdrawal("pixel-1", 12, "alipay")
+
+        self.assertTrue(raised.exception.outcome_unknown)
+        self.assertEqual(primary_posts, 1)
+        self.assertEqual(fallback_posts, 0)
+
     async def test_accounts_are_paginated_sanitized_and_use_cached_token(self) -> None:
         calls = {"login": 0, "accounts": 0}
 
@@ -1348,7 +1506,7 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
             inter_target_delay_seconds=0,
         )
 
-        async def fake_import(_bundle, target_ids, progress_callback=None):
+        async def fake_import(_bundle, target_ids, progress_callback=None, **_kwargs):
             if progress_callback:
                 await progress_callback({"phase": "processing", "currentTargetId": target_ids[0], "completedTargets": 0, "totalTargets": 1, "results": []})
             return {"ok": True, "sourceFileName": "source.json", "sourceCount": 1, "results": []}
@@ -1428,7 +1586,7 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         release = asyncio.Event()
 
-        async def fake_import(_bundle, target_ids, progress_callback=None):
+        async def fake_import(_bundle, target_ids, progress_callback=None, **_kwargs):
             if progress_callback:
                 await progress_callback(
                     {
@@ -1457,9 +1615,322 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(jobs.get(created["jobId"])["phase"], "processing")
             with self.assertRaisesRegex(PixelManagerError, "没有可加速"):
                 await jobs.accelerate(created["jobId"])
+            with self.assertRaises(PixelManagerError) as active_retry:
+                await jobs.retry(created["jobId"])
+            self.assertEqual(active_retry.exception.status_code, 409)
+            with self.assertRaises(PixelManagerError) as missing_retry:
+                await jobs.retry("missing-job")
+            self.assertEqual(missing_retry.exception.status_code, 404)
         finally:
             release.set()
             await jobs._tasks[created["jobId"]]
+
+    async def test_import_retry_reuses_prepared_names_and_skips_success_targets(self) -> None:
+        manager = PixelManager(
+            PixelManagerConfig(
+                manager_key=MANAGER_KEY,
+                targets={"one": target("one"), "two": target("two")},
+            ),
+            inter_target_delay_seconds=0,
+        )
+        calls: dict[str, list[tuple[int, tuple[str, ...]]]] = {"one": [], "two": []}
+
+        async def fake_import(item: PixelTarget, prepared) -> dict:
+            calls[item.id].append((id(prepared), prepared.generated_names))
+            attempt = len(calls[item.id])
+            status = "partial" if item.id == "two" and attempt == 1 else "success"
+            return {
+                "targetId": item.id,
+                "email": item.email,
+                "generatedFileName": prepared.generated_file_name,
+                "sourceCount": prepared.source_count,
+                "created": 1,
+                "updated": 0,
+                "failed": 0,
+                "shared": 0 if status == "partial" else 1,
+                "shareFailed": 1 if status == "partial" else 0,
+                "failedShareIds": [99] if status == "partial" else [],
+                "generatedNames": list(prepared.generated_names),
+                "status": status,
+                "message": status,
+            }
+
+        manager._import_target = fake_import
+        jobs = PixelImportJobs(manager)
+        bundle = parse_credential_bundle(
+            "source.json",
+            json.dumps([{"credentials": {"email": "a@example.com", "access_token": "source-secret"}}]).encode(),
+        )
+
+        created = await jobs.create(bundle, ["one", "two"])
+        self.assertEqual(created["retryableTargetIds"], ["one", "two"])
+        await jobs._tasks[created["jobId"]]
+        first = jobs.get(created["jobId"])
+        self.assertEqual([item["status"] for item in first["results"]], ["success", "partial"])
+        self.assertEqual(first["retryableTargetIds"], ["two"])
+        self.assertEqual(set(jobs._jobs[created["jobId"]]["_targetBundles"]), {"two"})
+        self.assertEqual(
+            jobs._jobs[created["jobId"]]["_sourceBundle"].source_payload,
+            {"accounts": []},
+        )
+
+        retried = await jobs.retry(created["jobId"])
+        self.assertEqual(retried["retryCount"], 1)
+        self.assertEqual(retried["retryableTargetIds"], ["two"])
+        await jobs._tasks[created["jobId"]]
+        finished = jobs.get(created["jobId"])
+
+        self.assertEqual([item["status"] for item in finished["results"]], ["success", "success"])
+        self.assertEqual(finished["retryableTargetIds"], [])
+        self.assertEqual(len(calls["one"]), 1)
+        self.assertEqual(len(calls["two"]), 2)
+        self.assertEqual(calls["two"][0], calls["two"][1])
+        self.assertNotIn("source-secret", json.dumps(finished))
+        self.assertNotIn("_sourceBundle", jobs._jobs[created["jobId"]])
+        self.assertNotIn("_targetBundles", jobs._jobs[created["jobId"]])
+        with self.assertRaisesRegex(PixelManagerError, "没有可重试"):
+            await jobs.retry(created["jobId"])
+
+    async def test_import_retry_payloads_evict_old_jobs_but_keep_latest_targeted_retry(self) -> None:
+        manager = PixelManager(
+            PixelManagerConfig(manager_key=MANAGER_KEY, targets={"one": target("one")}),
+            inter_target_delay_seconds=0,
+        )
+        succeed = False
+        prepared_calls: list[dict[str, object]] = []
+
+        async def fake_import(_bundle, target_ids, _progress_callback=None, *, prepared_bundles=None):
+            prepared_calls.append(dict(prepared_bundles or {}))
+            return {
+                "ok": True,
+                "sourceFileName": "source.json",
+                "sourceCount": 1,
+                "results": [
+                    {
+                        "targetId": target_id,
+                        "email": f"{target_id}@example.com",
+                        "generatedNames": list(prepared_bundles[target_id].generated_names),
+                        "status": "success" if succeed else "partial",
+                        "message": "ok" if succeed else "share failed",
+                    }
+                    for target_id in target_ids
+                ],
+            }
+
+        manager.import_bundle = AsyncMock(side_effect=fake_import)
+        jobs = PixelImportJobs(
+            manager,
+            max_retry_jobs=2,
+            max_retry_payload_bytes=1024 * 1024,
+        )
+        bundle = parse_credential_bundle(
+            "source.json",
+            json.dumps([{"credentials": {"email": "a@example.com", "access_token": "secret"}}]).encode(),
+        )
+        created_ids: list[str] = []
+        for _ in range(3):
+            created = await jobs.create(bundle, ["one"])
+            created_ids.append(created["jobId"])
+            await jobs._tasks[created["jobId"]]
+
+        self.assertEqual(jobs.get(created_ids[0])["retryableTargetIds"], [])
+        self.assertNotIn("_targetBundles", jobs._jobs[created_ids[0]])
+        self.assertEqual(jobs.get(created_ids[1])["retryableTargetIds"], ["one"])
+        self.assertEqual(jobs.get(created_ids[2])["retryableTargetIds"], ["one"])
+
+        latest_prepared = jobs._jobs[created_ids[2]]["_targetBundles"]["one"]
+        succeed = True
+        await jobs.retry(created_ids[2])
+        await jobs._tasks[created_ids[2]]
+        self.assertIs(prepared_calls[-1]["one"], latest_prepared)
+        self.assertEqual(jobs.get(created_ids[2])["results"][0]["status"], "success")
+        self.assertEqual(jobs.get(created_ids[2])["retryableTargetIds"], [])
+
+    async def test_import_retry_payload_byte_budget_keeps_only_latest_failed_job(self) -> None:
+        manager = PixelManager(
+            PixelManagerConfig(manager_key=MANAGER_KEY, targets={"one": target("one")}),
+            inter_target_delay_seconds=0,
+        )
+
+        async def fake_import(_bundle, target_ids, _progress_callback=None, *, prepared_bundles=None):
+            return {
+                "ok": True,
+                "sourceFileName": "source.json",
+                "sourceCount": 1,
+                "results": [
+                    {
+                        "targetId": target_id,
+                        "generatedNames": list(prepared_bundles[target_id].generated_names),
+                        "status": "partial",
+                        "message": "share failed",
+                    }
+                    for target_id in target_ids
+                ],
+            }
+
+        manager.import_bundle = AsyncMock(side_effect=fake_import)
+        jobs = PixelImportJobs(
+            manager,
+            max_retry_jobs=3,
+            max_retry_payload_bytes=1,
+        )
+        bundle = parse_credential_bundle(
+            "source.json",
+            json.dumps([{"credentials": {"email": "a@example.com", "access_token": "secret"}}]).encode(),
+        )
+
+        first = await jobs.create(bundle, ["one"])
+        await jobs._tasks[first["jobId"]]
+        second = await jobs.create(bundle, ["one"])
+        await jobs._tasks[second["jobId"]]
+
+        self.assertEqual(jobs.get(first["jobId"])["retryableTargetIds"], [])
+        self.assertNotIn("_sourceBundle", jobs._jobs[first["jobId"]])
+        self.assertNotIn("_targetBundles", jobs._jobs[first["jobId"]])
+        self.assertEqual(jobs.get(second["jobId"])["retryableTargetIds"], ["one"])
+        self.assertIn("_sourceBundle", jobs._jobs[second["jobId"]])
+        self.assertIn("_targetBundles", jobs._jobs[second["jobId"]])
+
+    async def test_import_retry_recovers_platform_normalized_name_without_reposting(self) -> None:
+        manager = PixelManager(
+            PixelManagerConfig(manager_key=MANAGER_KEY, targets={"one": target("one")}),
+            inter_target_delay_seconds=0,
+        )
+        manager._all_accounts_by_id = AsyncMock(
+            side_effect=[
+                {1: "existing@example.com"},
+                {1: "existing@example.com", 2: "platform-normalized@example.com"},
+                {1: "existing@example.com", 2: "platform-normalized@example.com"},
+                {1: "existing@example.com", 2: "platform-normalized@example.com"},
+            ]
+        )
+        manager._request = AsyncMock(
+            return_value={"data": {"created": 1, "updated": 0, "failed": 0}}
+        )
+        manager._share_accounts_unlocked = AsyncMock(
+            side_effect=[
+                {
+                    "success": 0,
+                    "failed": 1,
+                    "successIds": [],
+                    "failedIds": [2],
+                    "concurrencyById": {},
+                },
+                {
+                    "success": 1,
+                    "failed": 0,
+                    "successIds": [2],
+                    "failedIds": [],
+                    "concurrencyById": {"2": 3},
+                },
+            ]
+        )
+        jobs = PixelImportJobs(manager)
+        bundle = parse_credential_bundle(
+            "source.json",
+            json.dumps([{"credentials": {"email": "a@example.com"}}]).encode(),
+        )
+
+        created = await jobs.create(bundle, ["one"])
+        await jobs._tasks[created["jobId"]]
+        first = jobs.get(created["jobId"])
+        self.assertEqual(first["results"][0]["status"], "partial")
+        self.assertEqual(
+            first["results"][0]["generatedNames"],
+            ["platform-normalized@example.com"],
+        )
+
+        await jobs.retry(created["jobId"])
+        await jobs._tasks[created["jobId"]]
+        finished = jobs.get(created["jobId"])
+
+        self.assertEqual(finished["results"][0]["status"], "success")
+        self.assertEqual(
+            finished["results"][0]["generatedNames"],
+            ["platform-normalized@example.com"],
+        )
+        self.assertEqual(manager._request.await_count, 1)
+        self.assertEqual(manager._share_accounts_unlocked.await_count, 2)
+
+    async def test_transient_import_retries_are_finite_and_reuse_bundle(self) -> None:
+        delays: list[float] = []
+
+        async def sleeper(seconds: float) -> None:
+            delays.append(seconds)
+
+        manager = PixelManager(
+            PixelManagerConfig(manager_key=MANAGER_KEY, targets={"one": target("one")}),
+            inter_target_delay_seconds=0,
+            sleeper=sleeper,
+        )
+        calls: list[tuple[int, tuple[str, ...]]] = []
+
+        async def fake_import(item: PixelTarget, prepared) -> dict:
+            calls.append((id(prepared), prepared.generated_names))
+            return {
+                "targetId": item.id,
+                "status": "failed",
+                "message": "temporary",
+                "_retryable": True,
+            }
+
+        manager._import_target = fake_import
+        bundle = parse_credential_bundle(
+            "source.json",
+            json.dumps([{"credentials": {"email": "a@example.com"}}]).encode(),
+        )
+
+        result = await manager.import_bundle(bundle, ["one"])
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(set(calls)), 1)
+        self.assertEqual(delays, [1, 2])
+        self.assertEqual(result["results"][0]["status"], "failed")
+        self.assertNotIn("_retryable", result["results"][0])
+
+    async def test_transient_import_retry_keeps_platform_normalized_name(self) -> None:
+        delays: list[float] = []
+
+        async def sleeper(seconds: float) -> None:
+            delays.append(seconds)
+
+        manager = PixelManager(
+            PixelManagerConfig(manager_key=MANAGER_KEY, targets={"one": target("one")}),
+            inter_target_delay_seconds=0,
+            sleeper=sleeper,
+        )
+        prepared_names: list[tuple[str, ...]] = []
+
+        async def fake_import(item: PixelTarget, prepared) -> dict:
+            prepared_names.append(prepared.generated_names)
+            if len(prepared_names) == 1:
+                return {
+                    "targetId": item.id,
+                    "status": "partial",
+                    "message": "temporary share failure",
+                    "generatedNames": ["platform-normalized@example.com"],
+                    "_retryable": True,
+                }
+            return {
+                "targetId": item.id,
+                "status": "success",
+                "message": "ok",
+                "generatedNames": ["platform-normalized@example.com"],
+            }
+
+        manager._import_target = fake_import
+        bundle = parse_credential_bundle(
+            "source.json",
+            json.dumps([{"credentials": {"email": "a@example.com"}}]).encode(),
+        )
+
+        result = await manager.import_bundle(bundle, ["one"])
+
+        self.assertEqual(result["results"][0]["status"], "success")
+        self.assertEqual(len(prepared_names), 2)
+        self.assertNotIn("platform-normalized@example.com", prepared_names[0])
+        self.assertIn("platform-normalized@example.com", prepared_names[1])
+        self.assertEqual(delays, [1])
 
     async def test_export_rebuild_stops_before_delete_when_export_fails(self) -> None:
         manager = PixelManager(
@@ -1528,13 +1999,13 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         manager.delete_all_target_accounts.assert_awaited_once()
         manager.import_bundle.assert_awaited_once()
 
-    async def test_background_jobs_retain_only_the_latest_fifty(self) -> None:
+    async def test_background_jobs_retain_only_the_latest_twenty(self) -> None:
         manager = PixelManager(
             PixelManagerConfig(manager_key=MANAGER_KEY, targets={"one": target("one")}),
             inter_target_delay_seconds=0,
         )
 
-        async def fake_import(_bundle, _target_ids, _progress_callback=None):
+        async def fake_import(_bundle, _target_ids, _progress_callback=None, **_kwargs):
             return {
                 "ok": True,
                 "sourceFileName": "source.json",
@@ -1549,31 +2020,149 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
             json.dumps([{"credentials": {"email": "a@example.com"}}]).encode(),
         )
         created_ids: list[str] = []
-        for _ in range(52):
+        for _ in range(22):
             created = await jobs.create(bundle, ["one"])
             created_ids.append(created["jobId"])
             await jobs._tasks[created["jobId"]]
 
-        self.assertEqual(len(jobs._jobs), 50)
-        self.assertEqual(len(jobs._tasks), 50)
+        self.assertEqual(len(jobs._jobs), 20)
+        self.assertEqual(len(jobs._tasks), 20)
         self.assertNotIn(created_ids[0], jobs._jobs)
         self.assertNotIn(created_ids[1], jobs._jobs)
         self.assertIn(created_ids[-1], jobs._jobs)
+
+
+class PixelManagerCoordinatorEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.previous_manager = server_app.pixel_manager
+        self.previous_jobs = server_app.pixel_import_jobs
+        self.previous_export_jobs = server_app.pixel_export_jobs
+        self.previous_job_coordinator = server_app.pixel_job_coordinator
+        self.manager = manager_with_transport(lambda _request: login_response())
+        server_app.pixel_manager = self.manager
+        server_app.pixel_import_jobs = None
+        server_app.pixel_export_jobs = None
+
+    async def asyncTearDown(self) -> None:
+        server_app.pixel_manager = self.previous_manager
+        server_app.pixel_import_jobs = self.previous_jobs
+        server_app.pixel_export_jobs = self.previous_export_jobs
+        server_app.pixel_job_coordinator = self.previous_job_coordinator
+
+    async def test_slow_import_upload_registers_before_rebuild_checks_conflicts(self) -> None:
+        class ObservedCoordinator(PixelJobCoordinator):
+            def __init__(self) -> None:
+                super().__init__()
+                self.enter_attempts = 0
+                self.second_waiter = asyncio.Event()
+
+            def hold(self):
+                lock = super().hold()
+                coordinator = self
+
+                class ObservedLock:
+                    async def __aenter__(self):
+                        coordinator.enter_attempts += 1
+                        if coordinator.enter_attempts == 2:
+                            coordinator.second_waiter.set()
+                        await lock.acquire()
+
+                    async def __aexit__(self, _exc_type, _exc, _traceback):
+                        lock.release()
+
+                return ObservedLock()
+
+        class SlowUpload(httpx.AsyncByteStream):
+            def __init__(self) -> None:
+                self.read_started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def __aiter__(self):
+                self.read_started.set()
+                await self.release.wait()
+                yield b'{"accounts":[{"credentials":{"access_token":"secret"}}]}'
+
+        coordinator = ObservedCoordinator()
+        server_app.pixel_job_coordinator = coordinator
+        import_active = False
+        created_job = {
+            "jobId": "import-job",
+            "status": "queued",
+            "phase": "queued",
+            "results": [],
+        }
+
+        async def register_import(_bundle, _target_ids):
+            nonlocal import_active
+            import_active = True
+            return created_job
+
+        import_jobs = SimpleNamespace(
+            manager=self.manager,
+            has_active_job=Mock(side_effect=lambda: import_active),
+            create=AsyncMock(side_effect=register_import),
+        )
+        export_jobs = SimpleNamespace(
+            manager=self.manager,
+            has_active_job=Mock(return_value=False),
+            create_rebuild=AsyncMock(return_value={"jobId": "export-job"}),
+        )
+        server_app.pixel_import_jobs = import_jobs
+        server_app.pixel_export_jobs = export_jobs
+        upload = SlowUpload()
+        transport = httpx.ASGITransport(app=server_app.app)
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            import_request = asyncio.create_task(
+                client.post(
+                    "/gpt-api/pixel-manager/import",
+                    headers={"X-91-Manager-Key": MANAGER_KEY},
+                    params={"targetIds": '["pixel-1"]', "fileName": "accounts.json"},
+                    content=upload,
+                )
+            )
+            await asyncio.wait_for(upload.read_started.wait(), timeout=1)
+
+            export_request = asyncio.create_task(
+                client.post(
+                    "/gpt-api/pixel-manager/export-jobs",
+                    headers={"X-91-Manager-Key": MANAGER_KEY},
+                    json={"deleteAllAndReimport": True, "targetIds": ["pixel-1"]},
+                )
+            )
+            await asyncio.wait_for(coordinator.second_waiter.wait(), timeout=1)
+            self.assertFalse(export_request.done())
+
+            upload.release.set()
+            imported, blocked_export = await asyncio.gather(import_request, export_request)
+
+        self.assertEqual(imported.status_code, 202)
+        self.assertEqual(imported.json()["job"]["jobId"], "import-job")
+        self.assertEqual(blocked_export.status_code, 409)
+        self.assertIn("导入任务运行中", blocked_export.json()["detail"])
+        import_jobs.create.assert_awaited_once()
+        export_jobs.create_rebuild.assert_not_awaited()
 
 
 class PixelManagerEndpointTests(unittest.TestCase):
     def setUp(self) -> None:
         self.previous_manager = server_app.pixel_manager
         self.previous_jobs = server_app.pixel_import_jobs
+        self.previous_export_jobs = server_app.pixel_export_jobs
+        self.previous_job_coordinator = server_app.pixel_job_coordinator
         self.manager = manager_with_transport(self._upstream_handler)
         server_app.pixel_manager = self.manager
         server_app.pixel_import_jobs = None
+        server_app.pixel_export_jobs = None
+        server_app.pixel_job_coordinator = PixelJobCoordinator()
         self.client = TestClient(server_app.app)
 
     def tearDown(self) -> None:
         self.client.close()
         server_app.pixel_manager = self.previous_manager
         server_app.pixel_import_jobs = self.previous_jobs
+        server_app.pixel_export_jobs = self.previous_export_jobs
+        server_app.pixel_job_coordinator = self.previous_job_coordinator
 
     @staticmethod
     def _upstream_handler(request: httpx.Request) -> httpx.Response:
@@ -1910,6 +2499,7 @@ class PixelManagerEndpointTests(unittest.TestCase):
             create=AsyncMock(return_value=created_job),
             get=Mock(return_value=completed_job),
             accelerate=AsyncMock(return_value={**created_job, "status": "running", "phase": "waiting", "waitSeconds": 0}),
+            retry=AsyncMock(return_value={**created_job, "status": "queued", "phase": "queued", "retryCount": 1}),
         )
         server_app.pixel_import_jobs = jobs
 
@@ -1941,6 +2531,66 @@ class PixelManagerEndpointTests(unittest.TestCase):
         self.assertEqual(accelerated.status_code, 200)
         self.assertEqual(accelerated.json()["job"]["phase"], "waiting")
         jobs.accelerate.assert_awaited_once_with("job-123")
+
+        retried = self.client.post(
+            "/gpt-api/pixel-manager/import-jobs/job-123/retry",
+            headers=self._headers(),
+        )
+        self.assertEqual(retried.status_code, 202)
+        self.assertEqual(retried.json()["job"]["retryCount"], 1)
+        jobs.retry.assert_awaited_once_with("job-123")
+
+    def test_import_and_export_rebuild_jobs_are_mutually_exclusive(self) -> None:
+        active_export_jobs = SimpleNamespace(
+            manager=self.manager,
+            has_active_job=Mock(return_value=True),
+        )
+        server_app.pixel_export_jobs = active_export_jobs
+
+        blocked_import = self.client.post(
+            "/gpt-api/pixel-manager/import",
+            headers=self._headers(),
+            params={"targetIds": '["pixel-1"]', "fileName": "accounts.json"},
+            content=b'{"accounts":[{"credentials":{"access_token":"secret"}}]}',
+        )
+        self.assertEqual(blocked_import.status_code, 409)
+        self.assertIn("汇总整理任务运行中", blocked_import.json()["detail"])
+
+        blocked_batch_import = self.client.post(
+            "/gpt-api/pixel-manager/import-batch",
+            headers=self._headers(),
+            params={"targetIds": '["pixel-1"]'},
+        )
+        self.assertEqual(blocked_batch_import.status_code, 409)
+        self.assertIn("汇总整理任务运行中", blocked_batch_import.json()["detail"])
+
+        retry_jobs = SimpleNamespace(
+            manager=self.manager,
+            has_active_job=Mock(return_value=False),
+            retry=AsyncMock(return_value={"jobId": "import-job"}),
+        )
+        server_app.pixel_import_jobs = retry_jobs
+        blocked_retry = self.client.post(
+            "/gpt-api/pixel-manager/import-jobs/import-job/retry",
+            headers=self._headers(),
+        )
+        self.assertEqual(blocked_retry.status_code, 409)
+        self.assertIn("汇总整理任务运行中", blocked_retry.json()["detail"])
+        retry_jobs.retry.assert_not_awaited()
+
+        server_app.pixel_export_jobs = None
+        active_import_jobs = SimpleNamespace(
+            manager=self.manager,
+            has_active_job=Mock(return_value=True),
+        )
+        server_app.pixel_import_jobs = active_import_jobs
+        blocked_export = self.client.post(
+            "/gpt-api/pixel-manager/export-jobs",
+            headers=self._headers(),
+            json={"deleteAllAndReimport": True, "targetIds": ["pixel-1"]},
+        )
+        self.assertEqual(blocked_export.status_code, 409)
+        self.assertIn("导入任务运行中", blocked_export.json()["detail"])
 
     def test_export_returns_download_metadata_without_key_by_default(self) -> None:
         self.manager.export_all = AsyncMock(

@@ -288,6 +288,28 @@ export type PoolCredentials = {
 
 export type WithdrawalMode = "cost" | "full";
 
+export type WithdrawalDraft = {
+  mode: WithdrawalMode;
+  amount?: number;
+  accountAmounts?: Record<string, number>;
+};
+
+export type WithdrawalEligibility = {
+  status: "eligible" | "rate_limited" | "pending" | "manual" | "insufficient" | "insufficient_balance" | "disabled" | "unknown";
+  reason: string | null;
+  reasonCode?: string | null;
+  checkedAt: string | null;
+  windowDays: number;
+  maxRequests: number;
+  recentRequests: number;
+  exemptAmount: number;
+  firstWithdrawal: boolean;
+  feeAmount: number;
+  maxIntegerAmount: number;
+  exempt?: boolean;
+  nextEligibleAt?: string | null;
+};
+
 export type WithdrawalItem = {
   itemId?: number;
   sequence: number;
@@ -305,6 +327,14 @@ export type WithdrawalItem = {
   costRecoveredAmount?: number;
   costRecoveredAt?: string | null;
   remainingCostAfter?: number | null;
+  eligibility?: WithdrawalEligibility | null;
+  feeAmount?: number;
+  totalDeducted?: number;
+  attemptedAt?: string | null;
+  platformWithdrawalId?: string | number | null;
+  platformStatus?: string | null;
+  retryCount?: number;
+  outcomeUnknown?: boolean;
 };
 
 export type WithdrawalSettlement = {
@@ -479,6 +509,8 @@ export type PixelImportJob = {
   nextRunAt?: string | null;
   results: PixelImportTargetResult[];
   error: string | null;
+  retryCount?: number;
+  retryableTargetIds?: string[];
 };
 
 export type PixelDeleteTargetResult = {

@@ -124,12 +124,18 @@ class CostLedger:
             "remainingCost": stored["cost"],
         }
 
-    def recover_snapshot(self, conn: Any, snapshot: list[dict[str, Any]], amount: float) -> dict[str, Any]:
+    def recover_snapshot(
+        self,
+        conn: Any,
+        snapshot: list[dict[str, Any]],
+        amount: float,
+        frozen_cost: float,
+    ) -> dict[str, Any]:
         """Apply one successful withdrawal to the live cost ledger.
 
-        Frozen rows are consumed oldest-first. Costs added after the withdrawal
-        task was created are never edited, while the stored total also supports
-        legacy costs that do not have a matching history row.
+        Frozen rows are consumed oldest-first. Only the untracked portion that
+        already existed in the frozen total is treated as a legacy cost, so
+        rows and totals added after task creation are never consumed.
         """
         requested_cents = max(int(round(self._number(amount, 0) * 100)), 0)
         stored_row = conn.execute(
@@ -137,8 +143,8 @@ class CostLedger:
         ).fetchone()
         stored = self._loads(stored_row["value"], {}) if stored_row else {}
         live_cents = max(int(round(self._number(stored.get("cost"), 0) * 100)), 0)
-        recovered_cents = min(requested_cents, live_cents)
-        if recovered_cents <= 0:
+        recovery_budget_cents = min(requested_cents, live_cents)
+        if recovery_budget_cents <= 0:
             return {
                 "recoveredAmount": 0.0,
                 "remainingCost": live_cents / 100,
@@ -155,6 +161,9 @@ class CostLedger:
             ordered_snapshot.append(
                 (item_id, max(int(round(self._number(item.get("amount"), 0) * 100)), 0))
             )
+        frozen_rows_cents = sum(amount_cents for _, amount_cents in ordered_snapshot)
+        frozen_cost_cents = max(int(round(self._number(frozen_cost, 0) * 100)), 0)
+        frozen_legacy_cents = max(frozen_cost_cents - frozen_rows_cents, 0)
 
         rows_by_id: dict[str, Any] = {}
         if ordered_snapshot:
@@ -165,7 +174,14 @@ class CostLedger:
             ).fetchall()
             rows_by_id = {str(row["id"]): row for row in rows}
 
-        remaining_cents = recovered_cents
+        recorded_row = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS total FROM cost_additions"
+        ).fetchone()
+        recorded_cents = max(int(round(self._number(recorded_row["total"] if recorded_row else 0, 0) * 100)), 0)
+        live_legacy_cents = max(live_cents - recorded_cents, 0)
+
+        remaining_cents = recovery_budget_cents
+        row_recovered_cents = 0
         updated_rows = 0
         for item_id, frozen_cents in ordered_snapshot:
             if remaining_cents <= 0:
@@ -174,7 +190,7 @@ class CostLedger:
             if not row:
                 continue
             current_cents = max(int(round(self._number(row["amount"], 0) * 100)), 0)
-            available_cents = min(current_cents, frozen_cents) if frozen_cents else current_cents
+            available_cents = min(current_cents, frozen_cents)
             consumed_cents = min(remaining_cents, available_cents)
             if consumed_cents <= 0:
                 continue
@@ -187,7 +203,17 @@ class CostLedger:
                     (next_cents / 100, item_id),
                 )
             remaining_cents -= consumed_cents
+            row_recovered_cents += consumed_cents
             updated_rows += 1
+
+        legacy_recovered_cents = min(remaining_cents, frozen_legacy_cents, live_legacy_cents)
+        recovered_cents = row_recovered_cents + legacy_recovered_cents
+        if recovered_cents <= 0:
+            return {
+                "recoveredAmount": 0.0,
+                "remainingCost": live_cents / 100,
+                "updatedRows": 0,
+            }
 
         stored["cost"] = (live_cents - recovered_cents) / 100
         conn.execute(

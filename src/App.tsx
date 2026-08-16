@@ -77,6 +77,7 @@ import type {
   StoredState,
   WithdrawalJob,
   WithdrawalPlan,
+  WithdrawalDraft,
   WithdrawalMode,
 } from "./lib/types";
 import type { PixelRecoveryProgress, PixelRecoveryResult } from "./lib/pixel-recovery";
@@ -132,6 +133,10 @@ const navItems = [
 
 type ViewKey = (typeof navItems)[number]["key"];
 type TableCell = React.ReactNode;
+type PixelExportActivity = {
+  job: PixelExportJob;
+  currentTargetEmail: string;
+};
 
 const trendMetrics: { key: PoolMetricKey; label: string; color: string }[] = [
   { key: "total", label: "总账号", color: "#2563eb" },
@@ -170,7 +175,19 @@ export function App() {
   const [dialog, setDialog] = useState<null | "addCost" | "costHistory" | "accounts" | "poolCredentials" | "withdrawal">(null);
   const [withdrawalIntent, setWithdrawalIntent] = useState<"create" | "status">("create");
   const [withdrawalJob, setWithdrawalJob] = useState<WithdrawalJob | null>(null);
+  const [importJob, setImportJob] = useState<PixelImportJob | null>(null);
+  const [importResults, setImportResults] = useState<PixelImportTargetResult[]>([]);
+  const [importDetailsOpen, setImportDetailsOpen] = useState(false);
+  const [importRetrying, setImportRetrying] = useState(false);
+  const [importAccelerating, setImportAccelerating] = useState(false);
+  const [pixelImportBlocked, setPixelImportBlocked] = useState(false);
+  const [pixelExportActivity, setPixelExportActivity] = useState<PixelExportActivity | null>(null);
+  const [dismissedImportJobId, setDismissedImportJobId] = useState("");
+  const [dismissedWithdrawalJobId, setDismissedWithdrawalJobId] = useState(() => window.localStorage.getItem("dismissedWithdrawalJobId") ?? "");
   const withdrawalStateRefresh = useRef("");
+  const withdrawalLoadVersion = useRef(0);
+  const importJobVersion = useRef(0);
+  const importToastMarker = useRef("");
   const editStartedAt = useRef(0);
   const saveTimer = useRef<number | null>(null);
 
@@ -216,11 +233,17 @@ export function App() {
   }, [view]);
 
   const loadWithdrawalJob = useCallback(async () => {
+    const requestVersion = ++withdrawalLoadVersion.current;
     try {
       const response = await api.withdrawals();
+      if (requestVersion !== withdrawalLoadVersion.current) return;
       setWithdrawalJob(response.job);
       const current = response.job;
       if (current) {
+        if (["queued", "waiting", "running"].includes(current.status)) {
+          setDismissedWithdrawalJobId((dismissed) => dismissed === current.jobId ? "" : dismissed);
+          window.localStorage.removeItem("dismissedWithdrawalJobId");
+        }
         const marker = `${current.jobId}:${current.status}:${current.costClearedAmount ?? 0}`;
         if (withdrawalStateRefresh.current !== marker) {
           withdrawalStateRefresh.current = marker;
@@ -237,6 +260,105 @@ export function App() {
     const timer = window.setInterval(() => void loadWithdrawalJob(), 5_000);
     return () => window.clearInterval(timer);
   }, [loadWithdrawalJob]);
+
+  const updateImportJob = useCallback((job: PixelImportJob | null) => {
+    importJobVersion.current += 1;
+    setImportJob(job);
+    setImportResults(job?.results ?? []);
+    if (job) {
+      window.localStorage.setItem("pixelImportJobId", job.jobId);
+      setDismissedImportJobId((current) => current === job.jobId ? "" : current);
+    }
+  }, []);
+
+  useEffect(() => {
+    const jobId = window.localStorage.getItem("pixelImportJobId");
+    if (!jobId) return;
+    const restoreVersion = importJobVersion.current;
+    void api.pixelImportJob(jobId)
+      .then(({ job }) => {
+        if (restoreVersion === importJobVersion.current) updateImportJob(job);
+      })
+      .catch(() => {
+        // Keep the id: a temporary server outage must not orphan a running task.
+      });
+  }, [updateImportJob]);
+
+  useEffect(() => {
+    if (!importJob || ["completed", "failed"].includes(importJob.status)) return;
+    let cancelled = false;
+    let timer: number | null = null;
+    const poll = async () => {
+      try {
+        const { job } = await api.pixelImportJob(importJob.jobId);
+        if (cancelled) return;
+        updateImportJob(job);
+        if (["completed", "failed"].includes(job.status)) {
+          const retryable = job.retryableTargetIds?.length
+            ?? job.results.filter((item) => item.status !== "success").length;
+          const marker = `${job.jobId}:${job.status}:${job.updatedAt}`;
+          if (importToastMarker.current !== marker) {
+            importToastMarker.current = marker;
+            setToast(job.status === "failed"
+              ? job.error || "导入任务失败，可在任务托盘中重试"
+              : retryable
+                ? `导入完成，${retryable} 个平台需要重试`
+                : "导入任务已完成");
+          }
+          return;
+        }
+      } catch (error) {
+        if (!cancelled) setToast(error instanceof Error ? error.message : "导入进度读取失败");
+      }
+      if (!cancelled) timer = window.setTimeout(() => void poll(), 2_000);
+    };
+    timer = window.setTimeout(() => void poll(), 800);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [importJob?.jobId, importJob?.status, updateImportJob]);
+
+  const retryImportJob = async () => {
+    if (!importJob || importRetrying) return;
+    if (pixelImportBlocked) {
+      setToast("汇总整理任务运行中，暂不能重试导入");
+      return;
+    }
+    setImportRetrying(true);
+    try {
+      const { job } = await api.retryPixelImport(importJob.jobId);
+      updateImportJob(job);
+      setToast("失败平台已重新加入导入队列");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "导入任务重试失败");
+    } finally {
+      setImportRetrying(false);
+    }
+  };
+
+  const accelerateImportJob = async () => {
+    if (!importJob || importJob.phase !== "waiting" || importAccelerating) return;
+    setImportAccelerating(true);
+    try {
+      const { job } = await api.acceleratePixelImport(importJob.jobId);
+      updateImportJob(job);
+      setToast("已加速下一个平台上传");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "导入加速失败");
+    } finally {
+      setImportAccelerating(false);
+    }
+  };
+
+  const applyWithdrawalJob = useCallback((nextJob: WithdrawalJob | null) => {
+    withdrawalLoadVersion.current += 1;
+    setWithdrawalJob(nextJob);
+    if (nextJob && ["queued", "waiting", "running"].includes(nextJob.status)) {
+      setDismissedWithdrawalJobId("");
+      window.localStorage.removeItem("dismissedWithdrawalJobId");
+    }
+  }, []);
 
   const saveStoredDebounced = useCallback(
     (next: StoredState, delay = 700) => {
@@ -430,7 +552,14 @@ export function App() {
           </AnimatePresence>
           {!loading && managerVisited && (
             <div className={cn("h-full min-h-0", view !== "manager" && "hidden")}>
-              <PixelManagerView onToast={setToast} />
+              <PixelManagerView
+                importJob={importJob}
+                onImportJobChange={updateImportJob}
+                onImportResultsChange={setImportResults}
+                onImportBlockedChange={setPixelImportBlocked}
+                onExportActivityChange={setPixelExportActivity}
+                onToast={setToast}
+              />
             </div>
           )}
         </section>
@@ -477,23 +606,209 @@ export function App() {
         intent={withdrawalIntent}
         totalCost={totalCost}
         job={withdrawalJob}
-        onJobChange={setWithdrawalJob}
+        onJobChange={applyWithdrawalJob}
         onOpenChange={(open) => setDialog(open ? "withdrawal" : null)}
         onToast={setToast}
       />
 
-      <AnimatePresence>
-        {toast && (
-          <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 10 }}
-            className="fixed bottom-5 right-5 z-50 rounded-lg border border-border bg-card px-4 py-3 text-sm font-bold shadow-admin"
-          >
-            {toast}
-          </motion.div>
+      <div className="pointer-events-none fixed bottom-4 right-4 z-40 flex w-[min(470px,calc(100vw-32px))] flex-col items-stretch gap-2">
+        <AnimatePresence>
+          {toast && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 10 }}
+              className="pointer-events-auto rounded-md border border-border bg-card px-4 py-3 text-sm font-bold shadow-admin"
+            >
+              {toast}
+            </motion.div>
+          )}
+        </AnimatePresence>
+        {pixelExportActivity && (
+          <PixelExportProgress
+            job={pixelExportActivity.job}
+            currentTargetEmail={pixelExportActivity.currentTargetEmail}
+          />
         )}
-      </AnimatePresence>
+        <GlobalTaskTray
+          importJob={dismissedImportJobId === importJob?.jobId ? null : importJob}
+          withdrawalJob={dismissedWithdrawalJobId === withdrawalJob?.jobId ? null : withdrawalJob}
+          importRetrying={importRetrying}
+          importRetryBlocked={pixelImportBlocked}
+          importAccelerating={importAccelerating}
+          onOpenImport={() => setImportDetailsOpen(true)}
+          onRetryImport={() => void retryImportJob()}
+          onAccelerateImport={() => void accelerateImportJob()}
+          onDismissImport={() => {
+            if (!importJob) return;
+            setDismissedImportJobId(importJob.jobId);
+            window.localStorage.removeItem("pixelImportJobId");
+          }}
+          onOpenWithdrawal={() => {
+            setWithdrawalIntent("status");
+            setDialog("withdrawal");
+          }}
+          onDismissWithdrawal={() => {
+            if (!withdrawalJob) return;
+            setDismissedWithdrawalJobId(withdrawalJob.jobId);
+            window.localStorage.setItem("dismissedWithdrawalJobId", withdrawalJob.jobId);
+          }}
+        />
+      </div>
+
+      <Dialog open={importDetailsOpen} onOpenChange={setImportDetailsOpen}>
+        <DialogContent className="max-h-[min(720px,calc(100vh-48px))] w-[min(calc(100vw-48px),1420px)] overflow-auto">
+          <DialogHeader>
+            <DialogTitle>导入任务明细</DialogTitle>
+            <DialogDescription>{importJob ? `任务 ${importJob.jobId} · ${importResults.length} 个平台结果` : "暂无导入任务"}</DialogDescription>
+          </DialogHeader>
+          {importResults.length > 0 ? (
+            <PixelImportResults results={importResults} retryingTargetId="" />
+          ) : (
+            <div className="rounded-md border border-border bg-muted px-4 py-8 text-center text-sm font-bold text-muted-foreground">
+              {importJob?.error || "任务执行后将在这里显示逐平台结果"}
+            </div>
+          )}
+          {importJob && (importJob.status === "failed" || (importJob.retryableTargetIds?.length ?? 0) > 0 || importJob.results.some((item) => item.status !== "success")) && (
+            <div className="flex justify-end">
+              <Button onClick={() => void retryImportJob()} disabled={pixelImportBlocked || importRetrying || !["completed", "failed"].includes(importJob.status)}>
+                {importRetrying ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
+                重试失败平台
+              </Button>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+    </div>
+  );
+}
+
+function GlobalTaskTray({
+  importJob,
+  withdrawalJob,
+  importRetrying,
+  importRetryBlocked,
+  importAccelerating,
+  onOpenImport,
+  onRetryImport,
+  onAccelerateImport,
+  onDismissImport,
+  onOpenWithdrawal,
+  onDismissWithdrawal,
+}: {
+  importJob: PixelImportJob | null;
+  withdrawalJob: WithdrawalJob | null;
+  importRetrying: boolean;
+  importRetryBlocked: boolean;
+  importAccelerating: boolean;
+  onOpenImport: () => void;
+  onRetryImport: () => void;
+  onAccelerateImport: () => void;
+  onDismissImport: () => void;
+  onOpenWithdrawal: () => void;
+  onDismissWithdrawal: () => void;
+}) {
+  if (!importJob && !withdrawalJob) return null;
+  const importTerminal = Boolean(importJob && ["completed", "failed"].includes(importJob.status));
+  const importRetryable = Boolean(importJob && (
+    importJob.status === "failed"
+    || (importJob.retryableTargetIds?.length ?? 0) > 0
+    || importJob.results.some((item) => item.status !== "success")
+  ));
+  const withdrawalTerminal = Boolean(withdrawalJob && ["completed", "failed"].includes(withdrawalJob.status));
+  const importRetryCount = importJob
+    ? importJob.retryableTargetIds?.length ?? importJob.results.filter((item) => item.status !== "success").length
+    : 0;
+
+  return (
+    <div className="pointer-events-auto w-full overflow-hidden rounded-md border border-border bg-card shadow-admin">
+      <div className="border-b border-border bg-muted/70 px-3 py-2 text-[11px] font-black text-muted-foreground">任务中心</div>
+      {importJob && (
+        <TaskTrayRow
+          icon={importTerminal ? (importRetryable ? <AlertTriangle className="h-4 w-4" /> : <CheckCircle2 className="h-4 w-4" />) : <Loader2 className="h-4 w-4 animate-spin" />}
+          tone={importTerminal ? (importRetryable ? "amber" : "green") : "blue"}
+          title="账号导入"
+          detail={importJob.status === "failed"
+            ? importJob.error || "任务失败"
+            : importTerminal
+              ? importRetryable ? `${importRetryCount} 个平台需要重试` : "全部平台导入完成"
+              : `${Math.min(importJob.completedTargets, importJob.totalTargets)} / ${importJob.totalTargets} 个平台已处理`}
+          onOpen={onOpenImport}
+          actions={(
+            <Fragment>
+              {importJob.phase === "waiting" && (
+                <Button size="icon" variant="outline" title="加速下一平台" disabled={importAccelerating} onClick={onAccelerateImport}>
+                  {importAccelerating ? <Loader2 className="h-4 w-4 animate-spin" /> : <FastForward className="h-4 w-4" />}
+                </Button>
+              )}
+              {importTerminal && importRetryable && (
+                <Button
+                  size="icon"
+                  variant="outline"
+                  title={importRetryBlocked ? "汇总整理任务运行中，暂不能重试导入" : "重试失败平台"}
+                  disabled={importRetryBlocked || importRetrying}
+                  onClick={onRetryImport}
+                >
+                  {importRetrying ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
+                </Button>
+              )}
+              {importTerminal && <Button size="icon" variant="outline" title="关闭导入任务" onClick={onDismissImport}><X className="h-4 w-4" /></Button>}
+            </Fragment>
+          )}
+        />
+      )}
+      {withdrawalJob && (
+        <TaskTrayRow
+          icon={withdrawalJob.status === "failed" ? <AlertTriangle className="h-4 w-4" /> : withdrawalJob.status === "completed" ? <CheckCircle2 className="h-4 w-4" /> : <Loader2 className="h-4 w-4 animate-spin" />}
+          tone={withdrawalJob.status === "failed" ? "red" : withdrawalJob.status === "completed" ? "green" : "violet"}
+          title="提现任务"
+          detail={withdrawalJob.status === "failed"
+            ? withdrawalJob.error || "任务已暂停，可打开详情重试"
+            : withdrawalJob.status === "completed"
+              ? `已提交 ${withdrawalJob.items.filter((item) => item.status === "submitted").length} 笔，跳过 ${withdrawalJob.items.filter((item) => item.status === "skipped").length} 笔`
+              : `${withdrawalJob.items.filter((item) => ["submitted", "skipped"].includes(item.status)).length} / ${withdrawalJob.items.length} 个账号已处理`}
+          onOpen={onOpenWithdrawal}
+          actions={withdrawalTerminal ? <Button size="icon" variant="outline" title="关闭提现任务" onClick={onDismissWithdrawal}><X className="h-4 w-4" /></Button> : null}
+        />
+      )}
+    </div>
+  );
+}
+
+function TaskTrayRow({
+  icon,
+  tone,
+  title,
+  detail,
+  onOpen,
+  actions,
+}: {
+  icon: React.ReactNode;
+  tone: "blue" | "green" | "amber" | "red" | "violet";
+  title: string;
+  detail: string;
+  onOpen: () => void;
+  actions: React.ReactNode;
+}) {
+  const tones = {
+    blue: "bg-blue-50 text-blue-700",
+    green: "bg-emerald-50 text-emerald-700",
+    amber: "bg-amber-50 text-amber-700",
+    red: "bg-rose-50 text-rose-700",
+    violet: "bg-violet-50 text-violet-700",
+  };
+  return (
+    <div className="flex min-h-16 items-center gap-3 border-b border-border px-3 py-2 last:border-b-0">
+      <div className={cn("flex h-9 w-9 shrink-0 items-center justify-center rounded-md", tones[tone])}>{icon}</div>
+      <button type="button" className="min-w-0 flex-1 text-left" onClick={onOpen}>
+        <div className="text-sm font-black text-foreground">{title}</div>
+        <div className={cn("truncate text-xs font-bold", tone === "red" ? "text-rose-600" : "text-muted-foreground")} title={detail}>{detail}</div>
+      </button>
+      <div className="flex shrink-0 items-center gap-1.5">
+        <Button size="icon" variant="outline" title={`查看${title}`} onClick={onOpen}><ChevronRight className="h-4 w-4" /></Button>
+        {actions}
+      </div>
     </div>
   );
 }
@@ -1460,7 +1775,21 @@ function PoolsView({
   );
 }
 
-function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
+function PixelManagerView({
+  importJob,
+  onImportJobChange,
+  onImportResultsChange,
+  onImportBlockedChange,
+  onExportActivityChange,
+  onToast,
+}: {
+  importJob: PixelImportJob | null;
+  onImportJobChange: (job: PixelImportJob | null) => void;
+  onImportResultsChange: React.Dispatch<React.SetStateAction<PixelImportTargetResult[]>>;
+  onImportBlockedChange: (blocked: boolean) => void;
+  onExportActivityChange: (activity: PixelExportActivity | null) => void;
+  onToast: (message: string) => void;
+}) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [targets, setTargets] = useState<PixelTarget[]>([]);
   const [activeTargetId, setActiveTargetId] = useState("");
@@ -1478,9 +1807,6 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   const [importOpen, setImportOpen] = useState(false);
   const [selectedTargetIds, setSelectedTargetIds] = useState<Set<string>>(new Set());
   const [importing, setImporting] = useState(false);
-  const [results, setResults] = useState<PixelImportTargetResult[]>([]);
-  const [importJob, setImportJob] = useState<PixelImportJob | null>(null);
-  const [importAccelerating, setImportAccelerating] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [exportDeleteAndReimport, setExportDeleteAndReimport] = useState(false);
   const [exportSelectedTargetIds, setExportSelectedTargetIds] = useState<Set<string>>(new Set());
@@ -1514,6 +1840,23 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   const refreshAllTargetCountsRef = useRef<(targetList?: PixelTarget[], options?: { silent?: boolean }) => Promise<void>>(async () => undefined);
   const cleanupRunning = cleanupProgress !== null;
   const recoveryRunning = recoveryProgress !== null;
+
+  useEffect(() => {
+    onImportBlockedChange(exporting);
+  }, [exporting, onImportBlockedChange]);
+
+  useEffect(() => {
+    const active = exportJob && ["queued", "running"].includes(exportJob.status) ? exportJob : null;
+    onExportActivityChange(active ? {
+      job: active,
+      currentTargetEmail: targets.find((target) => target.id === active.currentTargetId)?.email ?? "",
+    } : null);
+  }, [exportJob, onExportActivityChange, targets]);
+
+  useEffect(() => () => {
+    onImportBlockedChange(false);
+    onExportActivityChange(null);
+  }, [onExportActivityChange, onImportBlockedChange]);
 
   const beginAccountsTransition = useCallback(() => {
     accountsRequestSequence.current += 1;
@@ -1649,25 +1992,6 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   }, [onToast]);
 
   useEffect(() => {
-    const jobId = window.localStorage.getItem("pixelImportJobId");
-    if (!jobId) return;
-    void api.pixelImportJob(jobId).then(({ job }) => {
-      setImportJob(job);
-      setResults(job.results);
-      setImporting(job.status === "queued" || job.status === "running");
-      if (job.status === "completed" || job.status === "failed") {
-        window.localStorage.removeItem("pixelImportJobId");
-      }
-      if (job.status === "completed") {
-        void loadTargets().then((targetList) => refreshAllTargetCountsRef.current(targetList, { silent: true }));
-        void loadAccountsRef.current();
-      }
-    }).catch(() => {
-      // Keep the job id so a temporary server or network failure cannot orphan a running import.
-    });
-  }, [loadTargets]);
-
-  useEffect(() => {
     const jobId = window.localStorage.getItem("pixelExportJobId");
     if (!jobId) return;
     void api.pixelExportJob(jobId).then(({ job }) => {
@@ -1688,43 +2012,13 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   }, [loadAccounts]);
 
   useEffect(() => {
-    if (!importJob || importJob.status === "completed" || importJob.status === "failed") return;
-    let cancelled = false;
-    let timer: number | null = null;
-    const poll = async () => {
-      try {
-        const response = await api.pixelImportJob(importJob.jobId);
-        if (cancelled) return;
-        setImportJob(response.job);
-        setResults(response.job.results);
-        if (response.job.status === "completed") {
-          setImporting(false);
-          window.localStorage.removeItem("pixelImportJobId");
-          const succeeded = response.job.results.filter((item) => item.status === "success").length;
-          const partial = response.job.results.filter((item) => item.status === "partial").length;
-          onToast(`导入完成：成功 ${succeeded} 个平台${partial ? `，部分成功 ${partial} 个` : ""}`);
-          const targetList = await loadTargets();
-          await refreshAllTargetCountsRef.current(targetList, { silent: true });
-          await loadAccountsRef.current();
-          return;
-        }
-        if (response.job.status === "failed") {
-          setImporting(false);
-          window.localStorage.removeItem("pixelImportJobId");
-          onToast(response.job.error || "批量导入失败");
-          return;
-        }
-      } catch (error) {
-        if (!cancelled) onToast(error instanceof Error ? error.message : "导入进度读取失败");
-      }
-      if (!cancelled) timer = window.setTimeout(() => void poll(), 2_000);
-    };
-    timer = window.setTimeout(() => void poll(), 1_000);
-    return () => {
-      cancelled = true;
-      if (timer !== null) window.clearTimeout(timer);
-    };
-  }, [importJob?.jobId]);
+    const active = Boolean(importJob && ["queued", "running"].includes(importJob.status));
+    setImporting(active);
+    if (importJob?.status === "completed") {
+      void loadTargets().then((targetList) => refreshAllTargetCountsRef.current(targetList, { silent: true }));
+      void loadAccountsRef.current();
+    }
+  }, [importJob?.jobId, importJob?.status, importJob?.updatedAt, loadTargets]);
 
   useEffect(() => {
     if (!exportJob || exportJob.status === "completed" || exportJob.status === "failed") return;
@@ -1772,7 +2066,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
   }, [exportJob?.jobId]);
 
   const openImport = () => {
-    if (!selectedFiles.length || !targets.length) return;
+    if (!selectedFiles.length || !targets.length || exporting) return;
     setSelectedTargetIds(new Set(targets.map((target) => target.id)));
     setImportOpen(true);
   };
@@ -1900,12 +2194,15 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
 
   const runImport = async () => {
     if (!selectedFiles.length || !selectedTargetIds.size) return;
+    if (exporting) {
+      onToast("汇总整理任务运行中，暂不能开始导入");
+      return;
+    }
     setImporting(true);
     try {
-      const response = await api.pixelImportBatch(selectedFiles, [...selectedTargetIds]);
-      setImportJob(response.job);
-      window.localStorage.setItem("pixelImportJobId", response.job.jobId);
-      setResults(response.job.results);
+      const targetIds = [...selectedTargetIds];
+      const response = await api.pixelImportBatch(selectedFiles, targetIds);
+      onImportJobChange(response.job);
       setImportOpen(false);
       setSelectedFiles([]);
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -1927,7 +2224,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
         const recordResponse = await api.pixelImportRecords();
         setImportRecords(recordResponse.records);
       }
-      setResults((current) =>
+      onImportResultsChange((current) =>
         current.map((item) => {
           if (item.targetId !== result.targetId) return item;
           const shared = item.shared + response.success;
@@ -2006,20 +2303,6 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
       onToast(error instanceof Error ? error.message : "全池批量测试失败");
     } finally {
       setRecoveryProgress(null);
-    }
-  };
-
-  const accelerateImport = async () => {
-    if (!importJob || importJob.phase !== "waiting") return;
-    setImportAccelerating(true);
-    try {
-      const response = await api.acceleratePixelImport(importJob.jobId);
-      setImportJob(response.job);
-      onToast("已加速下一个平台上传");
-    } catch (error) {
-      onToast(error instanceof Error ? error.message : "导入加速失败");
-    } finally {
-      setImportAccelerating(false);
     }
   };
 
@@ -2178,11 +2461,11 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
                 setSelectedFiles(files);
               }}
             />
-            <Button variant="outline" disabled={importing || sharingAll || cleanupRunning || recoveryRunning} onClick={() => fileInputRef.current?.click()}>
+            <Button variant="outline" disabled={importing || exporting || sharingAll || cleanupRunning || recoveryRunning} onClick={() => fileInputRef.current?.click()}>
               <FileJson className="h-4 w-4" />
               选择 JSON
             </Button>
-            <Button disabled={importing || sharingAll || cleanupRunning || recoveryRunning || !selectedFiles.length || !targets.length} onClick={openImport}>
+            <Button disabled={importing || exporting || sharingAll || cleanupRunning || recoveryRunning || !selectedFiles.length || !targets.length} onClick={openImport}>
               <Upload className="h-4 w-4" />
               上传到平台
             </Button>
@@ -2469,27 +2752,6 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
         </Card>
       </div>
 
-      {importJob && (importJob.status === "queued" || importJob.status === "running") && (
-        <div className="fixed bottom-4 right-4 z-40 w-[min(560px,calc(100vw-32px))] shadow-admin">
-          <PixelImportProgress job={importJob} targets={targets} accelerating={importAccelerating} onAccelerate={accelerateImport} />
-        </div>
-      )}
-      {exportJob && (exportJob.status === "queued" || exportJob.status === "running") && (
-        <div className="fixed bottom-4 right-4 z-40 w-[min(620px,calc(100vw-32px))] shadow-admin">
-          <PixelExportProgress job={exportJob} targets={targets} />
-        </div>
-      )}
-      {results.length > 0 && importJob?.status === "completed" && (
-        <Dialog open onOpenChange={(open) => !open && setResults([])}>
-          <DialogContent className="max-h-[min(720px,calc(100vh-48px))] w-[min(calc(100vw-48px),1420px)] overflow-auto">
-            <DialogHeader>
-              <DialogTitle>最近一次导入结果</DialogTitle>
-              <DialogDescription>已完成 {results.length} 个平台账号的导入与公共共享处理。</DialogDescription>
-            </DialogHeader>
-            <PixelImportResults results={results} retryingTargetId={retryingTargetId} onRetry={retryShare} />
-          </DialogContent>
-        </Dialog>
-      )}
       {exportJob?.status === "completed" && (
         <Dialog open onOpenChange={(open) => !open && setExportJob(null)}>
           <DialogContent className="max-h-[min(760px,calc(100vh-48px))] w-[min(calc(100vw-48px),1420px)] overflow-auto">
@@ -2826,7 +3088,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={importOpen} onOpenChange={(open) => !importing && setImportOpen(open)}>
+      <Dialog open={importOpen} onOpenChange={(open) => !importing && !exporting && setImportOpen(open)}>
         <DialogContent className="max-w-xl">
           <DialogHeader>
             <DialogTitle>选择上传账号</DialogTitle>
@@ -2837,7 +3099,7 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
           <div className="grid max-h-[360px] grid-cols-2 gap-2 overflow-auto">
             {targets.map((target, index) => (
               <label key={target.id} className="flex h-12 items-center gap-2.5 rounded-md border border-border bg-background px-3 text-sm font-bold">
-                <Checkbox checked={selectedTargetIds.has(target.id)} onCheckedChange={() => toggleImportTarget(target.id)} />
+                <Checkbox disabled={exporting} checked={selectedTargetIds.has(target.id)} onCheckedChange={() => toggleImportTarget(target.id)} />
                 <span className="flex h-6 w-6 items-center justify-center rounded bg-slate-100 text-[11px] font-black text-slate-600">{index + 1}</span>
                 <span className="truncate">{target.email}</span>
               </label>
@@ -2845,14 +3107,15 @@ function PixelManagerView({ onToast }: { onToast: (message: string) => void }) {
           </div>
           <div className="mt-5 flex items-center justify-between">
             <button
-              className="text-xs font-black text-blue-600 hover:text-blue-700"
+              disabled={exporting}
+              className="text-xs font-black text-blue-600 hover:text-blue-700 disabled:cursor-not-allowed disabled:text-muted-foreground"
               onClick={() => setSelectedTargetIds((current) => current.size === targets.length ? new Set() : new Set(targets.map((target) => target.id)))}
             >
               {selectedTargetIds.size === targets.length ? "取消全选" : "全部选择"}
             </button>
             <div className="flex gap-2">
-              <Button variant="outline" disabled={importing} onClick={() => setImportOpen(false)}>取消</Button>
-              <Button disabled={importing || !selectedTargetIds.size} onClick={() => void runImport()}>
+              <Button variant="outline" disabled={importing || exporting} onClick={() => setImportOpen(false)}>取消</Button>
+              <Button disabled={importing || exporting || !selectedTargetIds.size} onClick={() => void runImport()}>
                 {importing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
                 {importing ? "正在导入" : `确认上传 ${selectedTargetIds.size} 个`}
               </Button>
@@ -3315,17 +3578,16 @@ function PixelImportRecordsDialog({
   );
 }
 
-function PixelExportProgress({ job, targets }: { job: PixelExportJob; targets: PixelTarget[] }) {
-  const currentTarget = targets.find((target) => target.id === job.currentTargetId);
+function PixelExportProgress({ job, currentTargetEmail }: { job: PixelExportJob; currentTargetEmail: string }) {
   const completed = Math.min(job.completedTargets, job.totalTargets);
   const percent = job.totalTargets ? Math.round((completed / job.totalTargets) * 100) : 0;
   const phaseLabel = {
     queued: "准备汇总整理",
     exporting: "正在导出全部平台账号",
     backing_up: "正在保存服务器备份",
-    deleting: `正在清空 ${currentTarget?.email || "平台账号"}`,
-    importing: `正在重新导入 ${currentTarget?.email || "平台账号"}`,
-    waiting: `等待 ${Math.round(job.waitSeconds)} 秒后处理 ${currentTarget?.email || "下一个平台账号"}`,
+    deleting: `正在清空 ${currentTargetEmail || "平台账号"}`,
+    importing: `正在重新导入 ${currentTargetEmail || "平台账号"}`,
+    waiting: `等待 ${Math.round(job.waitSeconds)} 秒后处理 ${currentTargetEmail || "下一个平台账号"}`,
     completed: "汇总整理完成",
     failed: job.error || "汇总整理失败",
   }[job.phase];
@@ -3414,7 +3676,7 @@ function PixelImportResults({
 }: {
   results: PixelImportTargetResult[];
   retryingTargetId: string;
-  onRetry: (result: PixelImportTargetResult) => Promise<void>;
+  onRetry?: (result: PixelImportTargetResult) => Promise<void>;
 }) {
   return (
     <Card>
@@ -3452,10 +3714,12 @@ function PixelImportResults({
                   <td className={cn("px-3 py-3 font-black", result.shareFailed ? "text-rose-600" : "text-slate-400")}>{result.shareFailed}</td>
                   <td className="max-w-[260px] px-3 py-3"><div className={cn("truncate font-bold", result.status === "failed" ? "text-rose-600" : "text-muted-foreground")} title={result.message}>{result.message || "-"}</div></td>
                   <td className="px-3 py-3">
-                    <Button variant="outline" size="sm" disabled={!result.failedShareIds.length || retryingTargetId === result.targetId} onClick={() => void onRetry(result)}>
-                      {retryingTargetId === result.targetId ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
-                      重试共享
-                    </Button>
+                    {onRetry ? (
+                      <Button variant="outline" size="sm" disabled={!result.failedShareIds.length || retryingTargetId === result.targetId} onClick={() => void onRetry(result)}>
+                        {retryingTargetId === result.targetId ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}
+                        重试共享
+                      </Button>
+                    ) : <span className="text-muted-foreground">-</span>}
                   </td>
                 </tr>
               ))}
@@ -3675,11 +3939,16 @@ function WithdrawalDialog({
 }) {
   const [mode, setMode] = useState<WithdrawalMode>("cost");
   const [amount, setAmount] = useState("");
+  const [accountAmounts, setAccountAmounts] = useState<Record<string, string>>({});
   const [preview, setPreview] = useState<WithdrawalPlan | null>(null);
+  const [previewDraft, setPreviewDraft] = useState<WithdrawalDraft | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
   const [creating, setCreating] = useState(false);
   const [accelerating, setAccelerating] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [createConfirmOpen, setCreateConfirmOpen] = useState(false);
+  const [retryConfirmOpen, setRetryConfirmOpen] = useState(false);
   const [progressTab, setProgressTab] = useState<"current" | "history">("current");
   const [historyJobs, setHistoryJobs] = useState<WithdrawalJob[]>([]);
   const [historyTotal, setHistoryTotal] = useState(0);
@@ -3689,16 +3958,32 @@ function WithdrawalDialog({
   const [selectedHistoryJob, setSelectedHistoryJob] = useState<WithdrawalJob | null>(null);
   const [clock, setClock] = useState(Date.now());
   const createInFlight = useRef(false);
+  const previewRequestVersion = useRef(0);
   const active = Boolean(job && ["queued", "waiting", "running"].includes(job.status));
   const showingJob = intent === "status" || active;
 
+  const invalidatePreview = useCallback(() => {
+    previewRequestVersion.current += 1;
+    setPreview(null);
+    setPreviewDraft(null);
+    setPreviewLoading(true);
+    setPreviewError("");
+    setCreateConfirmOpen(false);
+  }, []);
+
   useEffect(() => {
     if (!open) return;
+    previewRequestVersion.current += 1;
     setPreview(null);
+    setPreviewDraft(null);
+    setPreviewLoading(false);
     setPreviewError("");
     setProgressTab("current");
     setHistoryPage(0);
     setSelectedHistoryJob(null);
+    setAccountAmounts({});
+    setCreateConfirmOpen(false);
+    setRetryConfirmOpen(false);
     if (intent === "create") {
       setMode("cost");
       setAmount(String(Math.max(0, Math.ceil(totalCost - 1e-9))));
@@ -3713,39 +3998,70 @@ function WithdrawalDialog({
 
   useEffect(() => {
     if (!open || showingJob) return;
+    const requestVersion = ++previewRequestVersion.current;
     setPreview(null);
+    setPreviewDraft(null);
+    setPreviewLoading(true);
     setPreviewError("");
 
     const requestedAmount = Number(amount);
     if (mode === "cost" && totalCost <= 0) {
-      setPreviewLoading(false);
+      if (requestVersion === previewRequestVersion.current) setPreviewLoading(false);
       setPreviewError("当前没有待回收成本，请切换到全部提现");
       return;
     }
     if (mode === "cost" && (!Number.isInteger(requestedAmount) || requestedAmount <= 0)) {
-      setPreviewLoading(false);
+      if (requestVersion === previewRequestVersion.current) setPreviewLoading(false);
       setPreviewError("提现金额必须是大于 0 的整数");
       return;
     }
 
+    const parsedAccountAmounts: Record<string, number> = {};
+    if (mode === "full") {
+      for (const [email, raw] of Object.entries(accountAmounts)) {
+        if (raw.trim() === "") {
+          if (requestVersion === previewRequestVersion.current) setPreviewLoading(false);
+          setPreviewError(`${email} 的提现金额不能为空，输入 0 表示主动跳过`);
+          return;
+        }
+        const value = Number(raw);
+        if (!Number.isInteger(value) || value < 0) {
+          if (requestVersion === previewRequestVersion.current) setPreviewLoading(false);
+          setPreviewError(`${email} 的提现金额必须是大于等于 0 的整数`);
+          return;
+        }
+        parsedAccountAmounts[email] = value;
+      }
+    }
+
     let cancelled = false;
     const timer = window.setTimeout(async () => {
-      setPreviewLoading(true);
       try {
-        const response = await api.withdrawalPreview(mode, mode === "cost" ? requestedAmount : undefined);
-        if (!cancelled) setPreview(response);
+        const draft: WithdrawalDraft = {
+          mode,
+          ...(mode === "cost" ? { amount: requestedAmount } : {}),
+          ...(mode === "full" && Object.keys(parsedAccountAmounts).length ? { accountAmounts: parsedAccountAmounts } : {}),
+        };
+        const response = await api.withdrawalPreview(draft);
+        if (!cancelled && requestVersion === previewRequestVersion.current) {
+          setPreview(response);
+          setPreviewDraft(draft);
+        }
       } catch (error) {
-        if (!cancelled) setPreviewError(error instanceof Error ? error.message : "提现预览失败");
+        if (!cancelled && requestVersion === previewRequestVersion.current) {
+          setPreviewDraft(null);
+          setPreviewError(error instanceof Error ? error.message : "提现预览失败");
+        }
       } finally {
-        if (!cancelled) setPreviewLoading(false);
+        if (!cancelled && requestVersion === previewRequestVersion.current) setPreviewLoading(false);
       }
-    }, mode === "cost" ? 250 : 0);
+    }, 250);
 
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [amount, mode, open, showingJob, totalCost]);
+  }, [accountAmounts, amount, mode, open, showingJob, totalCost]);
 
   useEffect(() => {
     if (!open || !showingJob || progressTab !== "history") return;
@@ -3771,7 +4087,7 @@ function WithdrawalDialog({
   }, [historyPage, job?.updatedAt, open, progressTab, showingJob]);
 
   const create = async () => {
-    if (createInFlight.current || active) return;
+    if (createInFlight.current || active || previewLoading || previewError || !preview || !previewDraft) return;
     if (mode === "cost" && totalCost <= 0) {
       onToast("当前没有待回收成本，请切换到全部提现");
       return;
@@ -3779,15 +4095,34 @@ function WithdrawalDialog({
     createInFlight.current = true;
     setCreating(true);
     try {
-      const response = await api.createWithdrawal(mode, mode === "cost" ? Number(amount) : undefined);
+      const response = await api.createWithdrawal(previewDraft);
       onJobChange(response.job);
       setPreview(null);
+      setCreateConfirmOpen(false);
       onToast("提现任务已创建，第一笔将立即执行");
     } catch (error) {
       onToast(error instanceof Error ? error.message : "提现任务创建失败");
     } finally {
       createInFlight.current = false;
       setCreating(false);
+    }
+  };
+
+  const retry = async () => {
+    if (!job || retrying) return;
+    setRetrying(true);
+    try {
+      const response = await api.retryWithdrawal(job.jobId);
+      onJobChange(response.job);
+      setRetryConfirmOpen(false);
+      const restored = response.job.items.some(
+        (item) => item.itemId === job.items.find((candidate) => candidate.status === "failed")?.itemId && item.status === "submitted",
+      );
+      onToast(restored ? "已在 Pixel 历史中确认上次提交，未重复提现" : "失败账号已重新加入提现队列");
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "提现任务重试失败");
+    } finally {
+      setRetrying(false);
     }
   };
 
@@ -3816,8 +4151,19 @@ function WithdrawalDialog({
     : nextQueuedItem;
   const progressPercent = job?.items.length ? Math.round((submittedCount / job.items.length) * 100) : 0;
   const historyPages = Math.max(1, Math.ceil(historyTotal / 10));
+  const failedItem = job?.items.find((item) => item.status === "failed");
+  const previewSubmitCount = preview?.items.filter((item) => item.status !== "skipped" && item.amount > 0).length ?? 0;
+  const previewSkippedCount = preview?.items.filter((item) => item.status === "skipped").length ?? 0;
+  const previewUnverifiedCount = preview?.items.filter(
+    (item) => item.amount > 0 && item.status !== "skipped" && item.eligibility?.status === "unknown",
+  ).length ?? 0;
+  const previewFees = preview?.items.reduce(
+    (sum, item) => sum + (item.status === "skipped" ? 0 : item.feeAmount ?? 0),
+    0,
+  ) ?? 0;
 
   return (
+    <Fragment>
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="!w-[min(calc(100vw-32px),1040px)] max-w-none max-h-[min(860px,calc(100vh-36px))] overflow-auto">
         <DialogHeader>
@@ -3856,8 +4202,8 @@ function WithdrawalDialog({
                   onClick={() => {
                     setMode(item);
                     setAmount(item === "cost" ? String(Math.max(0, Math.ceil(totalCost - 1e-9))) : "");
-                    setPreview(null);
-                    setPreviewError("");
+                    setAccountAmounts({});
+                    invalidatePreview();
                   }}
                   className={cn("rounded px-3 text-xs font-black", mode === item ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted")}
                 >
@@ -3868,13 +4214,13 @@ function WithdrawalDialog({
           </Field>
           {mode === "cost" && (
             <Field label="计划提现金额">
-              <Input type="number" min="0" step="1" value={amount} disabled={Boolean(active) || totalCost <= 0} onChange={(event) => { setAmount(event.target.value); setPreview(null); setPreviewError(""); }} />
+              <Input type="number" min="0" step="1" value={amount} disabled={Boolean(active) || totalCost <= 0} onChange={(event) => { setAmount(event.target.value); invalidatePreview(); }} />
             </Field>
           )}
           {mode === "full" && <Field label="提现规则"><div className="flex h-9 items-center rounded-md border border-border bg-card px-3 text-sm font-bold">各账号整数余额</div></Field>}
-          <Button className="bg-violet-600 text-white hover:bg-violet-700" onClick={() => void create()} disabled={creating || previewLoading || !preview || Boolean(previewError) || active}>
+          <Button className="bg-violet-600 text-white hover:bg-violet-700" onClick={() => setCreateConfirmOpen(true)} disabled={creating || previewLoading || !preview || !previewDraft || preview.totalAmount <= 0 || previewUnverifiedCount > 0 || Boolean(previewError) || active}>
             {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <WalletCards className="h-4 w-4" />}
-            创建提现任务
+            确认提现
           </Button>
         </div>}
 
@@ -3893,13 +4239,36 @@ function WithdrawalDialog({
         )}
 
         {progressTab === "current" && showingJob && job?.status === "completed" && <div className="rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-bold text-emerald-800">任务 {job.jobId} 已完成，共处理 {submittedCount}/{job.items.length} 个账号。</div>}
-        {progressTab === "current" && showingJob && job?.status === "failed" && <div className="rounded-md border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">任务 {job.jobId} 已暂停：{job.error || "当前账号提现失败"}</div>}
+        {progressTab === "current" && showingJob && job?.status === "failed" && (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-bold text-rose-700">
+            <span>任务 {job.jobId} 已暂停：{job.error || "当前账号提现失败"}</span>
+            <Button size="sm" variant="outline" className="border-rose-300 bg-white text-rose-700 hover:bg-rose-100" onClick={() => setRetryConfirmOpen(true)}>
+              <RotateCcw className="h-3.5 w-3.5" />重试当前账号
+            </Button>
+          </div>
+        )}
         {progressTab === "current" && showingJob && !job && <div className="rounded-md border border-border bg-muted px-4 py-6 text-center text-sm font-bold text-muted-foreground">暂无提现任务</div>}
 
         {!showingJob && previewLoading && <div className="flex min-h-44 items-center justify-center rounded-md border border-border bg-card text-sm font-bold text-muted-foreground"><Loader2 className="mr-2 h-4 w-4 animate-spin" />正在刷新分配预览</div>}
         {!showingJob && previewError && <div className="rounded-md border border-rose-200 bg-rose-50 px-4 py-4 text-sm font-bold text-rose-700">{previewError}</div>}
+        {!showingJob && !previewLoading && !previewError && previewUnverifiedCount > 0 && (
+          <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-bold text-amber-800">
+            {previewUnverifiedCount} 个账号的 Pixel 实时规则或历史未能确认，本次不会提交。
+          </div>
+        )}
 
-        {(!showingJob || progressTab === "current") && shownPlan && <div className="mt-4"><WithdrawalPlanDetails plan={shownPlan} /></div>}
+        {(!showingJob || progressTab === "current") && shownPlan && (
+          <div className="mt-4">
+            <WithdrawalPlanDetails
+              plan={shownPlan}
+              editableAmounts={!showingJob && mode === "full" ? accountAmounts : undefined}
+              onAmountChange={!showingJob && mode === "full" ? (email, value) => {
+                setAccountAmounts((current) => ({ ...current, [email]: value }));
+                invalidatePreview();
+              } : undefined}
+            />
+          </div>
+        )}
 
         {showingJob && progressTab === "history" && (
           <div className="space-y-4">
@@ -3962,6 +4331,46 @@ function WithdrawalDialog({
         <div className="mt-6 flex justify-end gap-2 border-t border-border pt-4"><Button variant="outline" onClick={() => onOpenChange(false)}>关闭</Button></div>
       </DialogContent>
     </Dialog>
+    <Dialog open={createConfirmOpen} onOpenChange={(next) => !creating && setCreateConfirmOpen(next)}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>确认创建提现任务</DialogTitle>
+          <DialogDescription>创建后将按账号顺序向 Pixel 提交，已跳过账号不会提交。</DialogDescription>
+        </DialogHeader>
+        <div className="grid grid-cols-2 gap-3 text-sm">
+          <div className="rounded-md border border-border bg-muted/50 p-3"><div className="text-xs font-bold text-muted-foreground">将提交</div><div className="mt-1 text-lg font-black">{previewSubmitCount} 个账号</div></div>
+          <div className="rounded-md border border-border bg-muted/50 p-3"><div className="text-xs font-bold text-muted-foreground">自动跳过</div><div className="mt-1 text-lg font-black">{previewSkippedCount} 个账号</div></div>
+          <div className="rounded-md border border-border bg-muted/50 p-3"><div className="text-xs font-bold text-muted-foreground">提现总额</div><div className="mt-1 text-lg font-black">{formatMoney(preview?.totalAmount ?? 0)} 元</div></div>
+          <div className="rounded-md border border-border bg-muted/50 p-3"><div className="text-xs font-bold text-muted-foreground">首次手续费</div><div className="mt-1 text-lg font-black">{formatMoney(previewFees)} 元</div></div>
+        </div>
+        <div className="flex justify-end gap-2">
+          <Button variant="outline" disabled={creating} onClick={() => setCreateConfirmOpen(false)}>返回修改</Button>
+          <Button className="bg-violet-600 text-white hover:bg-violet-700" disabled={creating || previewLoading || Boolean(previewError) || !preview || !previewDraft || preview.totalAmount <= 0 || previewUnverifiedCount > 0} onClick={() => void create()}>
+            {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <WalletCards className="h-4 w-4" />}
+            确认提交
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+    <Dialog open={retryConfirmOpen} onOpenChange={(next) => !retrying && setRetryConfirmOpen(next)}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>确认重试提现</DialogTitle>
+          <DialogDescription>91 会先核对 Pixel 提现历史；若上次请求已被受理，将恢复记录而不会重复提交。未超过安全等待时间时不会重发。</DialogDescription>
+        </DialogHeader>
+        <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-3 text-sm font-bold text-rose-700">
+          {failedItem ? `${failedItem.email} · ${formatMoney(failedItem.amount, 0)} 元 · ${failedItem.error || job?.error || "提交失败"}` : job?.error || "当前任务没有可重试账号"}
+        </div>
+        <div className="flex justify-end gap-2">
+          <Button variant="outline" disabled={retrying} onClick={() => setRetryConfirmOpen(false)}>取消</Button>
+          <Button disabled={retrying || !failedItem} onClick={() => void retry()}>
+            {retrying ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
+            核对并重试
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+    </Fragment>
   );
 }
 
@@ -3972,7 +4381,15 @@ function withdrawalJobStatusTone(status: WithdrawalJob["status"]): "green" | "re
   return "amber";
 }
 
-function WithdrawalPlanDetails({ plan }: { plan: WithdrawalPlan | WithdrawalJob }) {
+function WithdrawalPlanDetails({
+  plan,
+  editableAmounts,
+  onAmountChange,
+}: {
+  plan: WithdrawalPlan | WithdrawalJob;
+  editableAmounts?: Record<string, string>;
+  onAmountChange?: (email: string, value: string) => void;
+}) {
   const finalized = "status" in plan && ["completed", "failed"].includes(plan.status);
   const displayedAmount = finalized ? plan.settlement.gross : plan.totalAmount;
   const recoveryDifference = Number((displayedAmount - plan.cost).toFixed(2));
@@ -3987,23 +4404,52 @@ function WithdrawalPlanDetails({ plan }: { plan: WithdrawalPlan | WithdrawalJob 
         <MetricTile title={plan.mode === "cost" ? "社会哥转给星星" : "社会哥应得"} value={plan.mode === "cost" ? plan.settlement.partnerToOwner : plan.settlement.partnerExpected} accent="text-orange-600" sub={plan.mode === "cost" ? "按实际收款归属" : "利润的 40%"} size="normal" digits={2} suffix=" 元" />
       </div>
       <div className="overflow-auto rounded-md border border-border">
-        <table className="w-full min-w-[860px] text-left text-xs">
-          <thead className="bg-muted font-black text-muted-foreground"><tr><th className="px-3 py-2">序号</th><th className="px-3 py-2">账号</th><th className="px-3 py-2">收款方式</th><th className="px-3 py-2">当前余额</th><th className="px-3 py-2">提现金额</th><th className="px-3 py-2">冲减成本</th><th className="px-3 py-2">状态</th></tr></thead>
+        <table className="w-full min-w-[1120px] text-left text-xs">
+          <thead className="bg-muted font-black text-muted-foreground"><tr><th className="px-3 py-2">序号</th><th className="px-3 py-2">账号</th><th className="px-3 py-2">收款方式</th><th className="px-3 py-2">当前余额</th><th className="w-[140px] px-3 py-2">提现金额</th><th className="px-3 py-2">平台扣除</th><th className="px-3 py-2">冲减成本</th><th className="px-3 py-2">状态</th><th className="w-[300px] px-3 py-2">跳过 / 失败原因</th></tr></thead>
           <tbody>
-            {plan.items.map((item, index) => (
-              <tr key={item.email} className="border-t border-border">
+            {plan.items.map((item, index) => {
+              const reason = item.error || item.eligibility?.reason || "";
+              const editable = Boolean(editableAmounts && onAmountChange && plan.mode === "full");
+              const showDeduction = finalized
+                ? item.status === "submitted"
+                : item.status !== "skipped" && item.amount > 0;
+              return (
+              <tr key={item.email} className="border-t border-border align-top">
                 <td className="px-3 py-2 font-black">{item.sequence ?? index + 1}</td>
                 <td className="px-3 py-2 font-bold">{item.email}</td>
                 <td className="px-3 py-2">{item.ownerLabel}</td>
                 <td className="px-3 py-2">{formatMoney(item.balance)}</td>
-                <td className="px-3 py-2 font-black">{formatMoney(item.amount, 0)}</td>
+                <td className="px-3 py-2 font-black">
+                  {editable ? (
+                    <div>
+                      <Input
+                        aria-label={`${item.email} 提现金额`}
+                        type="number"
+                        min={0}
+                        max={item.eligibility?.maxIntegerAmount ?? Math.floor(item.balance)}
+                        step={1}
+                        className="h-8 w-28"
+                        value={editableAmounts?.[item.email] ?? String(item.amount)}
+                        onChange={(event) => onAmountChange?.(item.email, event.target.value)}
+                      />
+                      <div className="mt-1 text-[10px] font-bold text-muted-foreground">最多 {item.eligibility?.maxIntegerAmount ?? Math.floor(item.balance)} 元</div>
+                    </div>
+                  ) : formatMoney(item.amount, 0)}
+                </td>
+                <td className="px-3 py-2 font-black">
+                  {showDeduction ? `${formatMoney(item.totalDeducted ?? item.amount)} 元` : "-"}
+                  {showDeduction && (item.feeAmount ?? 0) > 0 && <div className="mt-1 text-[10px] font-bold text-amber-700">含首次手续费 {formatMoney(item.feeAmount)} 元</div>}
+                </td>
                 <td className="px-3 py-2 font-black text-emerald-700">{item.costRecoveredAt ? `${formatMoney(item.costRecoveredAmount ?? 0)} 元` : "-"}</td>
                 <td className="px-3 py-2">
-                  <StatusPill tone={item.status === "failed" ? "red" : item.status === "submitted" ? "green" : item.status === "skipped" ? "gray" : item.status === "running" ? "blue" : "amber"}>{withdrawalItemStatusLabel(item.status, item.statusLabel)}</StatusPill>
-                  {item.error && <div className="mt-1 text-rose-600">{item.error}</div>}
+                  <StatusPill tone={item.status === "failed" ? "red" : item.status === "submitted" ? "green" : item.status === "skipped" ? "gray" : item.status === "running" ? "blue" : "amber"}>
+                    {item.status === "submitted" && item.platformStatus === "PENDING" ? "已提交 · Pixel 待结算" : withdrawalItemStatusLabel(item.status, item.statusLabel)}
+                  </StatusPill>
+                  {item.platformWithdrawalId ? <div className="mt-1 text-[10px] font-bold text-muted-foreground">Pixel #{item.platformWithdrawalId}</div> : null}
                 </td>
+                <td className={cn("px-3 py-2 font-bold leading-5", item.status === "failed" ? "text-rose-600" : item.status === "skipped" ? "text-slate-600" : "text-muted-foreground")}>{reason || "-"}</td>
               </tr>
-            ))}
+            );})}
           </tbody>
         </table>
       </div>

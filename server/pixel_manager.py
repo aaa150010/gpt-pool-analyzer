@@ -10,7 +10,7 @@ import re
 import secrets
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -32,8 +32,11 @@ IMPORT_CHUNK_SIZE = 100
 SHARE_CHUNK_SIZE = 100
 ACCOUNT_PAGE_SIZE = 100
 MAX_ACCOUNT_PAGES = 200
-MAX_RETAINED_IMPORT_JOBS = 50
+MAX_RETAINED_IMPORT_JOBS = 20
 MAX_RETAINED_EXPORT_JOBS = 20
+MAX_RETAINED_IMPORT_RETRY_JOBS = 3
+MAX_RETAINED_IMPORT_RETRY_PAYLOAD_BYTES = MAX_UPLOAD_BYTES * 2
+MAX_IMPORT_TRANSIENT_ATTEMPTS = 3
 PUBLIC_SHARE_CONCURRENCY = 10
 PUBLIC_SHARE_RANDOM_MIN_CONCURRENCY = 3
 PUBLIC_SHARE_RANDOM_MAX_CONCURRENCY = 10
@@ -57,10 +60,21 @@ BEARER_TOKEN_PATTERN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 
 
 class PixelManagerError(RuntimeError):
-    def __init__(self, public_message: str, status_code: int = 502) -> None:
+    def __init__(
+        self,
+        public_message: str,
+        status_code: int = 502,
+        *,
+        reason: str = "",
+        metadata: dict[str, str] | None = None,
+        outcome_unknown: bool = False,
+    ) -> None:
         super().__init__(public_message)
         self.public_message = public_message
         self.status_code = status_code
+        self.reason = reason
+        self.metadata = dict(metadata or {})
+        self.outcome_unknown = outcome_unknown
 
 
 class PixelConfigError(PixelManagerError):
@@ -71,6 +85,16 @@ class PixelConfigError(PixelManagerError):
 class PixelValidationError(PixelManagerError):
     def __init__(self, public_message: str) -> None:
         super().__init__(public_message, 400)
+
+
+class PixelJobCoordinator:
+    """Serializes the check-and-register phase for mutating background jobs."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+
+    def hold(self) -> asyncio.Lock:
+        return self._lock
 
 
 @dataclass(frozen=True)
@@ -177,6 +201,10 @@ def _safe_text(value: Any, limit: int = 500) -> str:
     text = BEARER_TOKEN_PATTERN.sub("Bearer [redacted]", text)
     text = SENSITIVE_TEXT_PATTERN.sub(lambda match: f"{match.group(1)}=[redacted]", text)
     return text[:limit]
+
+
+def _is_transient_pixel_error(exc: PixelManagerError) -> bool:
+    return exc.outcome_unknown or exc.status_code in {429, 500, 502, 503, 504}
 
 
 def _account_ids(values: Iterable[Any], maximum: int = MAX_BULK_ACCOUNTS) -> list[int]:
@@ -934,15 +962,53 @@ class PixelManager:
             self._target(target_id)
         return normalized
 
-    async def _decode_response(self, response: httpx.Response) -> dict[str, Any]:
-        if not response.is_success:
-            raise PixelManagerError(f"平台请求失败（HTTP {response.status_code}）")
+    async def _decode_response(
+        self,
+        response: httpx.Response,
+        *,
+        method: str = "GET",
+    ) -> dict[str, Any]:
+        unsafe_method = method.upper() not in {"GET", "HEAD", "OPTIONS"}
         try:
             payload = response.json()
         except ValueError as exc:
-            raise PixelManagerError("平台返回了无效数据") from exc
+            if not response.is_success:
+                raise PixelManagerError(
+                    f"平台请求失败（HTTP {response.status_code}）",
+                    response.status_code,
+                    outcome_unknown=unsafe_method and response.status_code >= 500,
+                ) from exc
+            raise PixelManagerError(
+                "平台返回了无效数据",
+                outcome_unknown=unsafe_method,
+            ) from exc
         if not isinstance(payload, dict):
-            raise PixelManagerError("平台返回了无效数据")
+            if not response.is_success:
+                raise PixelManagerError(
+                    f"平台请求失败（HTTP {response.status_code}）",
+                    response.status_code,
+                    outcome_unknown=unsafe_method and response.status_code >= 500,
+                )
+            raise PixelManagerError(
+                "平台返回了无效数据",
+                outcome_unknown=unsafe_method,
+            )
+        if not response.is_success:
+            message = _safe_text(payload.get("message")) or f"平台请求失败（HTTP {response.status_code}）"
+            reason = _safe_text(payload.get("reason"), 120)
+            raw_metadata = payload.get("metadata")
+            metadata = {
+                _safe_text(key, 120): _safe_text(value)
+                for key, value in raw_metadata.items()
+                if _safe_text(key, 120)
+            } if isinstance(raw_metadata, dict) else {}
+            raise PixelManagerError(
+                message,
+                response.status_code,
+                reason=reason,
+                metadata=metadata,
+                outcome_unknown=unsafe_method and response.status_code >= 500,
+            )
         return payload
 
     async def _authenticate(
@@ -1036,9 +1102,27 @@ class PixelManager:
                     retry_transient=retry_transient,
                 )
             except httpx.HTTPError as exc:
-                if index + 1 == len(factories):
-                    raise PixelManagerError("平台连接失败") from exc
-        raise PixelManagerError("平台连接失败")
+                connection_never_established = isinstance(
+                    exc,
+                    (httpx.ConnectError, httpx.ConnectTimeout),
+                )
+                unsafe_without_idempotent_retry = (
+                    method.upper() not in {"GET", "HEAD", "OPTIONS"}
+                    and not retry_transient
+                    and not connection_never_established
+                )
+                if unsafe_without_idempotent_retry or index + 1 == len(factories):
+                    raise PixelManagerError(
+                        "平台连接失败",
+                        outcome_unknown=(
+                            method.upper() not in {"GET", "HEAD", "OPTIONS"}
+                            and not connection_never_established
+                        ),
+                    ) from exc
+        raise PixelManagerError(
+            "平台连接失败",
+            outcome_unknown=method.upper() not in {"GET", "HEAD", "OPTIONS"},
+        )
 
     async def _request_once(
         self,
@@ -1113,7 +1197,7 @@ class PixelManager:
                     break
                 if response is None:
                     raise PixelManagerError("平台连接失败")
-                return await self._decode_response(response)
+                return await self._decode_response(response, method=method)
         except PixelManagerError:
             raise
         except httpx.HTTPError:
@@ -1227,8 +1311,44 @@ class PixelManager:
             "updatedAt": data.get("updated_at"),
         }
 
+    async def withdrawal_settings(self, target_id: str) -> dict[str, Any]:
+        target = self._target(target_id)
+        payload = await self._request(target, "GET", "/api/v1/settings/public")
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        if not isinstance(data, dict):
+            raise PixelManagerError("平台提现配置格式无效")
+        return data
+
+    async def withdrawal_profile(self, target_id: str) -> dict[str, Any]:
+        target = self._target(target_id)
+        payload = await self._request(target, "GET", "/api/v1/user/profile")
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        if not isinstance(data, dict):
+            raise PixelManagerError("平台账号余额格式无效")
+        return data
+
+    async def withdrawal_history(
+        self,
+        target_id: str,
+        page: int = 1,
+        page_size: int = 1000,
+    ) -> dict[str, Any]:
+        target = self._target(target_id)
+        normalized_page = max(_positive_int(page, 1), 1)
+        normalized_page_size = max(min(_positive_int(page_size, 1000), 1000), 1)
+        payload = await self._request(
+            target,
+            "GET",
+            "/api/v1/user/withdrawals",
+            params={"page": normalized_page, "page_size": normalized_page_size},
+        )
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            raise PixelManagerError("平台提现记录格式无效")
+        return data
+
     async def submit_withdrawal(
-        self, target_id: str, amount: int, payment_method: str
+        self, target_id: str, amount: int | float, payment_method: str
     ) -> dict[str, Any]:
         if amount < 1:
             raise PixelValidationError("提现金额必须至少为 1 元")
@@ -1236,13 +1356,17 @@ class PixelManager:
             raise PixelValidationError("提现方式无效")
         target = self._target(target_id)
         async with self._operation_locks[target.id]:
-            return await self._request(
+            payload = await self._request(
                 target,
                 "POST",
                 "/api/v1/user/withdrawals",
                 json_body={"amount": amount, "payment_method": payment_method},
                 timeout=30,
             )
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        if not isinstance(data, dict):
+            raise PixelManagerError("平台提现结果格式无效", outcome_unknown=True)
+        return data
 
     async def receipt_code(self, target_id: str, payment_method: str) -> dict[str, Any] | None:
         if payment_method not in {"wechat", "alipay"}:
@@ -1898,45 +2022,58 @@ class PixelManager:
             try:
                 before_accounts = await self._all_accounts_by_id(target)
             except PixelManagerError as exc:
-                return {**base_result, "status": "failed", "message": exc.public_message}
-
-            defaults = target.import_defaults
-            created = updated = failed = 0
-            request_error = ""
-            for index, content in enumerate(bundle.contents):
-                try:
-                    payload = await self._request(
-                        target,
-                        "POST",
-                        "/api/v1/accounts/import-credentials",
-                        json_body={
-                            "contents": [content],
-                            "platform": defaults.platform,
-                            "share_mode": defaults.share_mode,
-                            "concurrency": defaults.concurrency,
-                            "priority": defaults.priority,
-                            "group_ids": list(defaults.group_ids),
-                            "auto_pause_on_expired": defaults.auto_pause_on_expired,
-                            "account_level": defaults.account_level,
-                        },
-                        timeout=LONG_OPERATION_TIMEOUT_SECONDS,
-                    )
-                    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-                    if not isinstance(data, dict):
-                        raise PixelManagerError("平台导入返回了无效数据")
-                    created += _positive_int(data.get("created"))
-                    updated += _positive_int(data.get("updated"))
-                    failed += _positive_int(data.get("failed"))
-                    import_errors = _import_error_details(data)
-                    base_result["importErrors"].extend(import_errors)
-                    failed = max(failed, len(base_result["importErrors"]))
-                except PixelManagerError as exc:
-                    failed += sum(bundle.chunk_sizes[index:])
-                    request_error = exc.public_message
-                    break
+                return {
+                    **base_result,
+                    "status": "failed",
+                    "message": exc.public_message,
+                    "_retryable": _is_transient_pixel_error(exc),
+                }
 
             before_ids = set(before_accounts)
             expected_names = set(bundle.generated_names)
+            already_imported_ids = {
+                account_id
+                for account_id, name in before_accounts.items()
+                if name in expected_names
+            }
+            defaults = target.import_defaults
+            created = updated = failed = 0
+            request_error = ""
+            request_retryable = False
+            if len(already_imported_ids) < bundle.source_count:
+                for index, content in enumerate(bundle.contents):
+                    try:
+                        payload = await self._request(
+                            target,
+                            "POST",
+                            "/api/v1/accounts/import-credentials",
+                            json_body={
+                                "contents": [content],
+                                "platform": defaults.platform,
+                                "share_mode": defaults.share_mode,
+                                "concurrency": defaults.concurrency,
+                                "priority": defaults.priority,
+                                "group_ids": list(defaults.group_ids),
+                                "auto_pause_on_expired": defaults.auto_pause_on_expired,
+                                "account_level": defaults.account_level,
+                            },
+                            timeout=LONG_OPERATION_TIMEOUT_SECONDS,
+                        )
+                        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                        if not isinstance(data, dict):
+                            raise PixelManagerError("平台导入返回了无效数据")
+                        created += _positive_int(data.get("created"))
+                        updated += _positive_int(data.get("updated"))
+                        failed += _positive_int(data.get("failed"))
+                        import_errors = _import_error_details(data)
+                        base_result["importErrors"].extend(import_errors)
+                        failed = max(failed, len(base_result["importErrors"]))
+                    except PixelManagerError as exc:
+                        failed += sum(bundle.chunk_sizes[index:])
+                        request_error = exc.public_message
+                        request_retryable = _is_transient_pixel_error(exc)
+                        break
+
             after_accounts: dict[int, str] = {}
             imported_ids: list[int] = []
             discovery_error: PixelManagerError | None = None
@@ -1961,7 +2098,12 @@ class PixelManager:
                 await asyncio.sleep(0.3)
             if discovery_error is not None:
                 base_result.update({"created": created, "updated": updated, "failed": failed})
-                return {**base_result, "status": "failed", "message": discovery_error.public_message}
+                return {
+                    **base_result,
+                    "status": "failed",
+                    "message": discovery_error.public_message,
+                    "_retryable": _is_transient_pixel_error(discovery_error),
+                }
 
             generated_names = [after_accounts[account_id] for account_id in imported_ids]
             created = max(created, len(imported_ids))
@@ -1980,6 +2122,17 @@ class PixelManager:
                         "concurrencyById": {},
                     }
                     request_error = request_error or exc.public_message
+                    request_retryable = request_retryable or _is_transient_pixel_error(exc)
+
+            if (
+                request_error
+                and request_retryable
+                and len(imported_ids) >= bundle.source_count
+                and _positive_int(share_result.get("success")) >= bundle.source_count
+            ):
+                failed = 0
+                request_error = ""
+                request_retryable = False
 
             unresolved_created = max(created - len(imported_ids), 0)
             share_failed = _positive_int(share_result.get("failed")) + unresolved_created
@@ -2013,17 +2166,25 @@ class PixelManager:
                 message = "导入完成，新增账号已开启公共共享"
             if import_error_summary:
                 message += f"；平台明细：{import_error_summary}"
-            return {**base_result, "status": status, "message": message}
+            return {
+                **base_result,
+                "status": status,
+                "message": message,
+                "_retryable": status != "success" and request_retryable,
+            }
 
     async def import_bundle(
         self,
         bundle: CredentialBundle,
         target_ids: Iterable[str],
         progress_callback: Callable[[dict[str, Any]], Any] | None = None,
+        *,
+        prepared_bundles: dict[str, TargetCredentialBundle] | None = None,
     ) -> dict[str, Any]:
         normalized = self.validate_target_ids(target_ids)
         used_emails: set[str] = set()
         _collect_emails(bundle.source_payload, used_emails)
+        prepared_by_target = prepared_bundles if prepared_bundles is not None else {}
         results: list[dict[str, Any]] = []
         for index, target_id in enumerate(normalized):
             if progress_callback:
@@ -2038,8 +2199,29 @@ class PixelManager:
                 )
                 if asyncio.iscoroutine(update):
                     await update
-            prepared = build_target_credential_bundle(bundle, used_emails)
-            results.append(await self._import_target(self._target(target_id), prepared))
+            prepared = prepared_by_target.get(target_id)
+            if prepared is None:
+                prepared = build_target_credential_bundle(bundle, used_emails)
+                prepared_by_target[target_id] = prepared
+            result: dict[str, Any] = {}
+            for attempt in range(MAX_IMPORT_TRANSIENT_ATTEMPTS):
+                result = await self._import_target(self._target(target_id), prepared)
+                discovered_names = tuple(
+                    str(value).strip()
+                    for value in result.get("generatedNames") or []
+                    if str(value).strip()
+                )
+                if discovered_names:
+                    expanded_names = tuple(dict.fromkeys((*prepared.generated_names, *discovered_names)))
+                    if expanded_names != prepared.generated_names:
+                        prepared = replace(prepared, generated_names=expanded_names)
+                        prepared_by_target[target_id] = prepared
+                retryable = bool(result.pop("_retryable", False))
+                if result.get("status") == "success" or not retryable:
+                    break
+                if attempt + 1 < MAX_IMPORT_TRANSIENT_ATTEMPTS:
+                    await self._sleeper(min(2**attempt, 5))
+            results.append(result)
             if index + 1 < len(normalized) and self._inter_target_delay_seconds:
                 wait_handled = False
                 if progress_callback:
@@ -2112,36 +2294,139 @@ class PixelImportJobs:
         self,
         manager: PixelManager,
         record_callback: Callable[[dict[str, Any]], None] | None = None,
+        *,
+        max_retained_jobs: int = MAX_RETAINED_IMPORT_JOBS,
+        max_retry_jobs: int = MAX_RETAINED_IMPORT_RETRY_JOBS,
+        max_retry_payload_bytes: int = MAX_RETAINED_IMPORT_RETRY_PAYLOAD_BYTES,
     ) -> None:
         self.manager = manager
         self.record_callback = record_callback
+        self.max_retained_jobs = max(int(max_retained_jobs), 1)
+        self.max_retry_jobs = max(int(max_retry_jobs), 1)
+        self.max_retry_payload_bytes = max(int(max_retry_payload_bytes), 1)
         self._jobs: dict[str, dict[str, Any]] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
 
+    @staticmethod
+    def _failed_target_ids(job: dict[str, Any]) -> list[str]:
+        results_by_target = {
+            str(item.get("targetId") or ""): item
+            for item in job.get("results") or []
+            if isinstance(item, dict) and str(item.get("targetId") or "")
+        }
+        return [
+            target_id
+            for target_id in job.get("_targetIds") or []
+            if results_by_target.get(target_id, {}).get("status") != "success"
+        ]
+
+    @classmethod
+    def _retryable_target_ids(cls, job: dict[str, Any]) -> list[str]:
+        prepared = job.get("_targetBundles")
+        source = job.get("_sourceBundle")
+        if not isinstance(prepared, dict) or not isinstance(source, CredentialBundle):
+            return []
+        return [
+            target_id
+            for target_id in cls._failed_target_ids(job)
+            if isinstance(prepared.get(target_id), TargetCredentialBundle)
+        ]
+
     def _public_job(self, job: dict[str, Any]) -> dict[str, Any]:
-        return {
+        public = {
             key: copy.deepcopy(value)
             for key, value in job.items()
             if not key.startswith("_")
         }
+        public["retryableTargetIds"] = self._retryable_target_ids(job)
+        return public
+
+    def _compact_job_payloads(self, job: dict[str, Any]) -> None:
+        retryable_ids = set(self._failed_target_ids(job))
+        if not retryable_ids:
+            job.pop("_sourceBundle", None)
+            job.pop("_targetBundles", None)
+            return
+
+        source = job.get("_sourceBundle")
+        if isinstance(source, CredentialBundle):
+            job["_sourceBundle"] = replace(
+                source,
+                source_payload={"accounts": []},
+            )
+        prepared = job.get("_targetBundles")
+        if isinstance(prepared, dict):
+            job["_targetBundles"] = {
+                target_id: prepared[target_id]
+                for target_id in retryable_ids
+                if target_id in prepared
+            }
+
+    @staticmethod
+    def _retry_payload_size(job: dict[str, Any]) -> int:
+        prepared = job.get("_targetBundles")
+        if not isinstance(prepared, dict):
+            return 0
+        total = 0
+        for bundle in prepared.values():
+            if not isinstance(bundle, TargetCredentialBundle):
+                continue
+            total += sum(len(content.encode("utf-8")) for content in bundle.contents)
+            total += sum(len(name.encode("utf-8")) for name in bundle.generated_names)
+            total += len(bundle.generated_file_name.encode("utf-8"))
+        return total
+
+    @staticmethod
+    def _discard_retry_payload(job: dict[str, Any]) -> None:
+        job.pop("_sourceBundle", None)
+        job.pop("_targetBundles", None)
+
+    def _enforce_retry_payload_limits(self, protected_job_id: str) -> None:
+        retained = []
+        for job_id, job in self._jobs.items():
+            size = self._retry_payload_size(job)
+            if size > 0:
+                retained.append((job_id, job, size))
+        total_bytes = sum(size for _, _, size in retained)
+        while len(retained) > self.max_retry_jobs or (
+            total_bytes > self.max_retry_payload_bytes and len(retained) > 1
+        ):
+            victim_index = next(
+                (index for index, (job_id, _, _) in enumerate(retained) if job_id != protected_job_id),
+                None,
+            )
+            if victim_index is None:
+                break
+            _, victim, size = retained.pop(victim_index)
+            total_bytes -= size
+            self._discard_retry_payload(victim)
 
     def _prune_completed_jobs(self) -> None:
         completed_ids = [
             job_id for job_id, task in self._tasks.items() if task.done()
         ]
-        overflow = max(len(completed_ids) - (MAX_RETAINED_IMPORT_JOBS - 1), 0)
+        overflow = max(len(completed_ids) - (self.max_retained_jobs - 1), 0)
         for job_id in completed_ids[:overflow]:
             self._tasks.pop(job_id, None)
             self._jobs.pop(job_id, None)
+
+    def has_active_job(self) -> bool:
+        return any(not task.done() for task in self._tasks.values())
 
     async def create(
         self, bundle: CredentialBundle, target_ids: Iterable[str]
     ) -> dict[str, Any]:
         normalized = self.manager.validate_target_ids(target_ids)
+        used_emails: set[str] = set()
+        _collect_emails(bundle.source_payload, used_emails)
+        prepared_bundles = {
+            target_id: build_target_credential_bundle(bundle, used_emails)
+            for target_id in normalized
+        }
         async with self._lock:
             self._prune_completed_jobs()
-            if any(not task.done() for task in self._tasks.values()):
+            if self.has_active_job():
                 raise PixelManagerError("已有导入任务正在运行，请等待完成", 409)
             job_id = uuid.uuid4().hex
             now = _utc_now()
@@ -2161,24 +2446,89 @@ class PixelImportJobs:
                 "nextRunAt": None,
                 "results": [],
                 "error": None,
+                "retryCount": 0,
                 "_accelerateEvent": asyncio.Event(),
+                "_sourceBundle": bundle,
+                "_targetIds": list(normalized),
+                "_targetBundles": prepared_bundles,
             }
             self._jobs[job_id] = job
             self._tasks[job_id] = asyncio.create_task(
-                self._run(job_id, bundle, normalized),
+                self._run(job_id, normalized),
                 name=f"pixel-import-{job_id}",
             )
             return self._public_job(job)
 
     async def _run(
-        self, job_id: str, bundle: CredentialBundle, target_ids: list[str]
+        self, job_id: str, target_ids: list[str]
     ) -> None:
         job = self._jobs[job_id]
+        bundle: CredentialBundle = job["_sourceBundle"]
+        prepared_bundles: dict[str, TargetCredentialBundle] = job["_targetBundles"]
+        all_target_ids: list[str] = job["_targetIds"]
+        previous_results = {
+            str(item.get("targetId") or ""): copy.deepcopy(item)
+            for item in job.get("results") or []
+            if isinstance(item, dict) and str(item.get("targetId") or "")
+        }
+        retained_results = {
+            target_id: item
+            for target_id, item in previous_results.items()
+            if target_id not in target_ids
+        }
+
+        for target_id in target_ids:
+            prepared = prepared_bundles.get(target_id)
+            previous = previous_results.get(target_id, {})
+            known_names = tuple(
+                str(value).strip()
+                for value in previous.get("generatedNames") or []
+                if str(value).strip()
+            )
+            if prepared is None or not known_names:
+                continue
+            expanded_names = tuple(dict.fromkeys((*prepared.generated_names, *known_names)))
+            if expanded_names != prepared.generated_names:
+                prepared_bundles[target_id] = replace(
+                    prepared,
+                    generated_names=expanded_names,
+                )
+
+        def merge_results(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+            merged = dict(retained_results)
+            for item in items:
+                if isinstance(item, dict) and str(item.get("targetId") or ""):
+                    target_id = str(item["targetId"])
+                    normalized = copy.deepcopy(item)
+                    previous = previous_results.get(target_id)
+                    if previous is not None:
+                        normalized["generatedNames"] = list(dict.fromkeys(
+                            [
+                                str(value).strip()
+                                for value in previous.get("generatedNames") or []
+                                if str(value).strip()
+                            ]
+                            + [
+                                str(value).strip()
+                                for value in normalized.get("generatedNames") or []
+                                if str(value).strip()
+                            ]
+                        ))
+                    merged[target_id] = normalized
+            return [merged[target_id] for target_id in all_target_ids if target_id in merged]
+
         job.update({"status": "running", "phase": "processing", "updatedAt": _utc_now()})
 
         async def progress(update: dict[str, Any]) -> bool:
+            normalized_update = dict(update)
+            if isinstance(update.get("results"), list):
+                normalized_update["results"] = merge_results(update["results"])
+            normalized_update["completedTargets"] = len(retained_results) + _positive_int(
+                update.get("completedTargets")
+            )
+            normalized_update["totalTargets"] = len(all_target_ids)
             if update.get("phase") != "waiting":
-                job.update(update)
+                job.update(normalized_update)
                 job["status"] = "running"
                 job["nextRunAt"] = None
                 job["updatedAt"] = _utc_now()
@@ -2187,7 +2537,7 @@ class PixelImportJobs:
             wait_seconds = max(float(update.get("waitSeconds") or 0), 0.0)
             accelerate_event: asyncio.Event = job["_accelerateEvent"]
             accelerate_event.clear()
-            job.update(update)
+            job.update(normalized_update)
             job["status"] = "running"
             job["updatedAt"] = _utc_now()
             job["nextRunAt"] = datetime.fromtimestamp(
@@ -2206,7 +2556,13 @@ class PixelImportJobs:
             return True
 
         try:
-            result = await self.manager.import_bundle(bundle, target_ids, progress)
+            result = await self.manager.import_bundle(
+                bundle,
+                target_ids,
+                progress,
+                prepared_bundles=prepared_bundles,
+            )
+            final_results = merge_results(result["results"])
             if self.record_callback:
                 try:
                     self.record_callback(
@@ -2216,7 +2572,7 @@ class PixelImportJobs:
                             "sourceFileName": bundle.source_file_name,
                             "sourceFileNames": list(bundle.source_file_names or (bundle.source_file_name,)),
                             "sourceCount": bundle.source_count,
-                            "targets": result["results"],
+                            "targets": final_results,
                         }
                     )
                 except Exception:
@@ -2227,10 +2583,12 @@ class PixelImportJobs:
                     "status": "completed",
                     "phase": "completed",
                     "currentTargetId": None,
-                    "completedTargets": len(target_ids),
+                    "completedTargets": len(all_target_ids),
+                    "totalTargets": len(all_target_ids),
                     "waitSeconds": 0,
                     "nextRunAt": None,
-                    "results": result["results"],
+                    "results": final_results,
+                    "error": None,
                     "updatedAt": _utc_now(),
                 }
             )
@@ -2262,6 +2620,9 @@ class PixelImportJobs:
                     "updatedAt": _utc_now(),
                 }
             )
+        finally:
+            self._compact_job_payloads(job)
+            self._enforce_retry_payload_limits(job_id)
 
     def get(self, job_id: str) -> dict[str, Any]:
         job = self._jobs.get(str(job_id or ""))
@@ -2295,6 +2656,40 @@ class PixelImportJobs:
             accelerate_event.set()
             return self._public_job(job)
 
+    async def retry(self, job_id: str) -> dict[str, Any]:
+        async with self._lock:
+            job = self._jobs.get(str(job_id or ""))
+            if job is None:
+                raise PixelManagerError("导入任务不存在", 404)
+            if self.has_active_job():
+                raise PixelManagerError("已有导入任务正在运行，请等待完成", 409)
+
+            retry_target_ids = self._retryable_target_ids(job)
+            if not retry_target_ids:
+                raise PixelManagerError("当前导入任务没有可重试的平台", 409)
+
+            now = _utc_now()
+            successful_count = len(job["_targetIds"]) - len(retry_target_ids)
+            job.update(
+                {
+                    "status": "queued",
+                    "phase": "queued",
+                    "currentTargetId": None,
+                    "completedTargets": successful_count,
+                    "waitSeconds": 0,
+                    "nextRunAt": None,
+                    "error": None,
+                    "retryCount": _positive_int(job.get("retryCount")) + 1,
+                    "updatedAt": now,
+                }
+            )
+            job["_accelerateEvent"] = asyncio.Event()
+            self._tasks[job_id] = asyncio.create_task(
+                self._run(job_id, retry_target_ids),
+                name=f"pixel-import-retry-{job_id}",
+            )
+            return self._public_job(job)
+
 
 class PixelExportJobs:
     def __init__(self, manager: PixelManager, backup_dir: str | Path) -> None:
@@ -2320,11 +2715,14 @@ class PixelExportJobs:
             self._tasks.pop(job_id, None)
             self._jobs.pop(job_id, None)
 
+    def has_active_job(self) -> bool:
+        return any(not task.done() for task in self._tasks.values())
+
     async def create_rebuild(self, target_ids: Iterable[str]) -> dict[str, Any]:
         normalized = self.manager.validate_target_ids(target_ids)
         async with self._lock:
             self._prune_completed_jobs()
-            if any(not task.done() for task in self._tasks.values()):
+            if self.has_active_job():
                 raise PixelManagerError("已有汇总整理任务正在运行，请等待完成", 409)
             job_id = uuid.uuid4().hex
             now = _utc_now()
