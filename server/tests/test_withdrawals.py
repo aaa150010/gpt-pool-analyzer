@@ -552,7 +552,21 @@ class WithdrawalServiceConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             first["eligibility"]["reasonCode"],
             "WITHDRAWAL_HISTORY_INCOMPLETE",
         )
-        self.assertIn("历史不完整", first["eligibility"]["reason"])
+        self.assertIn("历史读取不完整", first["eligibility"]["reason"])
+        self.assertIn("本次不会提交", first["eligibility"]["reason"])
+        self.assertNotIn("recentRequests", first["eligibility"])
+        self.assertNotIn("pending", first["eligibility"])
+        self.assertNotIn("firstWithdrawal", first["eligibility"])
+
+        self.balance_values = [1, 0, 0, 0, 0, 0, 0]
+        job = self.service.create_job(self.service.latest_plan("cost", 1), self.target_ids)
+        await self.service.process_once()
+
+        failed = self.service.job_detail(job["jobId"])
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["items"][0]["status"], "failed")
+        self.assertIn("历史读取不完整", failed["items"][0]["error"])
+        self.assertEqual(self.manager.calls, 0)
 
     async def test_worker_business_limit_error_skips_account_and_continues(self) -> None:
         self.balance_values = [1, 1, 0, 0, 0, 0, 0]
@@ -593,6 +607,7 @@ class WithdrawalServiceConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         completed = self.service.job_detail(job["jobId"])
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(completed["items"][1]["status"], "submitted")
+        self.assertEqual(completed["totalAmount"], 1)
         self.assertEqual(calls, ["target-0", "target-1"])
 
     async def test_rolling_window_includes_the_exact_boundary(self) -> None:

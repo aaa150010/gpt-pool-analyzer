@@ -19,6 +19,7 @@
 - 账号池历史和成本历史都不限制条数。
 - Command+Q 必须能退出应用。
 - 打包后清理旧安装，避免 Launchpad/搜索出现多个重复 app。
+- 发布和安装验收不要使用 `computer-use`；统一通过命令行检查版本、应用名称、签名、产物、安装位置和进程退出行为。
 
 ## 推荐验证流程
 
@@ -27,4 +28,4 @@
 3. 删除旧的 `/Applications/91.app`，只复制新的 `91.app` 过去。
 4. 删除本目录 `build`。
 5. 用 `find /Applications /Users/lwh/Applications /Users/lwh/Downloads -name '91.app' -print` 确认只剩 `/Applications/91.app`。
-6. 打开新版应用，截图检查 UI。
+6. 通过命令行启动新版应用并检查启动、退出行为；UI 回归使用前端测试和 Web 构建结果验证，不使用 `computer-use`。

@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   pull_request:
 
 permissions:
@@ -11,11 +13,21 @@ permissions:
 
 jobs:
   build:
+    if: github.ref_type != 'tag'
     runs-on: macos-14
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install web dependencies
+        run: npm ci
 
       - name: Build app
         shell: bash
@@ -27,5 +39,89 @@ jobs:
           mkdir -p build/verify
           ditto -x -k dist/91.zip build/verify
           test -d build/verify/91.app
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' build/verify/91.app/Contents/Info.plist)" = "91"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' build/verify/91.app/Contents/Info.plist)" = "91"
           lipo -archs build/verify/91.app/Contents/MacOS/gpt-analyzer | grep -Eq '^(arm64|x86_64)$'
           codesign --verify --deep --strict build/verify/91.app
+
+  release:
+    if: github.ref_type == 'tag'
+    runs-on: macos-14
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install web dependencies
+        run: npm ci
+
+      - name: Build app
+        shell: bash
+        run: ./build.sh
+
+      - name: Verify release package
+        shell: bash
+        run: |
+          mkdir -p build/verify
+          ditto -x -k dist/91.zip build/verify
+          test -d build/verify/91.app
+          version="${GITHUB_REF_NAME#v}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' build/verify/91.app/Contents/Info.plist)" = "91"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' build/verify/91.app/Contents/Info.plist)" = "91"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' build/verify/91.app/Contents/Info.plist)" = "$version"
+          lipo -archs build/verify/91.app/Contents/MacOS/gpt-analyzer | grep -Eq '^(arm64|x86_64)$'
+          codesign --verify --deep --strict build/verify/91.app
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p build/release
+          cp dist/91.zip "build/release/91-${version}.zip"
+          (
+            cd build/release
+            shasum -a 256 "91-${version}.zip" > SHA256SUMS.txt
+          )
+          if [[ -f dist/91.dmg ]]; then
+            cp dist/91.dmg "build/release/91-${version}.dmg"
+            (
+              cd build/release
+              shasum -a 256 "91-${version}.dmg" >> SHA256SUMS.txt
+            )
+          fi
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          assets=(
+            "build/release/91-${version}.zip"
+            "build/release/SHA256SUMS.txt"
+          )
+          if [[ -f "build/release/91-${version}.dmg" ]]; then
+            assets=("build/release/91-${version}.dmg" "${assets[@]}")
+          fi
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "91 ${version}" \
+              --notes-file RELEASE_NOTES.md \
+              --latest
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "${assets[@]}" \
+              --verify-tag \
+              --title "91 ${version}" \
+              --notes-file RELEASE_NOTES.md \
+              --latest
+          fi

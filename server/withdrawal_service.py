@@ -472,19 +472,18 @@ class WithdrawalService:
                 ]
                 return {
                     "status": "unknown",
-                    "reason": "Pixel 提现历史不完整，无法确认待结算申请和频控次数",
+                    "reason": "Pixel 提现历史读取不完整，无法确认待结算申请、频控次数和首次手续费，本次不会提交",
                     "reasonCode": "WITHDRAWAL_HISTORY_INCOMPLETE",
                     "checkedAt": checked_at,
                     "balance": round(balance, 2),
                     "managementEnabled": management_enabled,
                     "windowDays": window_days,
                     "maxRequests": max_requests,
-                    "recentRequests": 0,
                     "exemptAmount": round(exempt_amount, 2),
-                    "firstWithdrawal": False,
                     "feeAmount": 0.0,
-                    "pending": False,
-                    "nextEligibleAt": None,
+                    "historyComplete": False,
+                    "historyTotal": history_total,
+                    "observedHistoryCount": len(history_items),
                     "historyItems": history_items,
                     "observedWithdrawalIds": observed_ids,
                 }
