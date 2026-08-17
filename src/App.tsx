@@ -47,7 +47,7 @@ import {
   YAxis,
 } from "recharts";
 import { api } from "./lib/api";
-import { installAvailableUpdate } from "./lib/auto-update";
+import { installAvailableUpdate, installUpdateMenu } from "./lib/auto-update";
 import { cleanupPixelAccounts } from "./lib/pixel-cleanup";
 import { recoverPixelAccounts } from "./lib/pixel-recovery";
 import type {
@@ -226,6 +226,16 @@ export function App() {
 
   useEffect(() => {
     void installAvailableUpdate((event) => {
+      if (event.type === "ready") {
+        setUpdateNotice({ message: event.message, relaunch: event.relaunch });
+        return;
+      }
+      setToast(event.message);
+    });
+  }, []);
+
+  useEffect(() => {
+    void installUpdateMenu((event) => {
       if (event.type === "ready") {
         setUpdateNotice({ message: event.message, relaunch: event.relaunch });
         return;
