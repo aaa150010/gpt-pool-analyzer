@@ -62,9 +62,51 @@ rm -rf "$RELEASE_DIR"
 mkdir -p "$RELEASE_DIR"
 
 cp "dist/91.zip" "$RELEASE_DIR/91-$VERSION.zip"
+cp "dist/91.app.tar.gz" "$RELEASE_DIR/91-$VERSION.app.tar.gz"
+cp "dist/91.app.tar.gz.sig" "$RELEASE_DIR/91-$VERSION.app.tar.gz.sig"
+
+PLATFORM_ARCH="$(uname -m)"
+case "$PLATFORM_ARCH" in
+    arm64) UPDATER_PLATFORM="darwin-aarch64" ;;
+    x86_64) UPDATER_PLATFORM="darwin-x86_64" ;;
+    *) echo "Unsupported updater architecture: $PLATFORM_ARCH" >&2; exit 1 ;;
+esac
+
+python3 - "$VERSION" "$TAG" "$REPOSITORY" "$RELEASE_DIR" "$UPDATER_PLATFORM" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+version, tag, repository, release_dir, platform = sys.argv[1:]
+release_dir = Path(release_dir)
+notes = Path("RELEASE_NOTES.md").read_text(encoding="utf-8")
+current_heading = f"# 91 {version}"
+start = notes.find(current_heading)
+if start != -1:
+    rest = notes[start + len(current_heading):].lstrip()
+    next_heading = rest.find("\n# ")
+    notes = rest[:next_heading].strip() if next_heading != -1 else rest.strip()
+signature = (release_dir / f"91-{version}.app.tar.gz.sig").read_text(encoding="utf-8").strip()
+payload = {
+    "version": version,
+    "notes": notes,
+    "pub_date": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    "platforms": {
+        platform: {
+            "signature": signature,
+            "url": f"https://github.com/{repository}/releases/download/{tag}/91-{version}.app.tar.gz",
+        }
+    },
+}
+(release_dir / "latest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
 
 RELEASE_ASSETS=(
+    "$RELEASE_DIR/91-$VERSION.app.tar.gz"
+    "$RELEASE_DIR/91-$VERSION.app.tar.gz.sig"
     "$RELEASE_DIR/91-$VERSION.zip"
+    "$RELEASE_DIR/latest.json"
     "$RELEASE_DIR/SHA256SUMS.txt"
 )
 
@@ -74,6 +116,9 @@ if [[ -f "dist/91.dmg" ]]; then
 fi
 
 shasum -a 256 "$RELEASE_DIR/91-$VERSION.zip" > "$RELEASE_DIR/SHA256SUMS.txt"
+shasum -a 256 "$RELEASE_DIR/91-$VERSION.app.tar.gz" >> "$RELEASE_DIR/SHA256SUMS.txt"
+shasum -a 256 "$RELEASE_DIR/91-$VERSION.app.tar.gz.sig" >> "$RELEASE_DIR/SHA256SUMS.txt"
+shasum -a 256 "$RELEASE_DIR/latest.json" >> "$RELEASE_DIR/SHA256SUMS.txt"
 if [[ -f "$RELEASE_DIR/91-$VERSION.dmg" ]]; then
     shasum -a 256 "$RELEASE_DIR/91-$VERSION.dmg" >> "$RELEASE_DIR/SHA256SUMS.txt"
 fi

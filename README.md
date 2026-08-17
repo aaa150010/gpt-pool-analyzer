@@ -47,9 +47,11 @@ dist/91.dmg（当本机磁盘镜像工具可用时）
 
 ## 远程发布
 
-- 当前 Tauri 版本通过 GitHub Releases 提供手动下载，尚未集成应用内自动更新。
-- Release 包含 ZIP、SHA-256 校验文件，以及在可用时附加的 DMG。
+- 2.2.15 起应用会在启动后自动检查 GitHub Releases 的 `latest.json`，下载并安装新版本，重启后生效。
+- 从 2.2.14 或更早版本升级到 2.2.15 仍需手动安装一次；后续版本才会走自动更新。
+- Release 包含 ZIP、SHA-256 校验文件、updater 签名包和清单，以及在可用时附加的 DMG。
 - 没有 Apple Developer ID，首次从 GitHub 安装时需要在 macOS“隐私与安全性”中手动允许打开。
+- updater 私钥默认保存在 `~/.tauri/91-updater.key`，密码默认保存在 `~/.tauri/91-updater.key.pass`；不要提交或上传私钥。
 
 发布新版本前先更新 `RELEASE_NOTES.md`，然后运行：
 

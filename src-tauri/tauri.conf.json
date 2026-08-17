@@ -33,11 +33,20 @@
       "app",
       "dmg"
     ],
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/icon.icns"
     ],
     "macOS": {
       "minimumSystemVersion": "12.0"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDcxRjNGNkFGQjM5N0FDQkMKUldTOHJKZXpyL2J6Y2FDbUl5MFA4SHR1eE45N3RORUg4TzZJb0dkMVJveSs3Q0F5bzFoNDVkOE4K",
+      "endpoints": [
+        "https://github.com/aaa150010/gpt-pool-analyzer/releases/latest/download/latest.json"
+      ]
     }
   }
 }

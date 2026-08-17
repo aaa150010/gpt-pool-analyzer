@@ -1,3 +1,8 @@
+# 91 2.2.15
+
+- 接入 Tauri 自动更新：启动后自动检查 GitHub Release 的 `latest.json`，发现新版本后自动下载并安装，提示重启后生效。
+- 发布脚本新增 updater 签名包、签名文件和 `latest.json` 上传；私钥保存在本机 `~/.tauri/91-updater.key`，不会提交到仓库。
+
 # 91 2.2.14
 
 - 修复快捷提现预览在部分发布链路中以 POST 请求触发 Method Not Allowed 的问题；预览改为只读 GET 请求，并继续支持逐账号金额预览。

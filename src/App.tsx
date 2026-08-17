@@ -47,6 +47,7 @@ import {
   YAxis,
 } from "recharts";
 import { api } from "./lib/api";
+import { installAvailableUpdate } from "./lib/auto-update";
 import { cleanupPixelAccounts } from "./lib/pixel-cleanup";
 import { recoverPixelAccounts } from "./lib/pixel-recovery";
 import type {
@@ -172,6 +173,7 @@ export function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState("");
+  const [updateNotice, setUpdateNotice] = useState<null | { message: string; relaunch?: () => Promise<void> }>(null);
   const [dialog, setDialog] = useState<null | "addCost" | "costHistory" | "accounts" | "poolCredentials" | "withdrawal">(null);
   const [withdrawalIntent, setWithdrawalIntent] = useState<"create" | "status">("create");
   const [withdrawalJob, setWithdrawalJob] = useState<WithdrawalJob | null>(null);
@@ -221,6 +223,16 @@ export function App() {
     const timer = window.setInterval(() => void loadState(), 60_000);
     return () => window.clearInterval(timer);
   }, [loadState]);
+
+  useEffect(() => {
+    void installAvailableUpdate((event) => {
+      if (event.type === "ready") {
+        setUpdateNotice({ message: event.message, relaunch: event.relaunch });
+        return;
+      }
+      setToast(event.message);
+    });
+  }, []);
 
   useEffect(() => {
     if (!toast) return;
@@ -613,6 +625,26 @@ export function App() {
 
       <div className="pointer-events-none fixed bottom-4 right-4 z-40 flex w-[min(470px,calc(100vw-32px))] flex-col items-stretch gap-2">
         <AnimatePresence>
+          {updateNotice && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 10 }}
+              className="pointer-events-auto flex items-center justify-between gap-3 rounded-md border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm font-bold text-emerald-900 shadow-admin"
+            >
+              <span>{updateNotice.message}</span>
+              {updateNotice.relaunch && (
+                <Button
+                  size="sm"
+                  className="h-8 border-emerald-300 bg-white text-emerald-900 hover:bg-emerald-100"
+                  onClick={() => void updateNotice.relaunch?.()}
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  重启应用
+                </Button>
+              )}
+            </motion.div>
+          )}
           {toast && (
             <motion.div
               initial={{ opacity: 0, y: 20 }}
