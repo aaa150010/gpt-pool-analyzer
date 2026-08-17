@@ -159,6 +159,15 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+function withdrawalPreviewPath(draft: WithdrawalDraft): string {
+  const params = new URLSearchParams({ mode: draft.mode });
+  if (draft.amount !== undefined) params.set("amount", String(draft.amount));
+  if (draft.accountAmounts && Object.keys(draft.accountAmounts).length) {
+    params.set("accountAmounts", JSON.stringify(draft.accountAmounts));
+  }
+  return `/withdrawals/preview?${params.toString()}`;
+}
+
 export const api = {
   state: () => requestJson<ServerStateResponse>("/state"),
   refresh: () => requestJson<ServerRefreshResponse>("/refresh", { method: "POST" }),
@@ -204,11 +213,7 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ credentials }),
     }),
-  withdrawalPreview: (draft: WithdrawalDraft) =>
-    requestPixelJson<WithdrawalPlan>("/withdrawals/preview", {
-      method: "POST",
-      body: JSON.stringify(draft),
-    }),
+  withdrawalPreview: (draft: WithdrawalDraft) => requestPixelJson<WithdrawalPlan>(withdrawalPreviewPath(draft)),
   withdrawals: () => requestPixelJson<{ job: WithdrawalJob | null }>("/withdrawals"),
   withdrawalHistory: (limit = 20, offset = 0) =>
     requestPixelJson<WithdrawalHistoryResponse>(`/withdrawals/history?limit=${limit}&offset=${offset}`),

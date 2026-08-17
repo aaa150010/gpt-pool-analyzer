@@ -45,6 +45,7 @@ WITHDRAWAL_ITEM_RESERVE_SECONDS = 2 * 60
 UNKNOWN_OUTCOME_RETRY_GRACE_SECONDS = 2 * 60
 WITHDRAWAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
 WITHDRAWAL_PLATFORM_PENDING = "PENDING"
+WITHDRAWAL_RETRY_SEALED_REASON = "原任务已失败；本次重试仅恢复原失败账号，该项已封存不再执行"
 WITHDRAWAL_SKIP_REASONS = {
     "WITHDRAWAL_RATE_LIMIT_EXCEEDED",
     "WITHDRAWAL_PENDING_EXISTS",
@@ -148,6 +149,7 @@ def initialize_withdrawal_schema(conn: Any) -> None:
             platform_status TEXT,
             attempted_at TEXT,
             outcome_unknown INTEGER NOT NULL DEFAULT 0,
+            retry_reconciliation_required INTEGER NOT NULL DEFAULT 0,
             retry_count INTEGER NOT NULL DEFAULT 0,
             response TEXT NOT NULL DEFAULT '{}',
             UNIQUE(job_id, sequence)
@@ -185,6 +187,7 @@ def initialize_withdrawal_schema(conn: Any) -> None:
             conn.execute(statement)
 
     item_columns = {row["name"] for row in conn.execute("PRAGMA table_info(withdrawal_items)").fetchall()}
+    retry_reconciliation_column_missing = "retry_reconciliation_required" not in item_columns
     item_migrations = {
         "cost_recovered_amount": "ALTER TABLE withdrawal_items ADD COLUMN cost_recovered_amount REAL NOT NULL DEFAULT 0",
         "cost_recovered_at": "ALTER TABLE withdrawal_items ADD COLUMN cost_recovered_at TEXT",
@@ -196,11 +199,39 @@ def initialize_withdrawal_schema(conn: Any) -> None:
         "platform_status": "ALTER TABLE withdrawal_items ADD COLUMN platform_status TEXT",
         "attempted_at": "ALTER TABLE withdrawal_items ADD COLUMN attempted_at TEXT",
         "outcome_unknown": "ALTER TABLE withdrawal_items ADD COLUMN outcome_unknown INTEGER NOT NULL DEFAULT 0",
+        "retry_reconciliation_required": "ALTER TABLE withdrawal_items ADD COLUMN retry_reconciliation_required INTEGER NOT NULL DEFAULT 0",
         "retry_count": "ALTER TABLE withdrawal_items ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
     }
     for column, statement in item_migrations.items():
         if column not in item_columns:
             conn.execute(statement)
+
+    # v2.2.12 recorded every POST exception as a plain failure, even when the
+    # request might already have reached Pixel. The marker column is also a
+    # one-time migration gate for databases that were already opened by an
+    # earlier v2.2.13 build, where the new audit columns exist with defaults.
+    if retry_reconciliation_column_missing:
+        conn.execute(
+            """UPDATE withdrawal_items
+               SET attempted_at = COALESCE(
+                       NULLIF(attempted_at, ''),
+                       (SELECT NULLIF(j.updated_at, '') FROM withdrawal_jobs j
+                        WHERE j.job_id = withdrawal_items.job_id),
+                       (SELECT NULLIF(j.created_at, '') FROM withdrawal_jobs j
+                        WHERE j.job_id = withdrawal_items.job_id)
+                   ),
+                   outcome_unknown = 1,
+                   retry_reconciliation_required = 1
+               WHERE status = 'failed'
+                 AND (attempted_at IS NULL OR TRIM(attempted_at) = '')
+                 AND COALESCE(outcome_unknown, 0) = 0
+                 AND (submitted_at IS NULL OR TRIM(submitted_at) = '')
+                 AND (platform_withdrawal_id IS NULL OR TRIM(platform_withdrawal_id) = '')
+                 AND (platform_status IS NULL OR TRIM(platform_status) = '')
+                 AND COALESCE(retry_count, 0) = 0
+                 AND (eligibility IS NULL OR TRIM(eligibility) IN ('', '{}'))
+                 AND (response IS NULL OR TRIM(response) IN ('', '{}'))"""
+        )
 
     # A pre-migration process may have completed the platform POST before it
     # stopped, but legacy rows cannot say where in the submission it stopped.
@@ -214,7 +245,8 @@ def initialize_withdrawal_schema(conn: Any) -> None:
                    (SELECT NULLIF(j.created_at, '') FROM withdrawal_jobs j
                     WHERE j.job_id = withdrawal_items.job_id)
                ),
-               outcome_unknown = 1
+               outcome_unknown = 1,
+               retry_reconciliation_required = 1
            WHERE status = 'running'
              AND (attempted_at IS NULL OR TRIM(attempted_at) = '')
              AND EXISTS (
@@ -765,14 +797,20 @@ class WithdrawalService:
                 "platformStatus": item["platform_status"],
                 "attemptedAt": item["attempted_at"],
                 "outcomeUnknown": bool(item["outcome_unknown"]),
+                "retryReconciliationRequired": bool(item["retry_reconciliation_required"]),
                 "retryCount": int(item["retry_count"] or 0),
             }
             for item in items
         ]
+        finalized = result["status"] in {"completed", "failed"}
         result["totalAmount"] = round(sum(
             float(item.get("amount") or 0)
             for item in result["items"]
-            if item.get("status") != "skipped"
+            if (
+                item.get("status") == "submitted"
+                if finalized
+                else item.get("status") != "skipped"
+            )
         ), 2)
         return result
 
@@ -894,6 +932,7 @@ class WithdrawalService:
             "status", "status_label", "error", "submitted_at", "response", "eligibility",
             "fee_amount", "total_deducted", "platform_withdrawal_id", "platform_status",
             "attempted_at", "outcome_unknown",
+            "retry_reconciliation_required",
             "retry_count",
         }
         updates = {key: value for key, value in fields.items() if key in allowed}
@@ -1079,8 +1118,12 @@ class WithdrawalService:
             if not job or not item or job["status"] != "running" or item["status"] != "running":
                 return False
             conn.execute(
-                "UPDATE withdrawal_items SET status = 'failed', status_label = ?, error = ?, outcome_unknown = ? WHERE item_id = ?",
-                (self.item_label("failed"), message, int(outcome_unknown), item_id),
+                "UPDATE withdrawal_items SET status = 'failed', status_label = ?, error = ?, "
+                "outcome_unknown = ?, retry_reconciliation_required = ? WHERE item_id = ?",
+                (
+                    self.item_label("failed"), message, int(outcome_unknown),
+                    int(outcome_unknown), item_id,
+                ),
             )
             conn.execute(
                 "UPDATE withdrawal_jobs SET status = 'failed', next_run_at = NULL, error = ?, updated_at = ? "
@@ -1121,7 +1164,8 @@ class WithdrawalService:
         attempted_at = self._utc_now()
         with self._connect() as conn:
             updated = conn.execute(
-                "UPDATE withdrawal_items SET attempted_at = ?, outcome_unknown = 0 "
+                "UPDATE withdrawal_items SET attempted_at = ?, outcome_unknown = 0, "
+                "retry_reconciliation_required = 0 "
                 "WHERE item_id = ? AND job_id = ? AND status = 'running'",
                 (attempted_at, item_id, job_id),
             ).rowcount
@@ -1136,7 +1180,8 @@ class WithdrawalService:
         attempted_at = str(fallback_attempted_at or self._utc_now())
         with self._connect() as conn:
             updated = conn.execute(
-                "UPDATE withdrawal_items SET attempted_at = ?, outcome_unknown = 1 "
+                "UPDATE withdrawal_items SET attempted_at = ?, outcome_unknown = 1, "
+                "retry_reconciliation_required = 1 "
                 "WHERE item_id = ? AND job_id = ? AND status = 'running' "
                 "AND (attempted_at IS NULL OR TRIM(attempted_at) = '')",
                 (attempted_at, item_id, job_id),
@@ -1159,7 +1204,10 @@ class WithdrawalService:
             ).fetchone()
             if not item or item["status"] != "running":
                 return "lost"
-            fields = ["status = 'skipped'", "status_label = ?", "error = ?", "outcome_unknown = 0"]
+            fields = [
+                "status = 'skipped'", "status_label = ?", "error = ?",
+                "outcome_unknown = 0", "retry_reconciliation_required = 0",
+            ]
             values: list[Any] = [self.item_label("skipped"), message]
             if eligibility is not None:
                 fields.append("eligibility = ?")
@@ -1209,6 +1257,8 @@ class WithdrawalService:
         job_id: str,
         item_id: int,
         response: dict[str, Any],
+        *,
+        reconciliation: bool = False,
     ) -> tuple[str, float]:
         now = self._utc_now()
         with self._connect() as conn:
@@ -1221,10 +1271,28 @@ class WithdrawalService:
                 "SELECT * FROM withdrawal_items WHERE item_id = ? AND job_id = ?",
                 (item_id, job_id),
             ).fetchone()
-            if not job or not item or job["status"] != "running" or item["status"] != "running":
+            expected_status = "failed" if reconciliation else "running"
+            if not job or not item or job["status"] != expected_status or item["status"] != expected_status:
                 return "lost", RUNNING_RECHECK_SECONDS
             platform_id = self._platform_field(response, "id", default=None)
             platform_status = str(self._platform_field(response, "status", default="") or "").upper()
+            if self._record_claimed_by_other_item(conn, response, item):
+                raise RuntimeError("Pixel 提现记录已归属其他任务，禁止重复记录或冲减成本")
+            if reconciliation:
+                active = conn.execute(
+                    "SELECT job_id FROM withdrawal_jobs "
+                    "WHERE status IN ('queued', 'waiting', 'running') AND job_id <> ? LIMIT 1",
+                    (job_id,),
+                ).fetchone()
+                if active:
+                    raise RuntimeError("已有其他提现任务正在执行")
+                failed_count = int(conn.execute(
+                    "SELECT COUNT(*) AS count FROM withdrawal_items WHERE job_id = ? AND status = 'failed'",
+                    (job_id,),
+                ).fetchone()["count"])
+                if failed_count != 1:
+                    raise RuntimeError("失败任务必须且只能包含一个失败账号")
+                self._seal_queued_retry_items(conn, job_id)
             fee_amount = max(self._finite_number(
                 self._platform_field(response, "fee_amount", "feeAmount", default=item["fee_amount"]),
                 float(item["fee_amount"] or 0),
@@ -1235,12 +1303,14 @@ class WithdrawalService:
             ), 0.0)
             conn.execute(
                 "UPDATE withdrawal_items SET status = 'submitted', status_label = ?, submitted_at = ?, response = ?, "
-                "fee_amount = ?, total_deducted = ?, platform_withdrawal_id = ?, platform_status = ?, outcome_unknown = 0, error = NULL "
+                "fee_amount = ?, total_deducted = ?, platform_withdrawal_id = ?, platform_status = ?, "
+                "outcome_unknown = 0, retry_reconciliation_required = 0, error = NULL, "
+                "retry_count = retry_count + ? "
                 "WHERE item_id = ?",
                 (
                     self.item_label("submitted"), now, self._dumps(response), round(fee_amount, 2),
                     round(total_deducted, 2), str(platform_id) if platform_id is not None else None,
-                    platform_status or None, item_id,
+                    platform_status or None, int(reconciliation), item_id,
                 ),
             )
             self._apply_item_cost_recovery(conn, job, item, now)
@@ -1260,9 +1330,10 @@ class WithdrawalService:
                 outcome = "waiting"
             else:
                 conn.execute(
-                    "UPDATE withdrawal_jobs SET status = 'completed', next_run_at = NULL, error = NULL, updated_at = ? "
+                    "UPDATE withdrawal_jobs SET status = 'completed', current_sequence = ?, "
+                    "next_run_at = NULL, error = NULL, updated_at = ? "
                     "WHERE job_id = ?",
-                    (now, job_id),
+                    (item["sequence"], now, job_id),
                 )
                 outcome, delay = "completed", 1.0
         if outcome == "completed":
@@ -1373,6 +1444,78 @@ class WithdrawalService:
             <= attempted_at + timedelta(minutes=10)
         )
 
+    def _record_claimed_by_other_item(
+        self,
+        conn: Any,
+        record: dict[str, Any],
+        current_item: Any,
+    ) -> bool:
+        """Return whether this target's Pixel record already belongs to another local item."""
+        record_id = self._platform_field(record, "id", default=None)
+        if record_id in (None, ""):
+            return False
+        current_item_id = int(current_item["item_id"])
+        target_id = str(current_item["target_id"] or "")
+        bound = conn.execute(
+            """SELECT 1 FROM withdrawal_items
+               WHERE target_id = ? AND item_id <> ?
+                 AND TRIM(COALESCE(platform_withdrawal_id, '')) = ?
+               LIMIT 1""",
+            (target_id, current_item_id, str(record_id)),
+        ).fetchone()
+        if bound:
+            return True
+
+        raw_created = self._platform_field(record, "created_at", "createdAt", default=None)
+        try:
+            created_at = datetime.fromisoformat(str(raw_created).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return False
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        try:
+            amount = float(self._platform_field(record, "amount", default=None))
+        except (TypeError, ValueError):
+            return False
+        payment_method = str(
+            self._platform_field(record, "payment_method", "paymentMethod", default="") or ""
+        ).lower()
+        legacy_rows = conn.execute(
+            """SELECT item_id, amount, payment_method, submitted_at
+               FROM withdrawal_items
+               WHERE target_id = ? AND item_id <> ? AND status = 'submitted'
+                 AND TRIM(COALESCE(platform_withdrawal_id, '')) = ''
+                 AND submitted_at IS NOT NULL AND TRIM(submitted_at) <> ''""",
+            (target_id, current_item_id),
+        ).fetchall()
+        for legacy in legacy_rows:
+            if abs(float(legacy["amount"] or 0) - amount) > 1e-9:
+                continue
+            if str(legacy["payment_method"] or "").lower() != payment_method:
+                continue
+            submitted_at = self._parse_time(str(legacy["submitted_at"]))
+            if submitted_at is None:
+                continue
+            if submitted_at.tzinfo is None:
+                submitted_at = submitted_at.replace(tzinfo=timezone.utc)
+            if submitted_at - timedelta(minutes=10) <= created_at <= submitted_at + timedelta(minutes=2):
+                return True
+        return False
+
+    def _seal_queued_retry_items(self, conn: Any, job_id: str) -> int:
+        """Freeze untouched items so a retry can only recover the failed item."""
+        return int(conn.execute(
+            """UPDATE withdrawal_items
+               SET status = 'skipped', status_label = ?, error = ?,
+                   outcome_unknown = 0, retry_reconciliation_required = 0
+               WHERE job_id = ? AND status = 'queued'""",
+            (
+                self.item_label("skipped"),
+                WITHDRAWAL_RETRY_SEALED_REASON,
+                job_id,
+            ),
+        ).rowcount)
+
     def _record_terminal_unknown_attempt(
         self,
         job_id: str,
@@ -1399,10 +1542,12 @@ class WithdrawalService:
             ).fetchone()
             if not job or not item or job["status"] != "failed" or item["status"] != "failed":
                 return False
+            self._seal_queued_retry_items(conn, job_id)
             conn.execute(
                 """UPDATE withdrawal_items SET
                    error = ?, response = ?, platform_withdrawal_id = ?, platform_status = ?,
-                   outcome_unknown = 0, retry_count = retry_count + 1
+                   outcome_unknown = 0, retry_reconciliation_required = 0,
+                   retry_count = retry_count + 1
                    WHERE item_id = ?""",
                 (
                     message,
@@ -1425,6 +1570,12 @@ class WithdrawalService:
         job_status = "running" if running else "queued"
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            job = conn.execute(
+                "SELECT status FROM withdrawal_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if not job or job["status"] != "failed":
+                return False
             active = conn.execute(
                 "SELECT job_id FROM withdrawal_jobs WHERE status IN ('queued', 'waiting', 'running') AND job_id <> ? LIMIT 1",
                 (job_id,),
@@ -1437,8 +1588,11 @@ class WithdrawalService:
             ).fetchone()["count"])
             if failed_count != 1:
                 raise RuntimeError("失败任务必须且只能包含一个失败账号")
+            self._seal_queued_retry_items(conn, job_id)
             updated = conn.execute(
-                "UPDATE withdrawal_items SET status = ?, status_label = ?, error = NULL, retry_count = retry_count + 1 "
+                "UPDATE withdrawal_items SET status = ?, status_label = ?, error = NULL, "
+                "outcome_unknown = 0, retry_reconciliation_required = 0, "
+                "retry_count = retry_count + 1 "
                 "WHERE item_id = ? AND job_id = ? AND status = 'failed'",
                 (item_status, self.item_label(item_status), item_id, job_id),
             ).rowcount
@@ -1453,7 +1607,9 @@ class WithdrawalService:
                 "WHERE job_id = ? AND status = 'failed'",
                 (job_status, sequence, now, job_id),
             ).rowcount
-            return bool(updated_job)
+            if not updated_job:
+                raise RuntimeError("失败任务状态已变更")
+            return True
 
     async def retry_job(self, job_id: str, manager: Any) -> dict[str, Any] | None:
         job = self.job_detail(job_id)
@@ -1465,7 +1621,7 @@ class WithdrawalService:
         if len(failed) != 1:
             raise RuntimeError("失败任务必须且只能包含一个失败账号")
         item = failed[0]
-        if item.get("outcomeUnknown"):
+        if item.get("outcomeUnknown") or item.get("retryReconciliationRequired"):
             attempted_at = self._parse_time(item.get("attemptedAt"))
             if attempted_at is None:
                 raise RuntimeError("未知提交结果缺少尝试时间，禁止盲目重试")
@@ -1566,7 +1722,8 @@ class WithdrawalService:
             if not row or row["status"] not in {"queued", "running"} or not is_excluded_account(row["email"]):
                 return False
             conn.execute(
-                "UPDATE withdrawal_items SET status = 'skipped', status_label = '已排除', error = ? WHERE item_id = ?",
+                "UPDATE withdrawal_items SET status = 'skipped', status_label = '已排除', error = ?, "
+                "outcome_unknown = 0, retry_reconciliation_required = 0 WHERE item_id = ?",
                 ("账号已从 91 永久排除", item["itemId"]),
             )
             if row["status"] == "running":

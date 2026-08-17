@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -83,9 +84,18 @@ def create_withdrawal_router(
     async def preview(
         mode: str = Query(default="cost"),
         amount: float | None = Query(default=None),
+        account_amounts: str | None = Query(default=None, alias="accountAmounts"),
+        account_amounts_snake: str | None = Query(default=None, alias="account_amounts"),
         manager: Any = Depends(require_manager),
     ) -> dict[str, Any]:
-        plan = await checked_plan_for_request({"mode": mode, "amount": amount}, manager)
+        payload: dict[str, Any] = {"mode": mode, "amount": amount}
+        raw_account_amounts = account_amounts if account_amounts is not None else account_amounts_snake
+        if raw_account_amounts not in (None, ""):
+            try:
+                payload["accountAmounts"] = json.loads(str(raw_account_amounts))
+            except json.JSONDecodeError as exc:
+                raise HTTPException(status_code=400, detail="逐账号提现金额格式无效") from exc
+        plan = await checked_plan_for_request(payload, manager)
         validate_targets(plan, manager)
         return plan
 

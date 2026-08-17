@@ -8,7 +8,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
 from server.cost_ledger import CostLedger
+from server.withdrawal_routes import create_withdrawal_router
 from server.withdrawal_email import render_withdrawal_email_html
 from server.withdrawal_service import (
     UNKNOWN_OUTCOME_RETRY_GRACE_SECONDS,
@@ -238,6 +242,172 @@ class WithdrawalPlanningTests(unittest.TestCase):
         settlement = settlement_for(plan)
         self.assertEqual(settlement["gross"], 50.0)
         self.assertEqual(settlement["unrecoveredCost"], 50.0)
+
+
+class WithdrawalRouteTests(unittest.TestCase):
+    def test_get_preview_accepts_account_amounts_query(self) -> None:
+        recorded: dict[str, object] = {}
+        account = WITHDRAWAL_ACCOUNTS[0]
+
+        class PreviewService:
+            wake_event = SimpleNamespace(set=lambda: None)
+
+            async def preview_plan(self, mode, requested_amount, account_amounts, _manager):
+                recorded.update(
+                    {
+                        "mode": mode,
+                        "requested_amount": requested_amount,
+                        "account_amounts": account_amounts,
+                    }
+                )
+                return {
+                    "mode": mode,
+                    "cost": 0,
+                    "requestedAmount": 7,
+                    "totalAmount": 7,
+                    "items": [
+                        {
+                            "email": account.email,
+                            "amount": 7,
+                            "status": "queued",
+                        }
+                    ],
+                }
+
+            def target_ids(self, _manager):
+                return {account.email.lower(): "target-0"}
+
+        router, _handlers = create_withdrawal_router(
+            api_prefix="/gpt-api",
+            require_manager=lambda: object(),
+            pixel_http_error=lambda exc: exc,
+            service=PreviewService(),
+        )
+        app = FastAPI()
+        app.include_router(router)
+
+        with TestClient(app) as client:
+            response = client.get(
+                "/gpt-api/withdrawals/preview",
+                params={
+                    "mode": "full",
+                    "accountAmounts": f'{{"{account.email}":7}}',
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(recorded["mode"], "full")
+        self.assertEqual(recorded["account_amounts"], {account.email: 7})
+
+
+class WithdrawalSchemaMigrationTests(unittest.TestCase):
+    def test_v212_failed_item_requires_history_reconciliation_after_migration(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE withdrawal_jobs (
+                job_id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                requested_amount REAL NOT NULL,
+                total_amount REAL NOT NULL,
+                cost REAL NOT NULL,
+                balance_snapshot_at TEXT NOT NULL,
+                balance_snapshot_total REAL,
+                cost_history TEXT NOT NULL DEFAULT '[]',
+                cost_history_total REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                current_sequence INTEGER NOT NULL DEFAULT 0,
+                next_run_at TEXT,
+                error TEXT,
+                settlement TEXT NOT NULL DEFAULT '{}',
+                post_withdrawal_cost REAL,
+                post_withdrawal_balance REAL,
+                discounted_profit REAL,
+                cost_cleared_at TEXT,
+                cost_cleared_amount REAL NOT NULL DEFAULT 0,
+                cost_settlement_status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE withdrawal_items (
+                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                email TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                owner_label TEXT NOT NULL,
+                payment_method TEXT NOT NULL,
+                balance REAL NOT NULL,
+                amount INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                status_label TEXT NOT NULL DEFAULT '',
+                error TEXT,
+                submitted_at TEXT,
+                cost_recovered_amount REAL NOT NULL DEFAULT 0,
+                cost_recovered_at TEXT,
+                remaining_cost_after REAL,
+                response TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(job_id, sequence)
+            );
+            CREATE TABLE withdrawal_emails (
+                email_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                body TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        attempted_at = "2026-08-15T08:09:10Z"
+        connection.execute(
+            """INSERT INTO withdrawal_jobs(
+                   job_id, mode, requested_amount, total_amount, cost,
+                   balance_snapshot_at, balance_snapshot_total, cost_history,
+                   cost_history_total, status, current_sequence, error,
+                   settlement, cost_cleared_amount, cost_settlement_status,
+                   created_at, updated_at
+               ) VALUES (?, 'cost', 1, 1, 1, ?, 1, '[]', 0, 'failed', 1, ?,
+                         '{}', 0, 'not_recovered', ?, ?)""",
+            (
+                "legacy-failed",
+                "2026-08-15T08:00:00Z",
+                "平台连接失败",
+                "2026-08-15T08:00:00Z",
+                attempted_at,
+            ),
+        )
+        connection.execute(
+            """INSERT INTO withdrawal_items(
+                   job_id, sequence, email, target_id, owner, owner_label,
+                   payment_method, balance, amount, status, status_label,
+                   error, response
+               ) VALUES (?, 1, ?, 'target-0', 'owner', '自己支付宝',
+                         'alipay', 1, 1, 'failed', '失败', ?, '{}')""",
+            ("legacy-failed", WITHDRAWAL_ACCOUNTS[0].email, "平台连接失败"),
+        )
+
+        initialize_withdrawal_schema(connection)
+        migrated = connection.execute(
+            "SELECT attempted_at, outcome_unknown, retry_reconciliation_required "
+            "FROM withdrawal_items WHERE job_id = 'legacy-failed'"
+        ).fetchone()
+
+        self.assertEqual(migrated["attempted_at"], attempted_at)
+        self.assertEqual(migrated["outcome_unknown"], 1)
+        self.assertEqual(migrated["retry_reconciliation_required"], 1)
+
+        initialize_withdrawal_schema(connection)
+        repeated = connection.execute(
+            "SELECT attempted_at, outcome_unknown, retry_reconciliation_required "
+            "FROM withdrawal_items WHERE job_id = 'legacy-failed'"
+        ).fetchone()
+        self.assertEqual(dict(repeated), dict(migrated))
+        connection.close()
 
 
 class BlockingWithdrawalManager:
@@ -730,7 +900,8 @@ class WithdrawalServiceConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 1)
 
     async def _assert_terminal_unknown_history_is_audited(self, platform_status: str) -> None:
-        job = self.service.create_job(self.service.latest_plan("cost", 1), self.target_ids)
+        self.balance_values = [1, 1, 0, 0, 0, 0, 0]
+        job = self.service.create_job(self.service.latest_plan("full"), self.target_ids)
 
         async def ambiguous_submit(
             _target_id: str, amount: int, payment_method: str
@@ -766,6 +937,8 @@ class WithdrawalServiceConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(audited["items"][0]["outcomeUnknown"])
         self.assertEqual(audited["items"][0]["retryCount"], 1)
         self.assertEqual(audited["items"][0]["costRecoveredAmount"], 0)
+        self.assertEqual(audited["items"][1]["status"], "skipped")
+        self.assertIn("封存不再执行", audited["items"][1]["error"])
         self.assertEqual(audited["costClearedAmount"], 0)
         self.assertIn("未冲减成本", audited["items"][0]["error"])
         self.assertEqual([item["id"] for item in self.ledger.list()], ["cost-1"])
@@ -1050,6 +1223,68 @@ class WithdrawalServiceConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(resumed["error"])
         self.assertEqual(resumed["items"][0]["status"], "queued")
         self.assertEqual(resumed["items"][0]["retryCount"], 1)
+
+    async def test_failed_job_retry_seals_original_queue_tail(self) -> None:
+        self.manager = FailingWithdrawalManager()
+        self.balance_values = [1, 1, 1, 0, 0, 0, 0]
+        job = self.service.create_job(self.service.latest_plan("full"), self.target_ids)
+
+        await self.service.process_once()
+        failed = self.service.job_detail(job["jobId"])
+        self.assertEqual([item["status"] for item in failed["items"][:3]], ["failed", "queued", "queued"])
+        self.assertEqual(failed["totalAmount"], 0)
+
+        resumed = await self.service.retry_job(job["jobId"], self.manager)
+        self.assertEqual([item["status"] for item in resumed["items"][:3]], ["queued", "skipped", "skipped"])
+        self.assertEqual(resumed["totalAmount"], 1)
+        self.assertTrue(all("封存不再执行" in item["error"] for item in resumed["items"][1:3]))
+
+        self.manager = BlockingWithdrawalManager()
+        self.manager.release.set()
+        await self.service.process_once()
+        completed = self.service.job_detail(job["jobId"])
+
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual([item["status"] for item in completed["items"][:3]], ["submitted", "skipped", "skipped"])
+        self.assertEqual(completed["totalAmount"], 1)
+        self.assertEqual(completed["settlement"]["gross"], 1)
+        self.assertEqual(self.manager.calls, 1)
+
+    async def test_legacy_failed_history_match_never_posts_or_runs_queue_tail(self) -> None:
+        self.manager = FailingWithdrawalManager()
+        self.balance_values = [1, 1, 1, 0, 0, 0, 0]
+        job = self.service.create_job(self.service.latest_plan("full"), self.target_ids)
+
+        await self.service.process_once()
+        failed = self.service.job_detail(job["jobId"])
+        attempted_at = failed["items"][0]["attemptedAt"]
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE withdrawal_items SET outcome_unknown = 1, retry_reconciliation_required = 1 "
+                "WHERE item_id = ?",
+                (failed["items"][0]["itemId"],),
+            )
+
+        self.manager = BlockingWithdrawalManager()
+        self.manager.release.set()
+        self.manager.histories["target-0"].append(
+            {
+                "id": 19_001,
+                "amount": 1,
+                "payment_method": "alipay",
+                "status": "SETTLED",
+                "created_at": attempted_at,
+            }
+        )
+
+        reconciled = await self.service.retry_job(job["jobId"], self.manager)
+
+        self.assertEqual(reconciled["status"], "completed")
+        self.assertEqual([item["status"] for item in reconciled["items"][:3]], ["submitted", "skipped", "skipped"])
+        self.assertEqual(reconciled["items"][0]["platformWithdrawalId"], "19001")
+        self.assertEqual(reconciled["totalAmount"], 1)
+        self.assertEqual(reconciled["settlement"]["gross"], 1)
+        self.assertEqual(self.manager.calls, 0)
 
     async def test_restart_recovers_submitted_item_before_wait_state_was_saved(self) -> None:
         self.balance_values = [1, 1, 0, 0, 0, 0, 0]

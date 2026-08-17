@@ -29,3 +29,12 @@
 4. 删除本目录 `build`。
 5. 用 `find /Applications /Users/lwh/Applications /Users/lwh/Downloads -name '91.app' -print` 确认只剩 `/Applications/91.app`。
 6. 通过命令行启动新版应用并检查启动、退出行为；UI 回归使用前端测试和 Web 构建结果验证，不使用 `computer-use`。
+
+## 低配服务器发布约束
+
+- 线上服务器内存较小，发布前必须通过命令行检查可用内存、swap、磁盘、近期 OOM 记录及核心容器健康状态。
+- 禁止在服务器上并行执行构建、容器重建、日志扫描或批量重启；任何高内存操作必须串行，并在执行前确认有足够余量。
+- 部署前必须生成并校验 SQLite 一致性备份；不得覆盖线上专用 `docker-compose.yml`、`data` 目录或密钥配置。
+- 只重启本次变更所需服务。依赖恢复顺序固定为代理、Postgres、Redis、sub2api、91 后端、Caddy；每一步健康后才能继续。
+- 健康检查脚本必须使用单实例锁、依赖健康门槛、重启后复检和冷却机制，不能因瞬时失败每 5 分钟反复重启容器。
+- 发布完成后必须复核 91、sub2api、Postgres、Redis 健康状态及 OOM/重启计数；出现异常立即停止后续重操作并回滚。
