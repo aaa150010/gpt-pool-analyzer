@@ -1463,7 +1463,7 @@ dependencies = [
 
 [[package]]
 name = "gpt-analyzer"
-version = "2.2.14"
+version = "2.2.15"
 dependencies = [
  "futures-util",
  "reqwest",
