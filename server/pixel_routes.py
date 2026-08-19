@@ -216,9 +216,13 @@ def create_pixel_router(
         request: Request,
         target_ids_json: str = Query(alias="targetIds"),
         file_name: str | None = Query(default=None, alias="fileName"),
+        preserve_names: bool = Query(default=False, alias="preserveNames"),
         manager: Any = Depends(require_manager),
     ) -> dict[str, Any]:
         try:
+            preserve_names = preserve_names or (
+                request.headers.get("x-91-preserve-names", "").strip().lower() == "true"
+            )
             async with get_job_coordinator().hold():
                 if _has_active_jobs(get_export_jobs(), manager):
                     raise HTTPException(status_code=409, detail="汇总整理任务运行中，暂不能开始导入")
@@ -239,7 +243,10 @@ def create_pixel_router(
                 if jobs is None or jobs.manager is not manager:
                     jobs = PixelImportJobs(manager, record_callback=save_import_record)
                     set_import_jobs(jobs)
-                return {"job": await jobs.create(bundle, target_ids)}
+                create_kwargs: dict[str, Any] = {}
+                if preserve_names:
+                    create_kwargs["preserve_names"] = True
+                return {"job": await jobs.create(bundle, target_ids, **create_kwargs)}
         except PixelManagerError as exc:
             raise pixel_http_error(exc) from exc
 

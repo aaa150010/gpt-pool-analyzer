@@ -49,6 +49,13 @@ import {
 import { api } from "./lib/api";
 import { installAvailableUpdate, installUpdateMenu } from "./lib/auto-update";
 import { cleanupPixelAccounts } from "./lib/pixel-cleanup";
+import {
+  CLEANUP_IMPORT_BATCH_SIZE,
+  buildFailedImportPayload,
+  buildCleanupImportReport,
+  extractImportAccounts,
+  splitImportAccounts,
+} from "./lib/pixel-cleanup-import";
 import { recoverPixelAccounts } from "./lib/pixel-recovery";
 import type {
   BalanceAccount,
@@ -68,6 +75,8 @@ import type {
   PixelCleanupKind,
   PixelCleanupProgress,
   PixelCleanupResult,
+  PixelCleanupImportReport,
+  PixelCleanupImportBatchResult,
   PixelExportJob,
   PixelImportJob,
   PixelImportRecord,
@@ -1878,6 +1887,11 @@ function PixelManagerView({
   const [cleanupKind, setCleanupKind] = useState<PixelCleanupKind | null>(null);
   const [cleanupProgress, setCleanupProgress] = useState<PixelCleanupProgress | null>(null);
   const [cleanupResult, setCleanupResult] = useState<PixelCleanupResult | null>(null);
+  const [cleanupImportMode, setCleanupImportMode] = useState(false);
+  const [cleanupImportSelecting, setCleanupImportSelecting] = useState(false);
+  const [cleanupImportProgress, setCleanupImportProgress] = useState<{ batch: number; total: number; attempts: number } | null>(null);
+  const [cleanupImportReport, setCleanupImportReport] = useState<PixelCleanupImportReport | null>(null);
+  const [cleanupImportSourcePayload, setCleanupImportSourcePayload] = useState<unknown>(null);
   const loadAccountsRef = useRef<() => Promise<void>>(async () => undefined);
   const refreshAllTargetCountsRef = useRef<(targetList?: PixelTarget[], options?: { silent?: boolean }) => Promise<void>>(async () => undefined);
   const cleanupRunning = cleanupProgress !== null;
@@ -2109,8 +2123,20 @@ function PixelManagerView({
 
   const openImport = () => {
     if (!selectedFiles.length || !targets.length || exporting) return;
+    setCleanupImportMode(false);
     setSelectedTargetIds(new Set(targets.map((target) => target.id)));
     setImportOpen(true);
+  };
+
+  const openCleanupImport = () => {
+    if (!cleanupResult || cleanupResult.kind !== "error" || importing || exporting || !targets.length) return;
+    setCleanupResult(null);
+    setCleanupImportMode(true);
+    setCleanupImportSelecting(true);
+    setSelectedFiles([]);
+    setSelectedTargetIds(new Set());
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    fileInputRef.current?.click();
   };
 
   const downloadPixelFile = (download: { blob: Blob; fileName: string }) => {
@@ -2240,6 +2266,10 @@ function PixelManagerView({
       onToast("汇总整理任务运行中，暂不能开始导入");
       return;
     }
+    if (cleanupImportMode) {
+      await runCleanupImport();
+      return;
+    }
     setImporting(true);
     try {
       const targetIds = [...selectedTargetIds];
@@ -2252,6 +2282,125 @@ function PixelManagerView({
     } catch (error) {
       onToast(error instanceof Error ? error.message : "批量导入失败");
       setImporting(false);
+    }
+  };
+
+  const waitForCleanupImportJob = async (jobId: string): Promise<PixelImportJob> => {
+    let current = (await api.pixelImportJob(jobId)).job;
+    while (!(["completed", "failed"] as string[]).includes(current.status)) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+      current = (await api.pixelImportJob(jobId)).job;
+    }
+    return current;
+  };
+
+  const isImportTimeout = (message: string): boolean =>
+    /超时|timeout|timed out|平台连接失败|网络|连接失败|请求失败/i.test(message);
+
+  const runCleanupImport = async () => {
+    const file = selectedFiles[0];
+    const targetId = [...selectedTargetIds][0];
+    const target = targets.find((item) => item.id === targetId);
+    if (!file || !targetId || !target) return;
+    setImporting(true);
+    try {
+      let source: unknown;
+      try {
+        source = JSON.parse(await file.text());
+      } catch {
+        throw new Error("JSON 文件格式无效");
+      }
+      const accounts = extractImportAccounts(source);
+      if (!accounts.length) throw new Error("JSON 必须包含 accounts 数组");
+      const batches = splitImportAccounts(accounts, CLEANUP_IMPORT_BATCH_SIZE);
+      const batchResults: PixelCleanupImportBatchResult[] = [];
+      setCleanupImportSourcePayload(source);
+      setCleanupImportReport(buildCleanupImportReport({
+        sourceFileName: file.name,
+        targetId,
+        targetEmail: target.email,
+        accounts,
+        batches: [],
+      }));
+      setImportOpen(false);
+      setCleanupImportMode(false);
+      setSelectedFiles([]);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      for (let index = 0; index < batches.length; index += 1) {
+        const batchAccounts = batches[index];
+        const batchPayload = source && typeof source === "object" && !Array.isArray(source)
+          ? { ...(source as Record<string, unknown>), accounts: batchAccounts }
+          : { accounts: batchAccounts };
+        const batchFile = new File(
+          [JSON.stringify(batchPayload)],
+          `${file.name.replace(/\.json$/i, "")}.part-${index + 1}.json`,
+          { type: "application/json" },
+        );
+        let job: PixelImportJob | null = null;
+        let createError = "";
+        let attempts = 0;
+        let retryable = false;
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          attempts = attempt + 1;
+          setCleanupImportProgress({ batch: index + 1, total: batches.length, attempts });
+          job = null;
+          createError = "";
+          try {
+            const response = await api.pixelImport(batchFile, [targetId], { preserveNames: true });
+            job = await waitForCleanupImportJob(response.job.jobId);
+          } catch (error) {
+            createError = error instanceof Error ? error.message : "导入请求失败";
+          }
+          const attemptResult = job?.results.find((result) => result.targetId === targetId);
+          const attemptFailureText = [
+            job?.error,
+            createError,
+            attemptResult?.message,
+            ...(attemptResult?.importErrors ?? []).map((item) => item.message),
+          ].filter(Boolean).join(" ");
+          retryable = isImportTimeout(attemptFailureText);
+          if (!retryable || attempt >= 3) break;
+          onToast(`第 ${index + 1} 组请求超时，正在重试第 ${attempt + 1} / 3 次`);
+          await new Promise((resolve) => window.setTimeout(resolve, Math.min(2 ** attempt, 5) * 1_000));
+        }
+        const targetResult = job?.results.find((result) => result.targetId === targetId);
+        setCleanupImportProgress({ batch: index + 1, total: batches.length, attempts });
+        batchResults.push({
+          index: index + 1,
+          start: index * CLEANUP_IMPORT_BATCH_SIZE,
+          accounts: batchAccounts.length,
+          attempts,
+          status: targetResult?.status ?? (createError ? "failed" : job?.status === "completed" ? "success" : "failed"),
+          error: createError || job?.error || targetResult?.message || null,
+          results: targetResult ? [targetResult] : [],
+        });
+        const partialReport = buildCleanupImportReport({
+          sourceFileName: file.name,
+          targetId,
+          targetEmail: target.email,
+          accounts,
+          batches: batchResults,
+        });
+        setCleanupImportReport(partialReport);
+        if (retryable) onToast(`第 ${index + 1} 组请求超时，已自动重试 3 次${targetResult?.status === "success" ? "并成功" : "，仍然失败"}`);
+      }
+      const report = buildCleanupImportReport({
+        sourceFileName: file.name,
+        targetId,
+        targetEmail: target.email,
+        accounts,
+        batches: batchResults,
+      });
+      setCleanupImportReport(report);
+      const refreshedTargets = await loadTargets();
+      await refreshAllTargetCountsRef.current(refreshedTargets, { silent: true });
+      await loadAccountsRef.current();
+      onToast(report.levelErrors.length ? `导入完成，发现 ${report.levelErrors.length} 个等级相关失败，可下载 JSON` : "分组导入完成，未发现等级相关失败");
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "清理后分组导入失败");
+    } finally {
+      setImporting(false);
+      setCleanupImportProgress(null);
     }
   };
 
@@ -2499,11 +2648,17 @@ function PixelManagerView({
               multiple
               className="hidden"
               onChange={(event) => {
-                const files = Array.from(event.target.files ?? []).filter((file) => file.name.toLowerCase().endsWith(".json"));
+                const picked = Array.from(event.target.files ?? []).filter((file) => file.name.toLowerCase().endsWith(".json"));
+                const files = cleanupImportSelecting ? picked.slice(0, 1) : picked;
                 setSelectedFiles(files);
+                if (cleanupImportSelecting && files.length) {
+                  setCleanupImportSelecting(false);
+                  setSelectedTargetIds(new Set());
+                  setImportOpen(true);
+                }
               }}
             />
-            <Button variant="outline" disabled={importing || exporting || sharingAll || cleanupRunning || recoveryRunning} onClick={() => fileInputRef.current?.click()}>
+            <Button variant="outline" disabled={importing || exporting || sharingAll || cleanupRunning || recoveryRunning} onClick={() => { setCleanupImportSelecting(false); setCleanupImportMode(false); fileInputRef.current?.click(); }}>
               <FileJson className="h-4 w-4" />
               选择 JSON
             </Button>
@@ -3020,6 +3175,103 @@ function PixelManagerView({
                 </tbody>
               </table>
             </div>
+            {cleanupResult.kind === "error" && (
+              <div className="mt-4 flex items-center justify-between gap-3 rounded-md border border-blue-200 bg-blue-50 px-3 py-3">
+                <div className="text-xs font-bold text-blue-800">清理完成后可选择一个平台账号，将 JSON 按 10 个账号一组导入并分析等级相关失败。</div>
+                <div className="flex shrink-0 gap-2">
+                  <Button variant="outline" onClick={() => setCleanupResult(null)}>暂不导入</Button>
+                  <Button onClick={openCleanupImport}>
+                    <Upload className="h-4 w-4" />
+                    选择文件导入
+                  </Button>
+                </div>
+              </div>
+            )}
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {cleanupImportReport && (
+        <Dialog open onOpenChange={(open) => {
+          if (open) return;
+          setCleanupImportReport(null);
+          setCleanupImportSourcePayload(null);
+        }}>
+          <DialogContent className="max-h-[min(760px,calc(100vh-48px))] w-[min(calc(100vw-32px),1080px)] overflow-auto">
+            <DialogHeader>
+              <DialogTitle>清理后分组导入结果</DialogTitle>
+              <DialogDescription>
+                {cleanupImportReport.sourceFileName} · {cleanupImportReport.targetEmail} · 共 {cleanupImportReport.totalAccounts} 个账号，按 {cleanupImportReport.batchSize} 个一组处理。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <div className="rounded-md border border-border bg-muted/40 px-3 py-2"><div className="text-[11px] font-bold text-muted-foreground">处理分组</div><div className="mt-1 text-lg font-black">{cleanupImportReport.batches.length}</div></div>
+              <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
+                <div className="text-[11px] font-bold text-muted-foreground">失败日志</div>
+                <div className="mt-1 text-lg font-black">{cleanupImportReport.failures.length}</div>
+              </div>
+              <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2"><div className="text-[11px] font-bold text-amber-700">等级相关</div><div className="mt-1 text-lg font-black text-amber-800">{cleanupImportReport.levelErrors.length}</div></div>
+              <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2"><div className="text-[11px] font-bold text-emerald-700">映射账号</div><div className="mt-1 text-lg font-black text-emerald-800">{cleanupImportReport.levelErrors.filter((item) => item.account).length}</div></div>
+            </div>
+            {cleanupImportProgress && (
+              <div className="mt-4 rounded-md border border-blue-200 bg-blue-50 px-3 py-3 text-sm font-bold text-blue-800">
+                正在处理第 {cleanupImportProgress.batch} / {cleanupImportProgress.total} 组{cleanupImportProgress.attempts > 1 ? `，超时后自动重试 ${cleanupImportProgress.attempts - 1} 次` : ""}
+              </div>
+            )}
+            {cleanupImportReport.batches.length ? (
+              <div className="mt-4 overflow-hidden rounded-md border border-border">
+                <div className="border-b border-border bg-muted px-3 py-2 text-xs font-black text-muted-foreground">分组导入日志</div>
+                <div className="max-h-[240px] overflow-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-muted/60 text-[11px] font-black text-muted-foreground">
+                      <tr><th className="px-3 py-2.5">分组</th><th className="px-3 py-2.5">账号数</th><th className="px-3 py-2.5">状态</th><th className="px-3 py-2.5">重试</th><th className="px-3 py-2.5">说明</th></tr>
+                    </thead>
+                    <tbody>
+                      {cleanupImportReport.batches.map((batch) => (
+                        <tr key={batch.index} className="border-t border-border">
+                          <td className="px-3 py-2.5 font-bold">第 {batch.index} 组</td>
+                          <td className="px-3 py-2.5">{batch.accounts}</td>
+                          <td className={cn("px-3 py-2.5 font-bold", batch.status === "success" ? "text-emerald-700" : batch.status === "partial" ? "text-amber-700" : "text-rose-700")}>{batch.status === "success" ? "成功" : batch.status === "partial" ? "部分失败" : "失败"}</td>
+                          <td className="px-3 py-2.5">{batch.attempts > 1 ? `${batch.attempts - 1} 次` : "未重试"}</td>
+                          <td className="max-w-[420px] truncate px-3 py-2.5" title={batch.error || ""}>{batch.error || "已完成"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ) : null}
+            {cleanupImportReport.levelErrors.length ? (
+              <div className="mt-4 max-h-[330px] overflow-auto rounded-md border border-border">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-muted text-[11px] font-black text-muted-foreground"><tr><th className="px-3 py-2.5">原文件账号</th><th className="px-3 py-2.5">失败原因</th><th className="px-3 py-2.5">分组</th></tr></thead>
+                  <tbody>{cleanupImportReport.levelErrors.map((failure, index) => <tr key={`${failure.batch}-${failure.sourceIndex}-${index}`} className="border-t border-border"><td className="max-w-[360px] truncate px-3 py-2.5 font-bold" title={failure.name}>{failure.name || `第 ${Number(failure.sourceIndex ?? 0) + 1} 个账号`}</td><td className="px-3 py-2.5 font-bold text-amber-800">{failure.message}</td><td className="px-3 py-2.5">第 {failure.batch} 组</td></tr>)}</tbody>
+                </table>
+              </div>
+            ) : <div className="mt-4 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-3 text-sm font-bold text-emerald-800">没有匹配到等级相关失败，未生成需筛选的账号数据。</div>}
+            <div className="mt-4 overflow-hidden rounded-md border border-border">
+                <div className="border-b border-border bg-muted px-3 py-2 text-xs font-black text-muted-foreground">全部失败日志</div>
+                <div className="max-h-[360px] overflow-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-muted/60 text-[11px] font-black text-muted-foreground"><tr><th className="px-3 py-2.5">分组</th><th className="px-3 py-2.5">账号</th><th className="px-3 py-2.5">失败原因</th><th className="px-3 py-2.5">重试</th></tr></thead>
+                    <tbody>{cleanupImportReport.failures.map((failure, index) => <tr key={`${failure.batch}-${failure.sourceIndex}-${index}`} className="border-t border-border"><td className="px-3 py-2.5">第 {failure.batch} 组</td><td className="max-w-[300px] truncate px-3 py-2.5 font-bold" title={failure.name}>{failure.name || (failure.sourceIndex === null ? "未定位账号" : `第 ${failure.sourceIndex + 1} 个账号`)}</td><td className="px-3 py-2.5 font-bold text-rose-700">{failure.message}</td><td className="px-3 py-2.5">{failure.attempts > 1 ? `${failure.attempts - 1} 次` : "未重试"}</td></tr>)}</tbody>
+                  </table>
+                </div>
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <Button variant="outline" onClick={() => { setCleanupImportReport(null); setCleanupImportSourcePayload(null); }}>关闭</Button>
+              <Button onClick={() => {
+                const failedPayload = buildFailedImportPayload(cleanupImportSourcePayload, cleanupImportReport.failures);
+                const originalName = cleanupImportReport.sourceFileName.replace(/\.json$/i, "");
+                downloadPixelFile({
+                  blob: new Blob([JSON.stringify(failedPayload, null, 2)], { type: "application/json;charset=utf-8" }),
+                  fileName: `${originalName}-排除已存在账号.json`,
+                });
+              }}>
+                <Download className="h-4 w-4" />
+                下载排除已存在账号 JSON
+              </Button>
+            </div>
           </DialogContent>
         </Dialog>
       )}
@@ -3133,27 +3385,38 @@ function PixelManagerView({
       <Dialog open={importOpen} onOpenChange={(open) => !importing && !exporting && setImportOpen(open)}>
         <DialogContent className="max-w-xl">
           <DialogHeader>
-            <DialogTitle>选择上传账号</DialogTitle>
+            <DialogTitle>{cleanupImportMode ? "清理后分组导入" : "选择上传账号"}</DialogTitle>
             <DialogDescription>
-              {selectedFiles.length === 1 ? selectedFiles[0].name : `已选择 ${selectedFiles.length} 个 JSON 文件`} · 已选 {selectedTargetIds.size} / {targets.length} 个平台账号
+              {selectedFiles.length === 1 ? selectedFiles[0].name : `已选择 ${selectedFiles.length} 个 JSON 文件`} · {cleanupImportMode ? "请选择一个导入平台账号，文件将按 10 个一组顺序提交" : `已选 ${selectedTargetIds.size} / ${targets.length} 个平台账号`}
             </DialogDescription>
           </DialogHeader>
           <div className="grid max-h-[360px] grid-cols-2 gap-2 overflow-auto">
             {targets.map((target, index) => (
               <label key={target.id} className="flex h-12 items-center gap-2.5 rounded-md border border-border bg-background px-3 text-sm font-bold">
-                <Checkbox disabled={exporting} checked={selectedTargetIds.has(target.id)} onCheckedChange={() => toggleImportTarget(target.id)} />
+                <Checkbox disabled={exporting} checked={selectedTargetIds.has(target.id)} onCheckedChange={() => {
+                  if (cleanupImportMode) setSelectedTargetIds(new Set([target.id]));
+                  else toggleImportTarget(target.id);
+                }} />
                 <span className="flex h-6 w-6 items-center justify-center rounded bg-slate-100 text-[11px] font-black text-slate-600">{index + 1}</span>
                 <span className="truncate">{target.email}</span>
               </label>
             ))}
           </div>
+          {cleanupImportMode && cleanupImportProgress && (
+            <div className="mt-3 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-bold text-blue-800">
+              正在处理第 {cleanupImportProgress.batch} / {cleanupImportProgress.total} 组{cleanupImportProgress.attempts > 1 ? `，超时后自动重试 ${cleanupImportProgress.attempts - 1} 次` : ""}
+            </div>
+          )}
           <div className="mt-5 flex items-center justify-between">
             <button
               disabled={exporting}
               className="text-xs font-black text-blue-600 hover:text-blue-700 disabled:cursor-not-allowed disabled:text-muted-foreground"
-              onClick={() => setSelectedTargetIds((current) => current.size === targets.length ? new Set() : new Set(targets.map((target) => target.id)))}
+              onClick={() => {
+                if (cleanupImportMode) return;
+                setSelectedTargetIds((current) => current.size === targets.length ? new Set() : new Set(targets.map((target) => target.id)));
+              }}
             >
-              {selectedTargetIds.size === targets.length ? "取消全选" : "全部选择"}
+              {cleanupImportMode ? "仅可选择一个平台账号" : selectedTargetIds.size === targets.length ? "取消全选" : "全部选择"}
             </button>
             <div className="flex gap-2">
               <Button variant="outline" disabled={importing || exporting} onClick={() => setImportOpen(false)}>取消</Button>

@@ -486,6 +486,40 @@ export type PixelImportTargetResult = {
   message: string;
 };
 
+export type PixelCleanupImportBatchResult = {
+  index: number;
+  start: number;
+  accounts: number;
+  attempts: number;
+  status: "success" | "partial" | "failed";
+  error: string | null;
+  results: PixelImportTargetResult[];
+};
+
+export type PixelCleanupImportFailure = {
+  batch: number;
+  sourceIndex: number | null;
+  index: string;
+  name: string;
+  message: string;
+  account: Record<string, unknown> | null;
+  levelRelated: boolean;
+  attempts: number;
+};
+
+export type PixelCleanupImportReport = {
+  createdAt: string;
+  sourceFileName: string;
+  targetId: string;
+  targetEmail: string;
+  batchSize: number;
+  totalAccounts: number;
+  processedAccounts: number;
+  batches: Array<Omit<PixelCleanupImportBatchResult, "results">>;
+  failures: PixelCleanupImportFailure[];
+  levelErrors: PixelCleanupImportFailure[];
+};
+
 export type PixelImportResponse = {
   ok: boolean;
   sourceFileName: string;
