@@ -261,11 +261,16 @@ export const api = {
         method: "POST",
         body: JSON.stringify(payload),
       }),
-  pixelImport: (file: File, targetIds: string[]) => {
+  pixelImport: (file: File, targetIds: string[], options: { preserveNames?: boolean } = {}) => {
     const params = new URLSearchParams({ targetIds: JSON.stringify(targetIds), fileName: file.name });
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (options.preserveNames) {
+      params.set("preserveNames", "true");
+      headers["X-91-Preserve-Names"] = "true";
+    }
     return requestPixelJson<{ job: PixelImportJob }>(`/pixel-manager/import?${params.toString()}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: file,
     });
   },

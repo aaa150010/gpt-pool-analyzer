@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
@@ -21,6 +22,7 @@ from server.pixel_manager import (
     PixelTarget,
     PixelManagerError,
     PixelValidationError,
+    TargetCredentialBundle,
     _safe_text,
     build_target_credential_bundle,
     load_config,
@@ -223,6 +225,28 @@ class PixelConfigAndTransformTests(unittest.TestCase):
         prepared = build_target_credential_bundle(bundle, set())
         self.assertEqual(prepared.chunk_sizes, (100, 100, 5))
         self.assertEqual([len(json.loads(item)["accounts"]) for item in prepared.contents], [100, 100, 5])
+
+    def test_target_bundle_can_preserve_source_names_for_cleanup_import(self) -> None:
+        bundle = parse_credential_bundle(
+            "batch.json",
+            json.dumps(
+                {
+                    "accounts": [
+                        {
+                            "name": "original@example.com",
+                            "credentials": {"email": "original@example.com", "plan_type": "free"},
+                        }
+                    ]
+                }
+            ).encode(),
+        )
+
+        prepared = build_target_credential_bundle(bundle, set(), preserve_names=True)
+        payload = json.loads(prepared.contents[0])
+
+        self.assertEqual(payload["accounts"][0]["name"], "original@example.com")
+        self.assertEqual(payload["accounts"][0]["credentials"]["email"], "original@example.com")
+        self.assertEqual(prepared.generated_names, ("original@example.com",))
 
     def test_multiple_json_bundles_merge_and_retain_source_file_names(self) -> None:
         first = parse_credential_bundle(
@@ -1520,6 +1544,69 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finished["status"], "completed")
         self.assertEqual(finished["completedTargets"], 1)
 
+    async def test_cleanup_import_preserves_names_on_fallback_bundle_build(self) -> None:
+        manager = PixelManager(
+            PixelManagerConfig(manager_key=MANAGER_KEY, targets={"one": target("one")}),
+            inter_target_delay_seconds=0,
+        )
+        captured: list[TargetCredentialBundle] = []
+
+        async def fake_import(_target: PixelTarget, prepared: TargetCredentialBundle) -> dict[str, Any]:
+            captured.append(prepared)
+            return {
+                "targetId": "one",
+                "email": "one@example.com",
+                "generatedFileName": prepared.generated_file_name,
+                "sourceCount": prepared.source_count,
+                "created": 1,
+                "updated": 0,
+                "failed": 0,
+                "shared": 1,
+                "shareFailed": 0,
+                "failedShareIds": [],
+                "generatedNames": list(prepared.generated_names),
+                "status": "success",
+                "message": "ok",
+            }
+
+        manager._import_target = fake_import
+        bundle = parse_credential_bundle(
+            "source.json",
+            json.dumps(
+                [{"name": "original@example.com", "credentials": {"email": "original@example.com"}}]
+            ).encode(),
+        )
+
+        await manager.import_bundle(bundle, ["one"], preserve_names=True)
+
+        self.assertEqual(len(captured), 1)
+        payload = json.loads(captured[0].contents[0])
+        self.assertEqual(payload["accounts"][0]["name"], "original@example.com")
+        self.assertEqual(payload["accounts"][0]["credentials"]["email"], "original@example.com")
+
+    async def test_cleanup_import_job_forwards_preserve_names_to_manager(self) -> None:
+        manager = PixelManager(
+            PixelManagerConfig(manager_key=MANAGER_KEY, targets={"one": target("one")}),
+            inter_target_delay_seconds=0,
+        )
+        calls: list[dict[str, Any]] = []
+
+        async def fake_import(_bundle, _target_ids, _progress=None, **kwargs):
+            calls.append(kwargs)
+            return {"ok": True, "sourceFileName": "source.json", "sourceCount": 1, "results": []}
+
+        manager.import_bundle = AsyncMock(side_effect=fake_import)
+        jobs = PixelImportJobs(manager)
+        bundle = parse_credential_bundle(
+            "source.json",
+            json.dumps([{"name": "original@example.com"}]).encode(),
+        )
+
+        created = await jobs.create(bundle, ["one"], preserve_names=True)
+        await jobs._tasks[created["jobId"]]
+
+        self.assertEqual(calls[0]["preserve_names"], True)
+
     async def test_waiting_import_job_can_accelerate_without_parallel_targets(self) -> None:
         manager = PixelManager(
             PixelManagerConfig(
@@ -1882,9 +1969,9 @@ class PixelManagerTests(unittest.IsolatedAsyncioTestCase):
 
         result = await manager.import_bundle(bundle, ["one"])
 
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 4)
         self.assertEqual(len(set(calls)), 1)
-        self.assertEqual(delays, [1, 2])
+        self.assertEqual(delays, [1, 2, 4])
         self.assertEqual(result["results"][0]["status"], "failed")
         self.assertNotIn("_retryable", result["results"][0])
 

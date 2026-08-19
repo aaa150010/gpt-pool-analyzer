@@ -36,7 +36,7 @@ MAX_RETAINED_IMPORT_JOBS = 20
 MAX_RETAINED_EXPORT_JOBS = 20
 MAX_RETAINED_IMPORT_RETRY_JOBS = 3
 MAX_RETAINED_IMPORT_RETRY_PAYLOAD_BYTES = MAX_UPLOAD_BYTES * 2
-MAX_IMPORT_TRANSIENT_ATTEMPTS = 3
+MAX_IMPORT_TRANSIENT_RETRIES = 3
 PUBLIC_SHARE_CONCURRENCY = 10
 PUBLIC_SHARE_RANDOM_MIN_CONCURRENCY = 3
 PUBLIC_SHARE_RANDOM_MAX_CONCURRENCY = 10
@@ -600,6 +600,8 @@ def _ensure_openai_oauth_plan_type(payload: dict[str, Any]) -> None:
 def build_target_credential_bundle(
     bundle: CredentialBundle,
     used_emails: set[str],
+    *,
+    preserve_names: bool = False,
 ) -> TargetCredentialBundle:
     payload = copy.deepcopy(bundle.source_payload)
     _remove_chatgpt_field_source(payload)
@@ -612,6 +614,17 @@ def build_target_credential_bundle(
             account,
             preserve_agent_auth_mode=_is_agent_identity_account(account),
         )
+        if preserve_names:
+            credentials = account.get("credentials")
+            extra = account.get("extra")
+            original_name = str(account.get("name") or "").strip()
+            if not original_name and isinstance(credentials, dict):
+                original_name = str(credentials.get("email") or "").strip()
+            if not original_name and isinstance(extra, dict):
+                original_name = str(extra.get("email") or "").strip()
+            if original_name:
+                generated_names.append(original_name)
+            continue
         replacement = _random_email(_account_email_domain(account), used_emails)
         account["name"] = replacement
         _replace_email_fields(account, replacement)
@@ -2180,6 +2193,7 @@ class PixelManager:
         progress_callback: Callable[[dict[str, Any]], Any] | None = None,
         *,
         prepared_bundles: dict[str, TargetCredentialBundle] | None = None,
+        preserve_names: bool = False,
     ) -> dict[str, Any]:
         normalized = self.validate_target_ids(target_ids)
         used_emails: set[str] = set()
@@ -2201,10 +2215,14 @@ class PixelManager:
                     await update
             prepared = prepared_by_target.get(target_id)
             if prepared is None:
-                prepared = build_target_credential_bundle(bundle, used_emails)
+                prepared = build_target_credential_bundle(
+                    bundle,
+                    used_emails,
+                    preserve_names=preserve_names,
+                )
                 prepared_by_target[target_id] = prepared
             result: dict[str, Any] = {}
-            for attempt in range(MAX_IMPORT_TRANSIENT_ATTEMPTS):
+            for attempt in range(MAX_IMPORT_TRANSIENT_RETRIES + 1):
                 result = await self._import_target(self._target(target_id), prepared)
                 discovered_names = tuple(
                     str(value).strip()
@@ -2219,7 +2237,7 @@ class PixelManager:
                 retryable = bool(result.pop("_retryable", False))
                 if result.get("status") == "success" or not retryable:
                     break
-                if attempt + 1 < MAX_IMPORT_TRANSIENT_ATTEMPTS:
+                if attempt < MAX_IMPORT_TRANSIENT_RETRIES:
                     await self._sleeper(min(2**attempt, 5))
             results.append(result)
             if index + 1 < len(normalized) and self._inter_target_delay_seconds:
@@ -2415,13 +2433,21 @@ class PixelImportJobs:
         return any(not task.done() for task in self._tasks.values())
 
     async def create(
-        self, bundle: CredentialBundle, target_ids: Iterable[str]
+        self,
+        bundle: CredentialBundle,
+        target_ids: Iterable[str],
+        *,
+        preserve_names: bool = False,
     ) -> dict[str, Any]:
         normalized = self.manager.validate_target_ids(target_ids)
         used_emails: set[str] = set()
         _collect_emails(bundle.source_payload, used_emails)
         prepared_bundles = {
-            target_id: build_target_credential_bundle(bundle, used_emails)
+            target_id: build_target_credential_bundle(
+                bundle,
+                used_emails,
+                preserve_names=preserve_names,
+            )
             for target_id in normalized
         }
         async with self._lock:
@@ -2447,6 +2473,7 @@ class PixelImportJobs:
                 "results": [],
                 "error": None,
                 "retryCount": 0,
+                "_preserveNames": preserve_names,
                 "_accelerateEvent": asyncio.Event(),
                 "_sourceBundle": bundle,
                 "_targetIds": list(normalized),
@@ -2556,11 +2583,16 @@ class PixelImportJobs:
             return True
 
         try:
+            import_kwargs: dict[str, Any] = {
+                "prepared_bundles": prepared_bundles,
+            }
+            if job.get("_preserveNames"):
+                import_kwargs["preserve_names"] = True
             result = await self.manager.import_bundle(
                 bundle,
                 target_ids,
                 progress,
-                prepared_bundles=prepared_bundles,
+                **import_kwargs,
             )
             final_results = merge_results(result["results"])
             if self.record_callback:
